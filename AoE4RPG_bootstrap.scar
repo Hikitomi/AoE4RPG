@@ -1,0 +1,169 @@
+-- =============================================================================
+-- AoE4RPG Bootstrap
+-- =============================================================================
+-- Import this file in a host SCAR script to initialize the full AoE4RPG module.
+-- Example:
+--     import("AoE4RPG/AoE4RPG_bootstrap.scar")
+-- For UAGS win conditions, the host should import ags_cardinal.scar (and its
+-- selected win-condition modules) before this file. This module registers
+-- delegates into that lifecycle; it must not import ags_cardinal itself.
+-- =============================================================================
+
+import("cardinal.scar")
+-- Load the game's native cheat dispatcher. It registers Scar_AddInit(Cheat_Init)
+-- and handles
+-- broadcast chat commands such as AGEUP, ECONOMY, FOW, and INSTANTBUILD.
+-- Native chat cheats require the game's `dev` command-line option.
+import("gameplay/cheat.scar")
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+-- Runtime integration flags. UAGS owns the actual win-condition modules and
+-- match options; this package only records and respects the settings it is
+-- given through Cardinal's delegate chain.
+AoE4RPG.UAGS_ACTIVE = false
+AoE4RPG.WINCONDITION_OPTIONS = nil
+AoE4RPG.enabled = true
+AoE4RPG.ui_initialized = false
+
+-- Cardinal delegate: receives the same win-condition option table used by
+-- UAGS_GlobalSettings. Keep the table intact so other modules can continue to
+-- modify it; importing ags_cardinal.scar remains the host script's job.
+-- @param options Mutable win-condition options table supplied by Cardinal.
+-- Adjust: add more saved UAGS options here only when another module needs them later.
+function AoE4RPG_SetupSettings(options)
+    AoE4RPG.WINCONDITION_OPTIONS = options
+    AoE4RPG.UAGS_ACTIVE = (AGS_GLOBAL_SETTINGS ~= nil)
+end
+
+-- Cardinal delegate: enables the RPG level system when UAGS global settings
+-- are present, without overriding the selected annihilation/conquest/etc.
+-- win condition. This prevents the RPG module from fighting the game mode.
+-- Adjust: add optional AoE4RPG settings here without replacing the selected win condition.
+function AoE4RPG_AdjustSettings()
+    if AGS_GLOBAL_SETTINGS then
+        AoE4RPG.UAGS_ACTIVE = true
+        if AGS_GLOBAL_SETTINGS.LevelUp == nil then
+            AGS_GLOBAL_SETTINGS.LevelUp = true
+        end
+    end
+end
+
+-- Cardinal delegate: respect a host setting that explicitly disables leveling.
+-- Adjust: add more enable/disable checks here when new UAGS options are introduced.
+function AoE4RPG_UpdateModuleSettings()
+    if AGS_GLOBAL_SETTINGS and AGS_GLOBAL_SETTINGS.LevelUp == false then
+        AoE4RPG.enabled = false
+    end
+end
+
+-- Initializes the full AoE4RPG package and registers the module with the host
+-- SCAR environment. This keeps the system modular, since each sub-file is
+-- imported only after the base table exists.
+-- Initializes the AoE4RPG package once, in the same style as crafted-map scenario
+-- scripts: it attaches to the general Scar init lifecycle rather than assuming it
+-- owns the host mode's Mod_OnInit / Mod_Start sequence.
+-- @return Nothing. Initialization is idempotent and exits after the first call.
+-- @side_effect Creates UI panels and registers the damage event with UAGS.
+-- Adjust: register new simulation events here, but keep the initialized guard.
+function AoE4RPG_Initialize()
+    if AoE4RPG.initialized or not AoE4RPG.enabled then
+        return
+    end
+
+    AoE4RPG.initialized = true
+
+    if Rule_AddGlobalEvent then
+        Rule_AddGlobalEvent(AoE4RPG_LevelUp, GE_DamageReceived)
+    end
+end
+
+-- UAGS lifecycle delegates. Registration happens at global scope below, while
+-- mutable setup is deferred until the normal initialization phases.
+-- UAGS delegate called during EarlyInitializations; safe to call repeatedly.
+-- Adjust: put simulation-safe startup calls here; UI creation belongs in LateInitializations.
+function AoE4RPG_EarlyInitializations()
+    AoE4RPG_Initialize()
+end
+
+-- UAGS LateInitializations is the safe phase for constructing the hero XAML
+-- after the host HUD has been initialized.
+-- Adjust: change 2.0 for stat/XP refresh speed and 0.25 for selection show/hide response.
+function AoE4RPG_LateInitializations()
+    if AoE4RPG.ui_initialized then
+        return
+    end
+    AoE4RPG.ui_initialized = true
+    if AoE4RPG_UI_Initialize then
+        AoE4RPG_UI_Initialize()
+    end
+    if AoE4RPG_UI_InitializeHeroBar then
+        AoE4RPG_UI_InitializeHeroBar()
+    end
+    if Rule_AddInterval then
+        Rule_AddInterval(AoE4RPG_UI_RefreshSelection, 2.0)
+        Rule_AddInterval(AoE4RPG_UI_RefreshHeroProgress, 2.0)
+        Rule_AddInterval(AoE4RPG_UI_CheckSelectionChange, 0.25)
+    end
+end
+
+-- UAGS delegate called after entities are spawned; registers kill handling.
+-- Adjust: register other match-start events here if a new RPG system needs one.
+function AoE4RPG_OnPlay()
+    if AoE4RPG_EnableCriticalHitsForRegisteredUnits then
+        AoE4RPG_EnableCriticalHitsForRegisteredUnits()
+    end
+    if AoE4RPG_UI_RefreshHeroProgress then
+        AoE4RPG_UI_RefreshHeroProgress()
+    end
+    if Rule_AddGlobalEvent then
+        Rule_AddGlobalEvent(AoE4RPG_OnEntityKilled, GE_EntityKilled)
+    end
+end
+
+-- UAGS delegate called at match end; removes module-owned global event handlers.
+-- Adjust: remove every event added by this module here to avoid callbacks after game over.
+function AoE4RPG_OnGameOver()
+    if Rule_RemoveGlobalEvent then
+        Rule_RemoveGlobalEvent(AoE4RPG_LevelUp, GE_DamageReceived)
+        Rule_RemoveGlobalEvent(AoE4RPG_OnEntityKilled, GE_EntityKilled)
+    end
+end
+
+-- Explicit registration helper that keeps the module safe if another script also
+-- owns the main lifecycle. This is optional and only calls the init if not already
+-- started.
+-- Optional manual entry point for hosts that do not run the normal UAGS delegates.
+-- @side_effect Initializes the package and its damage-event hook once.
+-- Adjust: keep this manual fallback in sync with any new required startup function.
+function AoE4RPG_RegisterHooks()
+    if AoE4RPG and AoE4RPG.initialized then
+        return
+    end
+
+    AoE4RPG_Initialize()
+    AoE4RPG_LateInitializations()
+end
+
+-- Match the proven UAGS module structure: register delegates globally, then let
+-- cardinal invoke the lifecycle functions above.
+if Core_RegisterModule then
+    Core_RegisterModule("AoE4RPG")
+end
+
+import("AoE4RPG/AoE4RPG_blueprints.scar")
+import("AoE4RPG/AoE4RPG_core.scar")
+import("AoE4RPG/AoE4RPG_classes.scar")
+import("AoE4RPG/AoE4RPG_ui.scar")
+import("AoE4RPG/AoE4RPG_hero_ui.scar")
+import("AoE4RPG/AoE4RPG_debug_cheat.scar")
+
+-- Native game modules use Scar_AddInit as the guaranteed entry point. Keep a
+-- fallback registration so the RPG HUD still appears when a host imports this
+-- package without running the full UAGS Cardinal lifecycle.
+if Scar_AddInit then
+    Scar_AddInit(AoE4RPG_EarlyInitializations)
+    Scar_AddInit(AoE4RPG_LateInitializations)
+end

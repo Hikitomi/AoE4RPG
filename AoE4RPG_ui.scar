@@ -1,0 +1,135 @@
+-- =============================================================================
+-- AoE4RPG UI Module
+-- =============================================================================
+-- Primitive UI placeholders for the new RPG system. This can be expanded to
+-- add level display, attribute panels, and quick filter logic.
+-- =============================================================================
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+AoE4RPG.UI = {
+    enabled = true,
+    panels = {},
+    last_selection_count = nil,
+    last_selected_entity_id = nil,
+}
+
+-- This creates a simple stored panel record for class, level, and XP data.
+-- Adjust: add new fields to the table below if another UI needs more saved values.
+-- @param name Stable panel identifier; @param title Display title.
+-- @return Mutable panel table stored in AoE4RPG.UI.panels.
+function AoE4RPG_UI_CreatePanel(name, title)
+    local panel = {
+        name = name,
+        title = title,
+        visible = true,
+    }
+
+    AoE4RPG.UI.panels[name] = panel
+    return panel
+end
+
+-- This copies the selected unit's current RPG values into the stored panel record.
+-- Adjust: add another panel field here when a new selected-unit value is needed.
+-- @param entity Selected EntityID/entity object.
+-- @side_effect Copies the selected unit's class, level, and XP into unit_status.
+function AoE4RPG_UI_UpdateSelectedUnitPanel(entity)
+    if not entity then
+        return
+    end
+
+    if AoE4RPG_UI_NormalizeEntity then
+        entity = AoE4RPG_UI_NormalizeEntity(entity)
+    end
+
+    local entity_id = entity.EntityID or entity
+    local unit_data = AoE4RPG_GetUnitData(entity_id)
+    if not unit_data then
+        return
+    end
+
+    local class_name = unit_data.class_name or AoE4RPG_CLASS_GetClassForEntity(entity)
+    local panel = AoE4RPG.UI.panels["unit_status"]
+    if not panel then
+        panel = AoE4RPG_UI_CreatePanel("unit_status", "AoE4RPG")
+    end
+
+    panel.class_name = class_name
+    panel.level = unit_data.level
+    panel.exp = unit_data.exp
+end
+
+-- This creates the base unit-status data panel once during late initialization.
+-- Adjust: create more non-XAML panel records here if another UI module needs them.
+-- @return true after creating the base unit-status panel.
+function AoE4RPG_UI_Initialize()
+    AoE4RPG_UI_CreatePanel("unit_status", "AoE4RPG")
+    return true
+end
+
+-- This reads the current one-unit selection and updates or hides the hero UI.
+-- Adjust: change the selection-count rule here only if multi-select should show a panel.
+-- @side_effect Updates the unit_status panel when exactly one squad is selected.
+function AoE4RPG_UI_RefreshSelection()
+    if not Misc_GetSelectedSquads or not SGroup_CreateIfNotFound or not SGroup_Clear or not SGroup_Count or not SGroup_ForEach then
+        return
+    end
+
+    local selected_squads = SGroup_CreateIfNotFound("AoE4RPG_SelectedSquads")
+    SGroup_Clear(selected_squads)
+    Misc_GetSelectedSquads(selected_squads, false)
+    if SGroup_Count(selected_squads) == 1 then
+        -- This callback gets the first entity in the selected squad and sends it to both UI stores.
+        -- Adjust: add another selected-unit UI update here if a new panel is created.
+        local function update_selected(gid, index, squad_id)
+            local selected = Squad_GetFirstEntity and Squad_GetFirstEntity(squad_id)
+            if selected then
+                AoE4RPG_UI_UpdateSelectedUnitPanel(selected)
+                if AoE4RPG_UI_UpdateHeroAttributes then
+                    AoE4RPG_UI_UpdateHeroAttributes(selected)
+                end
+            end
+        end
+        SGroup_ForEach(selected_squads, update_selected)
+    elseif AoE4RPG_UI_UpdateHeroAttributes then
+        AoE4RPG_UI_UpdateHeroAttributes(nil)
+    end
+end
+
+-- This checks whether selection changed, so the UI can appear or hide without a full stat refresh.
+-- Adjust: change its 0.25-second interval in AoE4RPG_bootstrap.scar, not here.
+function AoE4RPG_UI_CheckSelectionChange()
+    if not Misc_GetSelectedSquads or not SGroup_CreateIfNotFound or not SGroup_Clear or not SGroup_Count or not SGroup_ForEach then
+        return
+    end
+
+    local selected_squads = SGroup_CreateIfNotFound("AoE4RPG_SelectionWatcher")
+    SGroup_Clear(selected_squads)
+    Misc_GetSelectedSquads(selected_squads, false)
+    local selection_count = SGroup_Count(selected_squads)
+    local selected_entity_id = nil
+    if selection_count == 1 then
+        -- This callback only reads the selected entity ID for the change comparison.
+        SGroup_ForEach(selected_squads, function(gid, index, squad_id)
+            local selected = Squad_GetFirstEntity and Squad_GetFirstEntity(squad_id)
+            if selected then
+                local entity_id = selected
+                if AoE4RPG_UI_NormalizeEntity then
+                    local _, normalized_id = AoE4RPG_UI_NormalizeEntity(selected)
+                    entity_id = normalized_id
+                end
+                selected_entity_id = entity_id
+            end
+        end)
+    end
+
+    local changed = selection_count ~= AoE4RPG.UI.last_selection_count
+        or selected_entity_id ~= AoE4RPG.UI.last_selected_entity_id
+    AoE4RPG.UI.last_selection_count = selection_count
+    AoE4RPG.UI.last_selected_entity_id = selected_entity_id
+    if changed and AoE4RPG_UI_RefreshSelection then
+        AoE4RPG_UI_RefreshSelection()
+    end
+end

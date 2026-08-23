@@ -1,0 +1,395 @@
+-- =============================================================================
+-- AoE4RPG Class System
+-- =============================================================================
+-- Mirrors the class structure used by the original RPG leveling package:
+-- Agility = damage/attack speed focus
+-- Vitality = durability/armor focus
+-- Endurance = health/regeneration focus
+-- =============================================================================
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+AoE4RPG.CLASS_DEFINITIONS = {
+    assassin = {
+        stat_type = "agility",
+        display = "Assassin",
+        class_key = "assassin",
+        can_be_elite = false,
+        damage_profile = "agility",
+        bonus_profile = "assassin_crit",
+        attribute_growth = { agility = 2.00, endurance = 1.00, vitality = 1.0 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    ranger = {
+        stat_type = "agility",
+        display = "Ranger",
+        class_key = "ranger",
+        can_be_elite = false,
+        damage_profile = "agility",
+        bonus_profile = "ranger_attack_speed",
+        attribute_growth = { agility = 3.5, endurance = 0.25, vitality = 0.25 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    skirmisher = {
+        stat_type = "agility",
+        display = "Skirmisher",
+        class_key = "skirmisher",
+        can_be_elite = true,
+        damage_profile = "agility",
+        bonus_profile = "skirmisher_regeneration",
+        attribute_growth = { agility = 2.25, endurance = 1.50, vitality = 0.25 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    initiator = {
+        stat_type = "vitality",
+        display = "Initiator",
+        class_key = "initiator",
+        can_be_elite = false,
+        damage_profile = "vitality",
+        bonus_profile = "initiator_melee_health_or_ranged_range",
+        attribute_growth = { agility = 1.25, endurance = 0.75, vitality = 2.00 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    duelist = {
+        stat_type = "vitality",
+        display = "Duelist",
+        class_key = "duelist",
+        can_be_elite = true,
+        damage_profile = "vitality",
+        bonus_profile = "duelist_doubled_vitality_armor",
+        attribute_growth = { agility = 0.75, endurance = 0.25, vitality = 3.00 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    technician = {
+        stat_type = "vitality",
+        display = "Technician",
+        class_key = "technician",
+        can_be_elite = false,
+        damage_profile = "vitality",
+        bonus_profile = "technician_repair_build_train",
+        attribute_growth = { agility = 0.25, endurance = 1.25, vitality = 2.00 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    commander = {
+        stat_type = "endurance",
+        display = "Commander",
+        class_key = "commander",
+        can_be_elite = false,
+        damage_profile = "endurance",
+        bonus_profile = "commander_health_regeneration",
+        attribute_growth = { agility = 0.25, endurance = 3.5, vitality = 0.25 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    roamer = {
+        stat_type = "endurance",
+        display = "Roamer",
+        class_key = "roamer",
+        can_be_elite = true,
+        damage_profile = "endurance",
+        bonus_profile = "roamer_endurance_armor",
+        attribute_growth = { agility = 0.25, endurance = 2.00, vitality = 1.75 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+    strategist = {
+        stat_type = "endurance",
+        display = "Strategist",
+        class_key = "strategist",
+        can_be_elite = false,
+        damage_profile = "endurance",
+        bonus_profile = "strategist_ability_cooldown",
+        attribute_growth = { agility = 0.50, endurance = 2.50, vitality = 1.00 },
+        unique_stat_growth = { agility = 0.0, endurance = 0.0, vitality = 0.0 },
+    },
+}
+
+-- Damage emphasis follows the overview's star ratings. Each class has exactly
+-- one damage driver: its `stat_type` (Agility, Endurance, or Vitality). Values
+-- are per raw primary-attribute point; the runtime formula additionally
+-- considers current health, derived armor, or attack-speed investment according
+-- to that one primary stat.
+AoE4RPG_CLASS_DAMAGE_PROFILES = {
+    -- Damage per primary-stat point is uniform within each attribute family.
+    assassin = { agility = 1.00 },
+    ranger = { agility = 1.00 },
+    skirmisher = { agility = 1.00 },
+    initiator = { vitality = 1.00 },
+    duelist = { vitality = 1.00 },
+    technician = { vitality = 1.00 },
+    commander = { endurance = 1.00 },
+    roamer = { endurance = 1.00 },
+    strategist = { endurance = 1.00 },
+}
+
+-- This picks a class by checking the unit's type tag.
+-- Change the tag strings or returned class names here when assigning classes to different units.
+function AoE4RPG_CLASS_GetClassForEntity(entity)
+    if not entity then
+        return nil
+    end
+
+    if Entity_IsOfType and Entity_IsOfType(entity, "sp_intel") then
+        return "assassin"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "hero") then
+        return "ranger"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "outlaw") then
+        return "skirmisher"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "spy") then
+        return "initiator"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "wolf") then
+        return "duelist"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "carpenter") then
+        return "technician"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "leader") then
+        return "commander"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "falcon") then
+        return "roamer"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "hq") then
+        return "strategist"
+    end
+
+    return nil
+end
+
+-- This checks if a class unit is also an elite bodyguard.
+-- Change the "bodyguard" tag if the map uses another squad property for elites.
+function AoE4RPG_ClassIsElite(entity)
+    if not entity then
+        return false
+    end
+
+    local class_name = AoE4RPG_CLASS_GetClassForEntity(entity)
+    if not class_name then
+        return false
+    end
+
+    local def = AoE4RPG.CLASS_DEFINITIONS[class_name]
+    if not def then
+        return false
+    end
+
+    if Entity_IsOfType and Entity_IsOfType(entity, "bodyguard") then
+        return def.can_be_elite
+    end
+
+    return false
+end
+
+-- This gives some class groups extra XP for attack, damage taken, or healing.
+-- Change the 1.5 values to tune bonus XP, or move class names between the three groups.
+function AoE4RPG_CLASS_GetExpMultiplier(entity, unit_data, mode)
+    if not entity then
+        return 1.0
+    end
+
+    local class_name = unit_data and unit_data.class_name or AoE4RPG_CLASS_GetClassForEntity(entity)
+    if not class_name then
+        return 1.0
+    end
+
+    if mode == "attack" then
+        if class_name == "assassin" or class_name == "ranger" or class_name == "skirmisher" then
+            return 1.5
+        end
+    elseif mode == "damage_taken" then
+        if class_name == "initiator" or class_name == "duelist" or class_name == "technician" then
+            return 1.5
+        end
+    elseif mode == "heal" then
+        if class_name == "commander" or class_name == "roamer" or class_name == "strategist" then
+            return 1.5
+        end
+    end
+
+    return 1.0
+end
+
+-- This gives the Initiator a different extra growth table for melee, ranged, or hybrid units.
+-- Change the three returned tables to tune each weapon profile.
+function AoE4RPG_CLASS_GetInitiatorGrowthProfile(entity)
+    if not entity then
+        return { agility = 0.0, endurance = 0.0, vitality = 0.0 }
+    end
+
+    local is_melee = Entity_IsOfType and Entity_IsOfType(entity, "melee")
+    local is_ranged = Entity_IsOfType and Entity_IsOfType(entity, "ranged")
+
+    if is_melee and is_ranged then
+        return { agility = 0.50, endurance = 1.25, vitality = 1.50 }
+    elseif is_melee then
+        return { agility = 0.00, endurance = 1.50, vitality = 1.75 }
+    elseif is_ranged then
+        return { agility = 1.00, endurance = 0.75, vitality = 0.75 }
+    end
+
+    return { agility = 0.0, endurance = 0.0, vitality = 0.0 }
+end
+
+-- This applies one level of class growth, special bonuses, and the final damage bonus.
+-- Most balance values are the multipliers in this function; base growth is in CLASS_DEFINITIONS above.
+-- Adjust: edit one class branch at a time so unrelated classes keep their current balance.
+function AoE4RPG_CLASS_ApplyGrowth(entity, class_name, level)
+    if not entity or not class_name then
+        return
+    end
+
+    local def = AoE4RPG.CLASS_DEFINITIONS[class_name]
+    if not def then
+        return
+    end
+
+    local unit_data = AoE4RPG_GetUnitData(entity.EntityID)
+    local civ = AoE4RPG_GetUnitCivilization(entity)
+    local unique_growth = AoE4RPG_GetUniqueGrowthForClass(civ, class_name)
+    local growth = def.attribute_growth
+
+    if class_name == "initiator" then
+        local initiator_profile = AoE4RPG_CLASS_GetInitiatorGrowthProfile(entity)
+        growth = {
+            agility = (growth.agility or 0) + (initiator_profile.agility or 0),
+            endurance = (growth.endurance or 0) + (initiator_profile.endurance or 0),
+            vitality = (growth.vitality or 0) + (initiator_profile.vitality or 0),
+        }
+    end
+
+    local agility_gain = (growth.agility or 0) + (unique_growth.agility or 0)
+    local endurance_gain = (growth.endurance or 0) + (unique_growth.endurance or 0)
+    local vitality_gain = (growth.vitality or 0) + (unique_growth.vitality or 0)
+
+    if agility_gain > 0 then
+        local attack_speed_multiplier = class_name == "ranger" and 2.0 or 1.0
+        AoE4RPG_ApplyStatModifier(entity, "attack_speed", agility_gain * 0.05 * attack_speed_multiplier)
+        if class_name == "skirmisher" and Modifier_ApplyToEntity then
+            Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "health_regeneration_modifier", MUT_Addition, false, agility_gain * 0.025, ""), entity, 0)
+        end
+    end
+
+    if endurance_gain > 0 then
+        local health_multiplier = class_name == "commander" and 1.25 or 1.0
+        AoE4RPG_ApplyStatModifier(entity, "health", endurance_gain * 10 * health_multiplier)
+        if class_name == "commander" and Modifier_ApplyToEntity then
+            Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "health_regeneration_modifier", MUT_Addition, false, endurance_gain * 0.075, ""), entity, 0)
+        end
+        AoE4RPG_ApplyStatModifier(entity, "armor", endurance_gain * 0.2)
+        if class_name == "roamer" then
+            -- Roamer's bonus armor is tied to its primary Endurance growth.
+            AoE4RPG_ApplyStatModifier(entity, "armor", endurance_gain * 0.3)
+        end
+    end
+
+    if vitality_gain > 0 then
+        -- Duelist receives exactly double the normal Vitality armor gain.
+        local armor_multiplier = class_name == "duelist" and 1.2 or 0.6
+        AoE4RPG_ApplyStatModifier(entity, "armor", vitality_gain * armor_multiplier)
+        if class_name == "initiator" and Entity_IsOfType and Entity_IsOfType(entity, "melee") then
+            AoE4RPG_ApplyStatModifier(entity, "health", vitality_gain * 5)
+        elseif class_name == "initiator" and Entity_IsOfType and Entity_IsOfType(entity, "ranged") and Modifier_ApplyToEntity then
+            Modifier_ApplyToEntity(Modifier_Create(MAT_Weapon, "range_weapon_modifier", MUT_MultiplicationAddition, false, vitality_gain * 0.02, ""), entity, 0)
+            unit_data.weapon_range_bonus = (unit_data.weapon_range_bonus or 0) + vitality_gain * 0.02
+        end
+    end
+
+    if class_name == "technician" and Modifier_ApplyToEntity then
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "repair_rate_modifier", MUT_MultiplicationAddition, false, vitality_gain * 0.02, ""), entity, 0)
+    end
+
+    -- These two values are kept in the RPG record because the current UAGS
+    -- modifier set exposes no proven crit chance/damage-factor modifier. A combat
+    -- resolver can consume them without changing the primary-stat damage rule.
+    if class_name == "assassin" then
+        unit_data.weapon_crit_damage_chance = (unit_data.weapon_crit_damage_chance or 0) + agility_gain * 0.01
+        unit_data.weapon_crit_damage_factor = (unit_data.weapon_crit_damage_factor or 0) + agility_gain * 0.02
+    end
+
+    -- Repair has a confirmed UAGS modifier; build/train bonuses remain tracked
+    -- for production systems that expose those modifiers in the host map.
+    if class_name == "technician" then
+        unit_data.build_speed_bonus = (unit_data.build_speed_bonus or 0) + vitality_gain * 0.50
+        unit_data.train_speed_bonus = (unit_data.train_speed_bonus or 0) + vitality_gain * 0.50
+        unit_data.production_speed_bonus = (unit_data.production_speed_bonus or 0) + vitality_gain * 0.50
+    end
+
+    unit_data.attributes.agility = (unit_data.attributes.agility or 0) + agility_gain
+    unit_data.attributes.endurance = (unit_data.attributes.endurance or 0) + endurance_gain
+    unit_data.attributes.vitality = (unit_data.attributes.vitality or 0) + vitality_gain
+    unit_data.class_name = class_name
+    unit_data.civilization = civ
+    unit_data.derived_stats = AoE4RPG_TranslateAttributesToStats(unit_data)
+
+    -- Strategist health regeneration also reduces weapon cooldown, but more
+    -- gently than Agility. Agility's normal attack-speed path is handled above;
+    -- this block applies only the Strategist-specific regeneration contribution.
+    if class_name == "strategist" and Modifier_ApplyToEntity then
+        local desired_weapon_cooldown = unit_data.attributes.endurance * 0.050
+            * AoE4RPG_GetPrimaryStatBonus(class_name) * 0.025
+        local previous_weapon_cooldown = unit_data.strategist_weapon_cooldown_applied or 0
+        local delta_weapon_cooldown = desired_weapon_cooldown - previous_weapon_cooldown
+        if math.abs(delta_weapon_cooldown) > 0.0001 then
+            Modifier_ApplyToEntity(Modifier_Create(MAT_Weapon, "cooldown_weapon_modifier", MUT_MultiplicationAddition, false, delta_weapon_cooldown, ""), entity, 0)
+            unit_data.strategist_weapon_cooldown_applied = desired_weapon_cooldown
+        end
+
+        -- Health regeneration also shortens ability recharge time. Apply the
+        -- incremental reduction as a multiplicative factor, matching UAGS.
+        local desired_ability_reduction = unit_data.derived_stats.ability_cooldown_modifier or 0
+        local previous_ability_reduction = unit_data.strategist_ability_cooldown_applied or 0
+        local delta_ability_reduction = desired_ability_reduction - previous_ability_reduction
+        if math.abs(delta_ability_reduction) > 0.0001 then
+            local ability_factor = math.max(0.01, 1 - delta_ability_reduction)
+            Modifier_ApplyToEntity(Modifier_Create(MAT_Ability, "ability_recharge_time_modifier", MUT_Multiplication, false, ability_factor, ""), entity, 0)
+            unit_data.strategist_ability_cooldown_applied = desired_ability_reduction
+        end
+    end
+
+    -- Damage is calculated after all class-specific health, armor, regeneration,
+    -- range, and attack-speed bonuses above have been applied.
+    -- Apply only the difference from the previous level so modifiers do not
+    -- repeatedly reapply historical attribute totals.
+    if AoE4RPG_CalculateClassDamageBonus and Modifier_ApplyToEntity then
+        local desired_damage_bonus = AoE4RPG_CalculateClassDamageBonus(entity, unit_data)
+        local previous_damage_bonus = unit_data.damage_bonus_applied or 0
+        local delta_damage_bonus = desired_damage_bonus - previous_damage_bonus
+        if math.abs(delta_damage_bonus) > 0.0001 then
+            local squad = Entity_GetSquad and Entity_GetSquad(entity)
+            local modifier = Modifier_Create(MAT_Weapon, "damage_weapon_modifier", MUT_MultiplicationAddition, false, delta_damage_bonus, "")
+            if squad and Modifier_ApplyToSquad then
+                Modifier_ApplyToSquad(modifier, squad, 0)
+            else
+                Modifier_ApplyToEntity(modifier, entity, 0)
+            end
+            unit_data.damage_bonus_applied = desired_damage_bonus
+        end
+    end
+
+    -- Siege engines use the same attribute growth but gain faster setup time from Agility
+    if Entity_IsOfType and Entity_IsOfType(entity, "siege") and Modifier_ApplyToEntity then
+        local setup_factor = math.max(0.25, 1 - (agility_gain or 0) * 0.01)
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Weapon, "weapon_setup_modifier", MUT_Multiplication, false, setup_factor, ""), entity, 0)
+    end
+end
+
+-- This saves the detected class and civilization into the unit's RPG data.
+-- Change class detection in GetClassForEntity instead of changing this helper.
+function AoE4RPG_CLASS_BindUnit(entity)
+    if not entity then
+        return
+    end
+
+    local eid = entity.EntityID
+    if not eid then
+        return
+    end
+
+    local class_name = AoE4RPG_CLASS_GetClassForEntity(entity)
+    if class_name then
+        local data = AoE4RPG_GetUnitData(eid)
+        data.class_name = class_name
+        data.civilization = AoE4RPG_GetUnitCivilization(entity)
+        -- Units created after match start get the same one-time critical setup
+        -- as starting units when they first enter the normal RPG bind path.
+        if AoE4RPG_EnableCriticalHits then
+            AoE4RPG_EnableCriticalHits(entity)
+        end
+    end
+end
