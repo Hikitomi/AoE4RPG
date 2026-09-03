@@ -1,0 +1,91 @@
+-- ================= AoE4RPG Projectiles ===============
+-- AoE4RPG Projectiles - Projectile Registry binds projectile blueprints to RPG effect rows.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_ability_list_compact.scar and AoE4RPG_effects.scar.
+-- ================= AoE4RPG Projectiles ===============
+
+if not AoE4RPG then AoE4RPG = {} end
+AoE4RPG.PROJECTILES = AoE4RPG.PROJECTILES or { entries = {}, registered = false }
+
+-- Registers a projectile blueprint name used by an ability-list row.
+function AoE4RPG_PROJECTILES_Register(projectile_blueprint, ability_name)
+    if not projectile_blueprint or not ability_name then return false end
+    local blueprint_name = type(projectile_blueprint) == "string"
+        and AoE4RPG_NormalizeBlueprintName
+        and AoE4RPG_NormalizeBlueprintName(projectile_blueprint)
+        or projectile_blueprint
+    AoE4RPG.PROJECTILES.entries[blueprint_name] = ability_name
+    return true
+end
+
+-- Extracts a blueprint name from the projectile event payload when the host exposes it.
+-- The documented event always supplies attacker and target; the blueprint field is host/version dependent.
+function AoE4RPG_PROJECTILES_GetBlueprint(projectile)
+    if not projectile then return nil end
+    local value = projectile.projectile_blueprint or projectile.blueprint or projectile.projectile
+    -- Some engine versions wrap projectile data in another Lua table.
+    -- IMPORTANT: Native BP_GetName accepts only a PropertyBagGroup, so unwrap common fields and reject unresolved tables/numbers before crossing that native boundary.
+    if type(value) == "table" then
+        value = value.projectile_blueprint
+            or value.blueprint
+            or value.blueprint_name
+            or value.name
+            or value.pbg
+    end
+    if type(value) == "string" then
+        return AoE4RPG_NormalizeBlueprintName
+            and AoE4RPG_NormalizeBlueprintName(value)
+            or value
+    end
+    if type(value) == "table" or type(value) == "number" then
+        return nil
+    end
+    if BP_GetName and value then
+        local resolved_name = BP_GetName(value)
+        if type(resolved_name) == "string" then
+            return AoE4RPG_NormalizeBlueprintName
+                and AoE4RPG_NormalizeBlueprintName(resolved_name)
+                or resolved_name
+        end
+    end
+    return nil
+end
+
+-- Applies a landed projectile's configured effect to its documented target.
+-- XML remains responsible for creating and firing the projectile itself.
+function AoE4RPG_PROJECTILES_OnLanded(projectile)
+    if not projectile or not projectile.attacker or not projectile.target
+        or not AoE4RPG_ABILITY_LIST_GetEffectData
+        or not AoE4RPG_EFFECTS_ApplyTargetEffect then return end
+    local blueprint = AoE4RPG_PROJECTILES_GetBlueprint(projectile)
+    local ability_name = blueprint and AoE4RPG.PROJECTILES.entries[blueprint]
+    if not ability_name then return end
+    local effect = AoE4RPG_ABILITY_LIST_GetEffectData(ability_name, projectile.attacker)
+    if not effect then return end
+    local marker_data = { marker = projectile.target, owner = projectile.attacker, effect = effect, hit_targets = {} }
+    AoE4RPG_EFFECTS_ApplyTargetEffect(marker_data, projectile.target)
+end
+
+-- Registers every projectile-mode ability row that declares projectile_blueprint.
+function AoE4RPG_PROJECTILES_RegisterAbilityRows()
+    for _, ability in ipairs(AoE4RPG.ABILITY_LIST or {}) do
+        local marker_type = ability.marker_type or ability.marker_dispatch
+        if (marker_type == "projectile" or marker_type == "projectiles") and ability.projectile_blueprint then
+            AoE4RPG_PROJECTILES_Register(ability.projectile_blueprint, ability.ability_name or ability.ability)
+        end
+    end
+end
+
+function AoE4RPG_PROJECTILES_Start()
+    AoE4RPG_PROJECTILES_RegisterAbilityRows()
+    if AoE4RPG.PROJECTILES.registered or not Rule_AddGlobalEvent or not GE_ProjectileLanded then return false end
+    Rule_AddGlobalEvent(AoE4RPG_PROJECTILES_OnLanded, GE_ProjectileLanded)
+    AoE4RPG.PROJECTILES.registered = true
+    return true
+end
+
+function AoE4RPG_PROJECTILES_Stop()
+    if AoE4RPG.PROJECTILES.registered and Rule_RemoveGlobalEvent then Rule_RemoveGlobalEvent(AoE4RPG_PROJECTILES_OnLanded) end
+    AoE4RPG.PROJECTILES.registered = false
+    AoE4RPG.PROJECTILES.entries = {}
+end

@@ -64,13 +64,22 @@ function AoE4RPG_DebugCheat_IDDQD(player_id, data)
     SGroup_ForEach(selected, grant_required_exp)
 end
 
--- The native cheat.scar initializes the global `cheats` table first. Register
--- after it so IDDQD is available through the same GE_BroadcastMessage path.
+-- Register IDDQD in the native chat-cheat dispatch table. SCAR initialization
+-- callbacks are not assumed to run in import order, so initialize cheat.scar's
+-- dispatcher here when its table has not been created yet. Cheat_Init is
+-- idempotent: its own later Scar_AddInit callback will see the existing table
+-- and leave this registration intact.
 -- Adjust: change "IDDQD" here if a different debug chat code is wanted.
 function AoE4RPG_DebugCheat_Init()
-    if cheats then
-        cheats["IDDQD"] = AoE4RPG_DebugCheat_IDDQD
+    if not cheats and Cheat_Init then
+        Cheat_Init()
     end
+
+    if not cheats then
+        return
+    end
+
+    cheats["IDDQD"] = AoE4RPG_DebugCheat_IDDQD
 end
 
 if Scar_AddInit then

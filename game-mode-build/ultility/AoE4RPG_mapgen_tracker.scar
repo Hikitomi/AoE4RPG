@@ -1,0 +1,86 @@
+-- ================= AoE4RPG Mapgen Tracker ===============
+-- AoE4RPG Mapgen Tracker -- Map Entity Tracker captures map-generated neutral entities for efficient resource updates.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_economic_blueprints.scar and AoE4RPG_entity_tracker.scar.
+-- ================= AoE4RPG Mapgen Tracker ===============
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+AoE4RPG.MAPGEN_TRACKER = AoE4RPG.MAPGEN_TRACKER or {
+    initialized = false,
+    tracked_entity_ids = {},
+    tracked_entity_records = {},
+}
+
+function AoE4RPG_MAPGEN_TRACKER_GetEntityID(entity)
+    if AoE4RPG_RUNTIME_GetEntityIdentifier then
+        return AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+    end
+    if type(entity) == "number" then
+        return entity
+    end
+    if not entity then
+        return nil
+    end
+    return entity.EntityID or (Entity_GetID and Entity_GetID(entity))
+end
+
+-- World_OwnsEntity is true for ownerless/neutral Gaia entities in AoE4 SCAR.
+function AoE4RPG_MAPGEN_TRACKER_IsNeutralEntity(entity)
+    return entity ~= nil and (not World_OwnsEntity or World_OwnsEntity(entity))
+end
+
+function AoE4RPG_MAPGEN_TRACKER_RegisterEntity(entity, resource_name)
+    if not AoE4RPG_MAPGEN_TRACKER_IsNeutralEntity(entity) then
+        return false
+    end
+    local entity_id = AoE4RPG_MAPGEN_TRACKER_GetEntityID(entity)
+    if not entity_id then
+        return false
+    end
+    local tracker = AoE4RPG.MAPGEN_TRACKER
+    tracker.tracked_entity_ids[entity_id] = true
+    tracker.tracked_entity_records[entity_id] = {
+        entity_id = entity_id,
+        resource_name = resource_name,
+    }
+    return true
+end
+
+function AoE4RPG_MAPGEN_TRACKER_IsTrackedEntityIdentifier(entity_id)
+    return entity_id ~= nil
+        and AoE4RPG.MAPGEN_TRACKER.tracked_entity_ids[entity_id] == true
+end
+
+function AoE4RPG_MAPGEN_TRACKER_ForEachTrackedEntity(callback)
+    if type(callback) ~= "function" then
+        return
+    end
+    for entity_id, record in pairs(AoE4RPG.MAPGEN_TRACKER.tracked_entity_records) do
+        local entity = Entity_FromID and Entity_FromID(entity_id) or nil
+        if entity and (not Entity_IsValid or Entity_IsValid(entity_id)) then
+            callback(entity, entity_id, record)
+        end
+    end
+end
+
+-- Registers the neutral set supplied by the map generator.
+-- IMPORTANT: The resource modifier module may then consume this registry without involving units.
+function AoE4RPG_MAPGEN_TRACKER_ScanNeutralEntities(entity_group)
+    if not entity_group or not EGroup_ForEach then
+        return false
+    end
+    EGroup_ForEach(entity_group, function(_, _, entity)
+        AoE4RPG_MAPGEN_TRACKER_RegisterEntity(entity)
+    end)
+    AoE4RPG.MAPGEN_TRACKER.initialized = true
+    return true
+end
+
+function AoE4RPG_MAPGEN_TRACKER_Shutdown()
+    AoE4RPG.MAPGEN_TRACKER.initialized = false
+    AoE4RPG.MAPGEN_TRACKER.tracked_entity_ids = {}
+    AoE4RPG.MAPGEN_TRACKER.tracked_entity_records = {}
+end

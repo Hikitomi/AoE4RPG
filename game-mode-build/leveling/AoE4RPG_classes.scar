@@ -1,0 +1,2916 @@
+-- ================= AoE4RPG Classes ===============
+-- AoE4RPG Classes - Class Definitions defines class attributes, growth, roles, and class bonuses.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_core.scar, AoE4RPG_blueprints.scar, and AoE4RPG_random_bonus.scar.
+-- ================= AoE4RPG Classes ===============
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+-- The active class definition fields are `stat_type`, `can_be_elite`, and `attribute_growth`.
+AoE4RPG.CLASS_DEFINITIONS = {
+    assassin = {
+        stat_type = "agility",
+        can_be_elite = false,
+        attribute_growth = { agility = 3.00, endurance = 2.00, vitality = 1.00 },
+    },
+    ranger = {
+        stat_type = "agility",
+        can_be_elite = false,
+        attribute_growth = { agility = 3.5, endurance = 1.25, vitality = 1.25 },
+    },
+    skirmisher = {
+        stat_type = "agility",
+        can_be_elite = true,
+        attribute_growth = { agility = 2.75, endurance = 2.00, vitality = 1.25 },
+    },
+    initiator = {
+        stat_type = "vitality",
+        can_be_elite = false,
+        attribute_growth = { agility = 1.75, endurance = 1.75, vitality = 2.50 },
+    },
+    duelist = {
+        stat_type = "vitality",
+        can_be_elite = true,
+        attribute_growth = { agility = 1.75, endurance = 1.25, vitality = 3.00 },
+    },
+    technician = {
+        stat_type = "vitality",
+        can_be_elite = true,
+        attribute_growth = { agility = 0.25, endurance = 2.25, vitality = 3.00 },
+    },
+    commander = {
+        stat_type = "endurance",
+        can_be_elite = false,
+        attribute_growth = { agility = 0.75, endurance = 3.5, vitality = 1.75 },
+    },
+    roamer = {
+        stat_type = "endurance",
+        can_be_elite = true,
+        attribute_growth = { agility = 0.25, endurance = 3.00, vitality = 2.75 },
+    },
+    strategist = {
+        stat_type = "endurance",
+        can_be_elite = false,
+        attribute_growth = { agility = 2.00, endurance = 3.00, vitality = 1.00 },
+    },
+}
+
+-- IMPORTANT: Native class upgrades are selected automatically when a class reaches a new RPG bracket.
+-- IMPORTANT: The state is separated by player and class because native upgrades are completed on a player, while two players may develop the same class independently.
+AoE4RPG.CLASS_BRACKET_ATTRIBUTE_UPGRADES = {}
+AoE4RPG.CLASS_ATTRIBUTE_UPGRADE_TYPES = {
+    { key = "health", suffix = "health" },
+    { key = "armor", suffix = "armor" },
+    { key = "weapon_range", suffix = "weapon_range" },
+}
+AoE4RPG.CLASS_UNLEVELLED_UPGRADE_TYPES = {
+    { key = "speed", suffix = "speed" },
+    { key = "siege_setup", suffix = "siege_setup" },
+}
+AoE4RPG.CLASS_UNLEVELLED_UPGRADE_CHANCE = 0.10 -- 10% chance per reached bracket.
+
+function AoE4RPG_CLASS_GetUnlevelledUpgradeSuffix(upgrade_key)
+    for _, upgrade_type in ipairs(AoE4RPG.CLASS_UNLEVELLED_UPGRADE_TYPES or {}) do
+        if upgrade_type.key == upgrade_key then
+            return upgrade_type.suffix
+        end
+    end
+    return upgrade_key
+end
+
+-- ==================== Commander Regeneration Aura ==============
+-- Commanders improve the health regeneration of nearby friendly units.
+-- The aura uses a fixed base radius and gains exactly one radius unit per internal level.
+-- IMPORTANT: A unit receives only the strongest Commander aura, so Commander bonuses never stack with each other or with repeated monitor refreshes.
+-- ==================== Commander Regeneration Aura ==============
+
+AoE4RPG.COMMANDER_REGENERATION_AURA_BASE_RADIUS = 10.0 -- Starting aura radius.
+AoE4RPG.COMMANDER_REGENERATION_AURA_RADIUS_PER_LEVEL = 1.0 -- Radius gained per level.
+AoE4RPG.COMMANDER_REGENERATION_PER_ENDURANCE = 0.0025 -- 0.25% regeneration per Endurance.
+AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS = {}
+AoE4RPG.commander_regeneration_aura_monitor_registered = false
+AoE4RPG.commander_regeneration_aura_dirty = true
+AoE4RPG.commander_regeneration_aura_elapsed = 1.0
+AoE4RPG.commander_regeneration_aura_refresh_interval = 1.0
+AoE4RPG.commander_regeneration_aura_signature = nil
+AoE4RPG.COMMANDER_SELF_REGENERATION_BASE_RATE = 0.02 -- 2% of maximum health before bracket growth.
+AoE4RPG.COMMANDER_SELF_REGENERATION_RATE_PER_BRACKET = 0.01 -- +1% of maximum health per bracket.
+AoE4RPG.COMMANDER_SELF_REGENERATION_REFRESH_INTERVAL = 0.25 -- Refresh after bracket or max-health changes.
+AoE4RPG.commander_self_regeneration_monitor_registered = false
+AoE4RPG.CLASS_RUNTIME_REFRESH_INTERVAL = 0.25
+AoE4RPG.class_runtime_monitor_registered = false
+
+-- Awards XP for positive self-health changes observed between synchronized runtime ticks.
+-- IMPORTANT: Max-health changes are excluded so level growth cannot be mistaken for healing.
+function AoE4RPG_CLASS_TrackSelfHealing(entity, unit_data)
+    if not entity or not unit_data or not Entity_GetHealth or not Entity_GetHealthMax then
+        return false
+    end
+    local class_name = unit_data.class_name
+    if (class_name ~= "commander" and class_name ~= "roamer" and class_name ~= "strategist")
+        or not (unit_data.is_hero or unit_data.is_elite) then
+        return false
+    end
+    local current_health = Entity_GetHealth(entity)
+    local maximum_health = Entity_GetHealthMax(entity)
+    if not current_health or not maximum_health or maximum_health <= 0 then
+        return false
+    end
+    local previous_health = unit_data.healing_observed_health
+    local previous_maximum_health = unit_data.healing_observed_max_health
+    unit_data.healing_observed_health = current_health
+    unit_data.healing_observed_max_health = maximum_health
+    if previous_health == nil or previous_maximum_health == nil
+        or math.abs(previous_maximum_health - maximum_health) > 0.0001 then
+        return false
+    end
+    local restored_health = current_health - previous_health
+    if restored_health <= 0 then
+        return false
+    end
+    return AoE4RPG_AwardHealingExperience
+        and AoE4RPG_AwardHealingExperience(entity, restored_health, entity)
+        or false
+end
+
+-- Calculates the flat health regeneration granted to the Commander itself.
+function AoE4RPG_CLASS_GetCommanderSelfRegeneration(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "commander"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not Entity_GetHealthMax then
+        return 0
+    end
+    local tracking_entry = AoE4RPG_GetBlueprintTrackingEntryForEntity
+        and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+        or nil
+    if tracking_entry and (tracking_entry.role == "attached" or tracking_entry.parent_unit_type) then
+        return 0
+    end
+
+    local maximum_health = Entity_GetHealthMax(entity)
+    if not maximum_health or maximum_health <= 0 then
+        return 0
+    end
+    local bracket_index = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 0
+    local regeneration_rate = AoE4RPG.COMMANDER_SELF_REGENERATION_BASE_RATE
+        + math.max(0, bracket_index or 0)
+            * AoE4RPG.COMMANDER_SELF_REGENERATION_RATE_PER_BRACKET
+    local regeneration = maximum_health * regeneration_rate
+    if AoE4RPG_RoundToStep then
+        regeneration = AoE4RPG_RoundToStep(regeneration, 0.25)
+    end
+    return math.max(0, regeneration)
+end
+
+function AoE4RPG_CLASS_UpdateCommanderSelfRegeneration(entity, unit_data)
+    if not entity or not unit_data or not Modifier_Create
+        or not Modifier_ApplyToEntity or not AoE4RPG_CLASS_ApplyModifierToEntity then
+        return false
+    end
+    local desired_regeneration = AoE4RPG_CLASS_GetCommanderSelfRegeneration(entity, unit_data)
+    local previous_regeneration = unit_data.commander_self_regeneration_applied or 0
+    local delta = desired_regeneration - previous_regeneration
+    if math.abs(delta) <= 0.0001 then
+        return false
+    end
+    local modifier_id = AoE4RPG_CLASS_ApplyModifierToEntity(
+        entity,
+        Modifier_Create(
+            MAT_Entity,
+            "health_regeneration_modifier",
+            MUT_Addition,
+            false,
+            delta,
+            ""
+        )
+    )
+    if not modifier_id then
+        return false
+    end
+    unit_data.commander_self_regeneration_applied = desired_regeneration
+    return true
+end
+
+-- Refreshes Commander self-regeneration after bracket or maximum-health changes.
+function AoE4RPG_CLASS_MonitorCommanderSelfRegeneration()
+    if not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity then
+        return false
+    end
+    AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(function(entity)
+        local unit_data = entity and entity.EntityID
+            and AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity.EntityID)
+            or nil
+        if unit_data and unit_data.class_name == "commander"
+            and (unit_data.is_hero or unit_data.is_elite) then
+            AoE4RPG_CLASS_UpdateCommanderSelfRegeneration(entity, unit_data)
+        end
+    end)
+    return true
+end
+
+-- Starts the synchronized Commander self-regeneration refresh rule.
+function AoE4RPG_CLASS_StartCommanderSelfRegeneration()
+    if AoE4RPG.class_runtime_monitor_registered then
+        return true
+    end
+    if AoE4RPG.commander_self_regeneration_monitor_registered then
+        return true
+    end
+    if not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(
+        AoE4RPG_CLASS_MonitorCommanderSelfRegeneration,
+        AoE4RPG.COMMANDER_SELF_REGENERATION_REFRESH_INTERVAL
+    )
+    AoE4RPG.commander_self_regeneration_monitor_registered = true
+    return true
+end
+
+-- Stops the Commander self-regeneration refresh rule.
+function AoE4RPG_CLASS_StopCommanderSelfRegeneration()
+    if AoE4RPG.commander_self_regeneration_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_CLASS_MonitorCommanderSelfRegeneration)
+    end
+    AoE4RPG.commander_self_regeneration_monitor_registered = false
+    return true
+end
+
+-- Damage emphasis follows the overview's star ratings.
+-- Each class has exactly one damage driver: its `stat_type` (Agility, Endurance, or Vitality).
+AoE4RPG_CLASS_DAMAGE_PROFILES = {
+    -- Damage per primary-stat point is uniform within each attribute family.
+    -- IMPORTANT: RPG damage scaling is intentionally reduced to half strength.
+    assassin = { agility = 0.375 },
+    ranger = { agility = 0.25 },
+    skirmisher = { agility = 0.375 },
+    initiator = { vitality = 0.50 },
+    duelist = { vitality = 0.375 },
+    technician = { vitality = 0.125 },
+    commander = { endurance = 0.25 },
+    roamer = { endurance = 0.50 },
+    strategist = { endurance = 0.25 },
+}
+
+-- ==================== Roamer Health Armor ==============
+-- Roamers gain armor from their maximum health.
+-- The pool grows when the Roamer reaches a new level bracket and is refreshed during combat.
+-- ==================== Roamer Health Armor ==============
+AoE4RPG.ROAMER_HEALTH_ARMOR_BASE_RATE = 0.01 -- 1% of maximum health before bracket growth.
+AoE4RPG.ROAMER_HEALTH_ARMOR_RATE_PER_BRACKET = 0.005 -- +0.5% of maximum health per bracket.
+AoE4RPG.ROAMER_HEALTH_ARMOR_HEALTH_STEP = 0.20 -- 20% current-health bands.
+AoE4RPG.ROAMER_HEALTH_ARMOR_EFFECTIVENESS_STEP = 0.20 -- Reduce effectiveness by 20% per band.
+AoE4RPG.ROAMER_HEALTH_ARMOR_MIN_EFFECTIVENESS = 0.20 -- Full health retains 20% of the pool.
+AoE4RPG.ROAMER_HEALTH_ARMOR_REFRESH_INTERVAL = 0.25 -- Recalculate current-health effectiveness.
+AoE4RPG.roamer_health_armor_monitor_registered = false
+
+-- Converts current-health percentage into the configured Roamer armor multiplier.
+function AoE4RPG_CLASS_GetRoamerHealthArmorEffectiveness(health_ratio)
+    local ratio = math.max(0, math.min(1, tonumber(health_ratio) or 1))
+    local health_step = math.max(0.01, AoE4RPG.ROAMER_HEALTH_ARMOR_HEALTH_STEP)
+    local effectiveness_step = AoE4RPG.ROAMER_HEALTH_ARMOR_EFFECTIVENESS_STEP
+    local band = math.floor(ratio / health_step)
+    local effectiveness = 1 - band * effectiveness_step
+    return math.max(AoE4RPG.ROAMER_HEALTH_ARMOR_MIN_EFFECTIVENESS, effectiveness)
+end
+
+-- Calculates the current armor pool before it is applied as four armor types.
+function AoE4RPG_CLASS_GetRoamerHealthArmor(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "roamer"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not Entity_GetHealth or not Entity_GetHealthMax then
+        return 0
+    end
+    local tracking_entry = AoE4RPG_GetBlueprintTrackingEntryForEntity
+        and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+        or nil
+    if tracking_entry and (tracking_entry.role == "attached" or tracking_entry.parent_unit_type) then
+        return 0
+    end
+
+    local maximum_health = Entity_GetHealthMax(entity)
+    local current_health = Entity_GetHealth(entity)
+    if not maximum_health or maximum_health <= 0 or not current_health then
+        return 0
+    end
+
+    local health_ratio = math.max(0, math.min(1, current_health / maximum_health))
+    local bracket_index = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 0
+    local pool_rate = AoE4RPG.ROAMER_HEALTH_ARMOR_BASE_RATE
+        + math.max(0, bracket_index or 0) * AoE4RPG.ROAMER_HEALTH_ARMOR_RATE_PER_BRACKET
+    local armor_pool = maximum_health * pool_rate
+        * AoE4RPG_CLASS_GetRoamerHealthArmorEffectiveness(health_ratio)
+    if AoE4RPG_RoundToStep then
+        armor_pool = AoE4RPG_RoundToStep(armor_pool, 0.25)
+    end
+    return math.max(0, armor_pool)
+end
+
+function AoE4RPG_CLASS_UpdateRoamerHealthArmor(entity, unit_data)
+    if not entity or not unit_data or not AoE4RPG_ApplyStatModifier
+        or not Modifier_ApplyToEntity then
+        return false
+    end
+    local desired_bonus = AoE4RPG_CLASS_GetRoamerHealthArmor(entity, unit_data)
+    local previous_bonus = unit_data.roamer_health_armor_applied or 0
+    local delta = desired_bonus - previous_bonus
+    if math.abs(delta) <= 0.0001 then
+        return false
+    end
+    AoE4RPG_ApplyStatModifier(entity, "armor", delta)
+    unit_data.roamer_health_armor_applied = desired_bonus
+    return true
+end
+
+-- Refreshes Roamer armor effectiveness from current health and bracket state.
+function AoE4RPG_CLASS_MonitorRoamerHealthArmor()
+    if not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity then
+        return false
+    end
+    AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(function(entity)
+        local unit_data = entity and entity.EntityID
+            and AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity.EntityID)
+            or nil
+        if unit_data then
+            AoE4RPG_CLASS_UpdateRoamerHealthArmor(entity, unit_data)
+        end
+    end)
+    return true
+end
+
+-- Starts the synchronized Roamer health-armor refresh rule.
+function AoE4RPG_CLASS_StartRoamerHealthArmor()
+    if AoE4RPG.class_runtime_monitor_registered then
+        return true
+    end
+    if AoE4RPG.roamer_health_armor_monitor_registered then
+        return true
+    end
+    if not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(
+        AoE4RPG_CLASS_MonitorRoamerHealthArmor,
+        AoE4RPG.ROAMER_HEALTH_ARMOR_REFRESH_INTERVAL
+    )
+    AoE4RPG.roamer_health_armor_monitor_registered = true
+    return true
+end
+
+-- Stops the Roamer refresh rule and clears its registration state.
+function AoE4RPG_CLASS_StopRoamerHealthArmor()
+    if AoE4RPG.roamer_health_armor_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_CLASS_MonitorRoamerHealthArmor)
+    end
+    AoE4RPG.roamer_health_armor_monitor_registered = false
+    return true
+end
+
+-- ==================== Initiator Idle Damage ==============
+-- Initiators build a temporary weapon-damage bonus while they have not attacked.
+-- The first bracket gains 10% damage for each complete two-second interval.
+-- Each additional bracket adds 5 percentage points to every two-second interval.
+-- The maximum idle duration starts at 6 seconds and grows by 1 second per bracket.
+-- IMPORTANT: A successful attack or recent attack state resets the timer and removes the temporary modifier.
+-- ==================== Initiator Idle Damage ==============
+
+AoE4RPG.INITIATOR_IDLE_DAMAGE_BASE_RATE_PER_INTERVAL = 0.05 -- Bracket 1: +5% damage per complete two-second interval.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_RATE_PER_BRACKET_PER_INTERVAL = 0.025 -- Each later bracket adds +2.5% damage per two-second interval.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_INTERVAL_SECONDS = 2.0 -- One idle-damage stack is gained every 2 seconds.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_BASE_MAX_SECONDS = 6.0 -- Bracket 1: maximum idle duration is 6 seconds.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_MAX_SECONDS_PER_BRACKET = 1.0 -- Each additional bracket adds 1 second to the maximum duration.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_REFRESH_INTERVAL = 0.25 -- Monitor interval and elapsed-time increment in seconds.
+AoE4RPG.initiator_idle_damage_monitor_registered = false
+
+-- IMPORTANT: Returns the Initiator's current idle damage percentage in modifier units.
+function AoE4RPG_CLASS_GetInitiatorIdleDamageBonus(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "initiator"
+        or not (unit_data.is_hero or unit_data.is_elite) then
+        return 0
+    end
+
+    local bracket_index = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 1
+    local bracket_rate = math.max(0, tonumber(AoE4RPG.INITIATOR_IDLE_DAMAGE_BASE_RATE_PER_INTERVAL) or 0)
+        + math.max(0, (tonumber(bracket_index) or 1) - 1)
+            * math.max(0, tonumber(AoE4RPG.INITIATOR_IDLE_DAMAGE_RATE_PER_BRACKET_PER_INTERVAL) or 0)
+    local idle_seconds = math.max(0, tonumber(unit_data.initiator_idle_seconds) or 0)
+    local maximum_idle_seconds = math.max(0, tonumber(AoE4RPG.INITIATOR_IDLE_DAMAGE_BASE_MAX_SECONDS) or 0)
+        + math.max(0, (tonumber(bracket_index) or 1) - 1)
+            * math.max(0, tonumber(AoE4RPG.INITIATOR_IDLE_DAMAGE_MAX_SECONDS_PER_BRACKET) or 0)
+    if maximum_idle_seconds > 0 then
+        idle_seconds = math.min(idle_seconds, maximum_idle_seconds)
+    end
+
+    local interval_seconds = math.max(0.01,
+        tonumber(AoE4RPG.INITIATOR_IDLE_DAMAGE_INTERVAL_SECONDS) or 2.0)
+    local stack_count = math.floor((idle_seconds + 0.0001) / interval_seconds)
+    local bonus = stack_count * bracket_rate
+    if AoE4RPG_Round then
+        bonus = AoE4RPG_Round(bonus, 2)
+    end
+    return math.max(0, bonus)
+end
+
+-- IMPORTANT: Removes the current temporary Initiator idle-damage modifier and resets its timer.
+function AoE4RPG_CLASS_ResetInitiatorIdleDamage(entity, unit_data)
+    if not unit_data then
+        return false
+    end
+    if unit_data.initiator_idle_damage_modifier_id and Modifier_Remove then
+        Modifier_Remove(unit_data.initiator_idle_damage_modifier_id)
+    end
+    local changed = (unit_data.initiator_idle_seconds or 0) ~= 0
+        or (unit_data.initiator_idle_damage_applied or 0) ~= 0
+        or unit_data.initiator_idle_damage_modifier_id ~= nil
+    unit_data.initiator_idle_seconds = 0
+    unit_data.initiator_idle_damage_applied = 0
+    unit_data.initiator_idle_damage_modifier_id = nil
+    return changed
+end
+
+-- IMPORTANT: Applies only the current difference by replacing one temporary modifier.
+-- IMPORTANT: A squad modifier is preferred so all weapons belonging to a hero squad receive the same bonus; the entity path remains available for entities without squads.
+function AoE4RPG_CLASS_UpdateInitiatorIdleDamage(entity, unit_data)
+    if not entity or not unit_data or not Modifier_Create
+        or not Modifier_ApplyToEntity then
+        return false
+    end
+
+    local desired_bonus = AoE4RPG_CLASS_GetInitiatorIdleDamageBonus(entity, unit_data)
+    local previous_bonus = tonumber(unit_data.initiator_idle_damage_applied) or 0
+    if math.abs(desired_bonus - previous_bonus) <= 0.0001 then
+        return false
+    end
+
+    if unit_data.initiator_idle_damage_modifier_id and Modifier_Remove then
+        Modifier_Remove(unit_data.initiator_idle_damage_modifier_id)
+    end
+    unit_data.initiator_idle_damage_modifier_id = nil
+    unit_data.initiator_idle_damage_applied = 0
+
+    if desired_bonus <= 0 then
+        return true
+    end
+
+    local modifier = Modifier_Create(
+        MAT_Weapon,
+        "damage_weapon_modifier",
+        MUT_MultiplicationAddition,
+        false,
+        desired_bonus,
+        ""
+    )
+    local modifier_id = nil
+    local squad = Entity_GetSquad and Entity_GetSquad(entity) or nil
+    if squad and Modifier_ApplyToSquad then
+        modifier_id = Modifier_ApplyToSquad(modifier, squad, 0)
+    else
+        modifier_id = Modifier_ApplyToEntity(modifier, entity, 0)
+    end
+    if not modifier_id then
+        return false
+    end
+
+    unit_data.initiator_idle_damage_modifier_id = modifier_id
+    unit_data.initiator_idle_damage_applied = desired_bonus
+    return true
+end
+
+-- Accumulates idle seconds for Initiators and resets the bonus after an attack.
+function AoE4RPG_CLASS_MonitorInitiatorIdleDamage()
+    if not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity
+        or not Entity_IsAttacking then
+        return false
+    end
+
+    AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(function(entity)
+        local unit_data = entity and entity.EntityID
+            and AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity.EntityID)
+            or nil
+        if not unit_data or unit_data.class_name ~= "initiator"
+            or not (unit_data.is_hero or unit_data.is_elite) then
+            return
+        end
+
+        -- This AoE4 build requires the elapsed look-back window as the second argument.
+        -- IMPORTANT: Keep the query compatible with the native Scar signature.
+        if Entity_IsAttacking(entity, AoE4RPG.INITIATOR_IDLE_DAMAGE_REFRESH_INTERVAL) then
+            AoE4RPG_CLASS_ResetInitiatorIdleDamage(entity, unit_data)
+            return
+        end
+
+        unit_data.initiator_idle_seconds = math.max(0,
+            tonumber(unit_data.initiator_idle_seconds) or 0)
+            + AoE4RPG.INITIATOR_IDLE_DAMAGE_REFRESH_INTERVAL
+        AoE4RPG_CLASS_UpdateInitiatorIdleDamage(entity, unit_data)
+    end)
+    return true
+end
+
+-- Starts the synchronized Initiator idle-damage refresh rule.
+function AoE4RPG_CLASS_StartInitiatorIdleDamage()
+    if AoE4RPG.class_runtime_monitor_registered then
+        return true
+    end
+    if AoE4RPG.initiator_idle_damage_monitor_registered then
+        return true
+    end
+    if not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(
+        AoE4RPG_CLASS_MonitorInitiatorIdleDamage,
+        AoE4RPG.INITIATOR_IDLE_DAMAGE_REFRESH_INTERVAL
+    )
+    AoE4RPG.initiator_idle_damage_monitor_registered = true
+    return true
+end
+
+-- Stops the Initiator idle-damage refresh rule.
+function AoE4RPG_CLASS_StopInitiatorIdleDamage()
+    if AoE4RPG.initiator_idle_damage_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_CLASS_MonitorInitiatorIdleDamage)
+    end
+    AoE4RPG.initiator_idle_damage_monitor_registered = false
+    return true
+end
+
+-- ==================== Strategist Attack Regeneration ==============
+-- ==================== Strategist Attack Regeneration ==============
+
+AoE4RPG.STRATEGIST_ATTACK_REGENERATION_BASE_PER_STACK = 0.002 -- Bracket 1: +0.2% of maximum health per stack.
+AoE4RPG.STRATEGIST_ATTACK_REGENERATION_PER_BRACKET_PER_STACK = 0.001 -- Each bracket adds +0.1% per stack.
+AoE4RPG.STRATEGIST_ATTACK_REGENERATION_MAX_STACKS = 5 -- Maximum accumulated attack stacks.
+AoE4RPG.STRATEGIST_ATTACK_REGENERATION_NEXT_STACK_WINDOW = 1.0 -- IMPORTANT: Next attack must occur within this many seconds.
+AoE4RPG.STRATEGIST_ATTACK_REGENERATION_RESET_BASE_SECONDS = 4.0 -- Base no-attack time before all regeneration resets.
+AoE4RPG.STRATEGIST_ATTACK_REGENERATION_RESET_SECONDS_PER_BRACKET = 1.0 -- Additional reset time per bracket level.
+AoE4RPG.STRATEGIST_ATTACK_REGENERATION_REFRESH_INTERVAL = 0.25 -- Expiration and health refresh interval in seconds.
+AoE4RPG.strategist_attack_regeneration_monitor_registered = false
+
+-- Returns synchronized game time for the attack-stack window and expiration check.
+function AoE4RPG_CLASS_GetStrategistAttackRegenerationTime()
+    if Game_GetTime then
+        local game_time = Game_GetTime()
+        if game_time ~= nil then
+            return game_time
+        end
+    end
+    if World_GetGameTime then
+        return World_GetGameTime()
+    end
+    return nil
+end
+
+-- Returns the current bracket-based no-attack duration before regeneration resets.
+function AoE4RPG_CLASS_GetStrategistAttackRegenerationResetSeconds(entity, unit_data)
+    local bracket_index = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data and unit_data.level or 0, entity, unit_data)
+        or 1
+    return math.max(0,
+        tonumber(AoE4RPG.STRATEGIST_ATTACK_REGENERATION_RESET_BASE_SECONDS) or 0)
+        + math.max(0, tonumber(bracket_index) or 1)
+            * math.max(0, tonumber(AoE4RPG.STRATEGIST_ATTACK_REGENERATION_RESET_SECONDS_PER_BRACKET) or 0)
+end
+
+-- Calculates the flat health-regeneration amount represented by the current stack count.
+-- IMPORTANT: The modifier receives a health-per-second amount, so the percentage is converted using the entity's current maximum health.
+function AoE4RPG_CLASS_GetStrategistAttackRegeneration(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "strategist"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not Entity_GetHealthMax then
+        return 0
+    end
+
+    local maximum_health = Entity_GetHealthMax(entity)
+    if not maximum_health or maximum_health <= 0 then
+        return 0
+    end
+    local bracket_index = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 1
+    local per_stack = math.max(0, tonumber(AoE4RPG.STRATEGIST_ATTACK_REGENERATION_BASE_PER_STACK) or 0)
+        + math.max(0, (tonumber(bracket_index) or 1) - 1)
+            * math.max(0, tonumber(AoE4RPG.STRATEGIST_ATTACK_REGENERATION_PER_BRACKET_PER_STACK) or 0)
+    local stacks = math.max(0, tonumber(unit_data.strategist_attack_regeneration_stacks) or 0)
+    local maximum_stacks = math.max(0, tonumber(AoE4RPG.STRATEGIST_ATTACK_REGENERATION_MAX_STACKS) or 0)
+    if maximum_stacks > 0 then
+        stacks = math.min(stacks, maximum_stacks)
+    end
+
+    local regeneration = maximum_health * per_stack * stacks
+    if AoE4RPG_RoundToStep then
+        regeneration = AoE4RPG_RoundToStep(regeneration, 0.25)
+    end
+    return math.max(0, regeneration)
+end
+
+-- IMPORTANT: Replaces only the temporary Strategist regeneration modifier, preventing repeated monitor passes or stack refreshes from multiplying the same bonus.
+function AoE4RPG_CLASS_UpdateStrategistAttackRegeneration(entity, unit_data)
+    if not entity or not unit_data or not Modifier_Create
+        or not Modifier_ApplyToEntity then
+        return false
+    end
+
+    local desired_regeneration = AoE4RPG_CLASS_GetStrategistAttackRegeneration(entity, unit_data)
+    local previous_regeneration = tonumber(unit_data.strategist_attack_regeneration_applied) or 0
+    if math.abs(desired_regeneration - previous_regeneration) <= 0.0001 then
+        return false
+    end
+
+    if unit_data.strategist_attack_regeneration_modifier_id and Modifier_Remove then
+        Modifier_Remove(unit_data.strategist_attack_regeneration_modifier_id)
+    end
+    unit_data.strategist_attack_regeneration_modifier_id = nil
+    unit_data.strategist_attack_regeneration_applied = 0
+
+    if desired_regeneration <= 0 then
+        return true
+    end
+
+    local modifier_id = Modifier_ApplyToEntity(
+        Modifier_Create(
+            MAT_Entity,
+            "health_regeneration_modifier",
+            MUT_Addition,
+            false,
+            desired_regeneration,
+            ""
+        ),
+        entity,
+        0
+    )
+    if not modifier_id then
+        return false
+    end
+
+    unit_data.strategist_attack_regeneration_modifier_id = modifier_id
+    unit_data.strategist_attack_regeneration_applied = desired_regeneration
+    return true
+end
+
+-- Adds one stack when the next successful attack occurs within the one-second stack window.
+-- An attack outside that window starts a fresh one-stack chain.
+function AoE4RPG_CLASS_RecordStrategistAttack(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "strategist"
+        or not (unit_data.is_hero or unit_data.is_elite) then
+        return false
+    end
+
+    local current_time = AoE4RPG_CLASS_GetStrategistAttackRegenerationTime()
+    if current_time == nil then
+        return false
+    end
+    local previous_time = unit_data.strategist_attack_regeneration_last_attack_time
+    local stack_window = math.max(0,
+        tonumber(AoE4RPG.STRATEGIST_ATTACK_REGENERATION_NEXT_STACK_WINDOW) or 0)
+    local maximum_stacks = math.max(0,
+        tonumber(AoE4RPG.STRATEGIST_ATTACK_REGENERATION_MAX_STACKS) or 0)
+    local stacks = tonumber(unit_data.strategist_attack_regeneration_stacks) or 0
+    if previous_time == nil or current_time - previous_time > stack_window then
+        stacks = 1
+    elseif maximum_stacks <= 0 or stacks < maximum_stacks then
+        stacks = stacks + 1
+    end
+    if maximum_stacks > 0 then
+        stacks = math.min(stacks, maximum_stacks)
+    end
+
+    unit_data.strategist_attack_regeneration_stacks = stacks
+    unit_data.strategist_attack_regeneration_last_attack_time = current_time
+    AoE4RPG_CLASS_UpdateStrategistAttackRegeneration(entity, unit_data)
+    return true
+end
+
+function AoE4RPG_CLASS_MonitorStrategistAttackRegeneration()
+    if not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity then
+        return false
+    end
+    local current_time = AoE4RPG_CLASS_GetStrategistAttackRegenerationTime()
+    if current_time == nil then
+        return false
+    end
+
+    AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(function(entity)
+        local unit_data = entity and entity.EntityID
+            and AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity.EntityID)
+            or nil
+        if not unit_data or unit_data.class_name ~= "strategist"
+            or not (unit_data.is_hero or unit_data.is_elite) then
+            return
+        end
+
+        local last_attack_time = unit_data.strategist_attack_regeneration_last_attack_time
+        local reset_seconds = AoE4RPG_CLASS_GetStrategistAttackRegenerationResetSeconds(
+            entity,
+            unit_data
+        )
+        if last_attack_time ~= nil and current_time - last_attack_time >= reset_seconds then
+            unit_data.strategist_attack_regeneration_stacks = 0
+            unit_data.strategist_attack_regeneration_last_attack_time = nil
+        end
+        AoE4RPG_CLASS_UpdateStrategistAttackRegeneration(entity, unit_data)
+    end)
+    return true
+end
+
+-- Starts the synchronized Strategist attack-regeneration refresh rule.
+function AoE4RPG_CLASS_StartStrategistAttackRegeneration()
+    if AoE4RPG.class_runtime_monitor_registered then
+        return true
+    end
+    if AoE4RPG.strategist_attack_regeneration_monitor_registered then
+        return true
+    end
+    if not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(
+        AoE4RPG_CLASS_MonitorStrategistAttackRegeneration,
+        AoE4RPG.STRATEGIST_ATTACK_REGENERATION_REFRESH_INTERVAL
+    )
+    AoE4RPG.strategist_attack_regeneration_monitor_registered = true
+    return true
+end
+
+-- Stops the Strategist attack-regeneration refresh rule.
+function AoE4RPG_CLASS_StopStrategistAttackRegeneration()
+    if AoE4RPG.strategist_attack_regeneration_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_CLASS_MonitorStrategistAttackRegeneration)
+    end
+    AoE4RPG.strategist_attack_regeneration_monitor_registered = false
+    return true
+end
+
+-- ==================== Skirmisher Damage-Received Movement Speed ==============
+-- IMPORTANT: The modifier is permanent after activation, is replaced instead of stacked, and is refreshed when Agility increases through class growth.
+-- ==================== Skirmisher Damage-Received Movement Speed ==============
+
+function AoE4RPG_CLASS_RefreshSkirmisherDamageReceivedMovementSpeed(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "skirmisher"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not unit_data.skirmisher_damage_received_movement_speed_active
+        or not Modifier_Create or not Modifier_ApplyToSquad or not Entity_GetSquad then
+        return false
+    end
+
+    local attributes = unit_data.attributes or {}
+    local total_agility = math.max(0, tonumber(attributes.agility) or 0)
+    local speed_multiplier = ((total_agility / 2) + 100) / 100
+    local previous_modifier_id = unit_data.skirmisher_damage_received_movement_speed_modifier_id
+    if previous_modifier_id and Modifier_Remove then
+        Modifier_Remove(previous_modifier_id)
+    end
+
+    local modifier = Modifier_Create(
+        MAT_Entity,
+        "speed_maximum_modifier",
+        MUT_Multiplication,
+        false,
+        speed_multiplier,
+        ""
+    )
+    -- IMPORTANT: Some hero and elite blueprints do not expose entity modifier_ext.
+    -- Apply the movement modifier through the owning squad instead.
+    local squad = Entity_GetSquad(entity)
+    if not squad then
+        unit_data.skirmisher_damage_received_movement_speed_modifier_id = nil
+        unit_data.skirmisher_damage_received_movement_speed_multiplier = 1.0
+        return false
+    end
+    local modifier_id = Modifier_ApplyToSquad(modifier, squad, 0)
+    if not modifier_id then
+        unit_data.skirmisher_damage_received_movement_speed_modifier_id = nil
+        unit_data.skirmisher_damage_received_movement_speed_multiplier = 1.0
+        return false
+    end
+    unit_data.skirmisher_damage_received_movement_speed_modifier_id = modifier_id
+    unit_data.skirmisher_damage_received_movement_speed_multiplier = speed_multiplier
+    return true
+end
+
+-- Applies the Skirmisher movement-speed multiplier after that Skirmisher is hit.
+function AoE4RPG_CLASS_ApplySkirmisherDamageReceivedMovementSpeed(entity, unit_data, context)
+    if not entity or not unit_data or unit_data.class_name ~= "skirmisher"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not context or tonumber(context.damage) == nil
+        or tonumber(context.damage) <= 0 then
+        return false
+    end
+
+    local victim = context.victim or context.target
+    if not victim or victim.EntityID ~= entity.EntityID
+        or (Entity_IsBuilding and Entity_IsBuilding(victim))
+        or (Entity_IsOfType and Entity_IsOfType(victim, "building")) then
+        return false
+    end
+
+    unit_data.skirmisher_damage_received_movement_speed_active = true
+    return AoE4RPG_CLASS_RefreshSkirmisherDamageReceivedMovementSpeed(entity, unit_data)
+end
+
+-- ==================== Assassin Attack Movement Reduction ==============
+-- IMPORTANT: Each damaged target is slowed for one second, and repeated hits refresh that target.
+-- ==================== Assassin Attack Movement Reduction ==============
+
+AoE4RPG.ASSASSIN_ATTACK_MOVEMENT_REDUCTION_FACTOR = 0.50
+AoE4RPG.ASSASSIN_ATTACK_MOVEMENT_REDUCTION_DURATION = 1.0
+
+-- Applies half of the Skirmisher movement bonus to each unit damaged by the Assassin.
+function AoE4RPG_CLASS_ApplyAssassinAttackMovementReduction(entity, unit_data, context)
+    if not entity or not unit_data or unit_data.class_name ~= "assassin"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not context or tonumber(context.damage) == nil
+        or tonumber(context.damage) <= 0
+        or not Modifier_Create or not Modifier_ApplyToSquad or not Entity_GetSquad then
+        return false
+    end
+
+    local victim = context.victim or context.target
+    if not victim or not victim.EntityID or victim.EntityID == entity.EntityID
+        or (Entity_IsBuilding and Entity_IsBuilding(victim))
+        or (Entity_IsOfType and Entity_IsOfType(victim, "building")) then
+        return false
+    end
+    local victim_squad = Entity_GetSquad(victim)
+    if not victim_squad then
+        return false
+    end
+
+    local attributes = unit_data.attributes or {}
+    local total_agility = math.max(0, tonumber(attributes.agility) or 0)
+    local movement_bonus = (total_agility / 2) / 100
+    local reduction_factor = tonumber(AoE4RPG.ASSASSIN_ATTACK_MOVEMENT_REDUCTION_FACTOR) or 0.50
+    local speed_multiplier = math.max(0.01, 1 - (movement_bonus * reduction_factor))
+    local modifier_ids = unit_data.assassin_attack_movement_reduction_modifier_ids or {}
+    local previous_modifier_id = modifier_ids[victim.EntityID]
+    if previous_modifier_id and Modifier_Remove then
+        Modifier_Remove(previous_modifier_id)
+    end
+
+    local modifier = Modifier_Create(
+        MAT_Entity,
+        "speed_maximum_modifier",
+        MUT_Multiplication,
+        false,
+        speed_multiplier,
+        ""
+    )
+    -- IMPORTANT: Ordinary units may not have modifier_ext on their entity.
+    -- Apply the timed slow through their squad instead.
+    local modifier_id = Modifier_ApplyToSquad(
+        modifier,
+        victim_squad,
+        tonumber(AoE4RPG.ASSASSIN_ATTACK_MOVEMENT_REDUCTION_DURATION) or 1.0
+    )
+    if not modifier_id then
+        modifier_ids[victim.EntityID] = nil
+        unit_data.assassin_attack_movement_reduction_modifier_ids = modifier_ids
+        unit_data.assassin_attack_movement_reduction_multiplier = 1.0
+        return false
+    end
+    modifier_ids[victim.EntityID] = modifier_id
+    unit_data.assassin_attack_movement_reduction_modifier_ids = modifier_ids
+    unit_data.assassin_attack_movement_reduction_multiplier = speed_multiplier
+    return true
+end
+
+-- ==================== Duelist Attack Movement Speed ==============
+-- IMPORTANT: A successful Duelist hit refreshes a civilization-specific movement-speed modifier.
+-- ==================== Duelist Attack Movement Speed ==============
+
+-- Applies or refreshes the configured Duelist movement-speed effect after a hit.
+function AoE4RPG_CLASS_ApplyDuelistAttackMovementSpeed(entity, unit_data, context)
+    if not entity or not unit_data or unit_data.class_name ~= "duelist"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not context or tonumber(context.damage) == nil
+        or tonumber(context.damage) <= 0
+        or not Modifier_Create or not Modifier_ApplyToEntity then
+        return false
+    end
+
+    local victim = context.victim or context.target
+    if not victim or (Entity_IsBuilding and Entity_IsBuilding(victim))
+        or (Entity_IsOfType and Entity_IsOfType(victim, "building")) then
+        return false
+    end
+
+    local civilization = unit_data.civilization
+        or (AoE4RPG_GetUnitCivilization and AoE4RPG_GetUnitCivilization(entity))
+    local rule = AoE4RPG_GetDuelistAttackMovementSpeedRule
+        and AoE4RPG_GetDuelistAttackMovementSpeedRule(civilization)
+        or nil
+    local effectiveness = rule and math.max(0, tonumber(rule.effectiveness) or 0) or 0
+    if effectiveness <= 0 then
+        return false
+    end
+
+    local bracket_index = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 1
+    local duration_seconds = math.max(1, tonumber(bracket_index) or 1)
+    local previous_modifier_id = unit_data.duelist_attack_movement_speed_modifier_id
+    if previous_modifier_id and Modifier_Remove then
+        Modifier_Remove(previous_modifier_id)
+    end
+
+    local modifier = Modifier_Create(
+        MAT_Entity,
+        "speed_maximum_modifier",
+        MUT_Multiplication,
+        false,
+        1 + effectiveness,
+        ""
+    )
+    local modifier_id = Modifier_ApplyToEntity(modifier, entity, duration_seconds)
+    if not modifier_id then
+        unit_data.duelist_attack_movement_speed_modifier_id = nil
+        return false
+    end
+    unit_data.duelist_attack_movement_speed_modifier_id = modifier_id
+    unit_data.duelist_attack_movement_speed_effectiveness = effectiveness
+    unit_data.duelist_attack_movement_speed_duration = duration_seconds
+    return true
+end
+
+-- Applies one cumulative burst-fire attack per reached bracket.
+-- IMPORTANT: The native burst rate comes from the profile's base rate_of_fire, so adding one attack per bracket is represented by the relative rate factor `(base_rate + extra_rate) / base_rate`.
+function AoE4RPG_CLASS_ApplyBurstFireBracketBonus(entity, unit_data)
+    if not entity or not unit_data or not unit_data.is_hero
+        or not Modify_WeaponBurstRateOfFire
+        or not Entity_GetSquad
+        or not AoE4RPG_GetBurstFireWeaponProfile then
+        return false
+    end
+
+    local class_definition = AoE4RPG.CLASS_DEFINITIONS[unit_data.class_name or ""]
+    if not class_definition or class_definition.stat_type ~= "agility" then
+        return false
+    end
+
+    local profile = AoE4RPG_GetBurstFireWeaponProfile(entity)
+    if not profile then
+        return false
+    end
+    local bracket = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 1
+    local extra_attacks = math.max(0, bracket - 1)
+    local squad = Entity_GetSquad(entity)
+    if not squad then
+        return false
+    end
+
+    unit_data.burst_fire_rate_factors = unit_data.burst_fire_rate_factors or {}
+    local new_entity = unit_data.burst_fire_rate_entity_id ~= entity.EntityID
+    local applied = false
+    for _, weapon in ipairs(profile) do
+        local hardpoint = weapon.hardpoint or "hardpoint_01"
+        local base_rate = tonumber(weapon.rate_of_fire) or 0
+        if base_rate > 0 then
+            local extra_rate = base_rate * extra_attacks
+            local desired_factor = (base_rate + extra_rate) / base_rate
+            local previous_factor = new_entity
+                and 1
+                or (unit_data.burst_fire_rate_factors[hardpoint] or 1)
+            local relative_factor = desired_factor / math.max(0.01, previous_factor)
+            if math.abs(relative_factor - 1) > 0.0001 then
+                Modify_WeaponBurstRateOfFire(squad, hardpoint, relative_factor)
+                applied = true
+            end
+            unit_data.burst_fire_rate_factors[hardpoint] = desired_factor
+        end
+    end
+    unit_data.burst_fire_rate_entity_id = entity.EntityID
+    return applied
+end
+
+-- ==================== Class Value Registry ==============
+-- IMPORTANT: Builds one deterministic cache for every civilization/class combination at match start.
+-- IMPORTANT: Live entities only perform a registry lookup and receive the cached class values; selection never performs class discovery.
+-- ==================== Class Value Registry ==============
+
+AoE4RPG.CLASS_VALUE_REGISTRY = {
+    initialized = false,
+    profiles = {},
+    entity_profile_keys = {},
+}
+
+AoE4RPG_CLASS_ATTRIBUTE_NAMES = { "agility", "endurance", "vitality" }
+
+function AoE4RPG_CLASS_CopyAttributeValues(values)
+    local copy = {}
+    for _, attribute_name in ipairs(AoE4RPG_CLASS_ATTRIBUTE_NAMES) do
+        copy[attribute_name] = values and values[attribute_name] or 0
+    end
+    return copy
+end
+
+function AoE4RPG_CLASS_AddAttributeValues(left, right)
+    local result = {}
+    for _, attribute_name in ipairs(AoE4RPG_CLASS_ATTRIBUTE_NAMES) do
+        result[attribute_name] = (left and left[attribute_name] or 0)
+            + (right and right[attribute_name] or 0)
+    end
+    return result
+end
+
+-- Find the blueprint registry unit type that supplies a class's base profile.
+-- A class maps to one stable unit type even when the entity is an elite variant.
+function AoE4RPG_CLASS_GetRegistryUnitType(civilization, class_name)
+    local civilization_table = AoE4RPG_ENTITY_TABLE
+        and (AoE4RPG_ENTITY_TABLE[civilization] or AoE4RPG_ENTITY_TABLE.default)
+        or {}
+    local candidate_unit_types = {}
+    for unit_type, mapped_class_name in pairs(AoE4RPG_CLASS_NAME_BY_UNIT_TYPE or {}) do
+        if mapped_class_name == class_name then
+            table.insert(candidate_unit_types, unit_type)
+        end
+    end
+    -- Sorting removes hash-table iteration order from the class profile build.
+    -- Every peer therefore selects the same registry row when a class has more than one mapped unit type.
+    table.sort(candidate_unit_types)
+    for _, unit_type in ipairs(candidate_unit_types) do
+        if AoE4RPG_BlueprintRegistryValueExists
+            and AoE4RPG_BlueprintRegistryValueExists(civilization_table[unit_type]) then
+            return unit_type
+        end
+    end
+    return candidate_unit_types[1]
+end
+
+-- Create a class profile from the base-attribute and unique-growth data in the blueprint registry.
+function AoE4RPG_CLASS_BuildProfile(civilization, class_name, unit_type)
+    local definition = AoE4RPG.CLASS_DEFINITIONS[class_name]
+    if not definition then
+        return nil
+    end
+
+    local base_attributes = AoE4RPG_GetBaseAttribute
+        and AoE4RPG_GetBaseAttribute(civilization, unit_type)
+        or { agility = 0, endurance = 0, vitality = 0 }
+    local unique_growth = AoE4RPG_GetUniqueGrowthForClass
+        and AoE4RPG_GetUniqueGrowthForClass(civilization, class_name)
+        or { agility = 0, endurance = 0, vitality = 0 }
+    local attribute_growth = AoE4RPG_CLASS_AddAttributeValues(
+        definition.attribute_growth,
+        unique_growth
+    )
+
+    local preview_data = {
+        class_name = class_name,
+        civilization = civilization,
+        base_attributes = AoE4RPG_CLASS_CopyAttributeValues(base_attributes),
+        non_bonus_attributes = AoE4RPG_CLASS_CopyAttributeValues(base_attributes),
+        attribute_bonuses = { agility = 0, endurance = 0, vitality = 0 },
+        attribute_passive_multipliers = { agility = 0, endurance = 0, vitality = 0 },
+        random_bonus_totals = {},
+        weapon_range_bonus = 0,
+        weapon_crit_damage_chance = 0,
+        weapon_crit_damage_factor = 0,
+    }
+    if AoE4RPG_RecalculateAttributeTotals then
+        AoE4RPG_RecalculateAttributeTotals(preview_data)
+    end
+    local derived_stats = AoE4RPG_TranslateAttributesToStats
+        and AoE4RPG_TranslateAttributesToStats(preview_data)
+        or {}
+
+    return {
+        key = tostring(civilization) .. ":" .. tostring(class_name),
+        civilization = civilization,
+        class_name = class_name,
+        unit_type = unit_type,
+        can_be_elite = definition.can_be_elite == true,
+        base_attributes = AoE4RPG_CLASS_CopyAttributeValues(base_attributes),
+        unique_growth = AoE4RPG_CLASS_CopyAttributeValues(unique_growth),
+        attribute_growth = AoE4RPG_CLASS_CopyAttributeValues(attribute_growth),
+        attributes = AoE4RPG_CLASS_CopyAttributeValues(preview_data.attributes),
+        derived_stats = derived_stats,
+        entity_ids = {},
+    }
+end
+
+-- Calculate all class profiles once after imports have completed.
+-- This is a deterministic data pass and does not inspect or classify live entities.
+function AoE4RPG_CLASS_InitializeValueRegistry()
+    local registry = AoE4RPG.CLASS_VALUE_REGISTRY
+    if registry.initialized then
+        return true
+    end
+
+    registry.profiles = {}
+    registry.entity_profile_keys = {}
+    for civilization in pairs(AoE4RPG_ENTITY_TABLE or { default = {} }) do
+        registry.profiles[civilization] = {}
+        for class_name in pairs(AoE4RPG.CLASS_DEFINITIONS or {}) do
+            local unit_type = AoE4RPG_CLASS_GetRegistryUnitType(civilization, class_name)
+            local profile = AoE4RPG_CLASS_BuildProfile(civilization, class_name, unit_type)
+            if profile then
+                registry.profiles[civilization][class_name] = profile
+            end
+        end
+    end
+    if not registry.profiles.default then
+        registry.profiles.default = {}
+    end
+    registry.initialized = true
+    return true
+end
+
+function AoE4RPG_CLASS_ShutdownValueRegistry()
+    local registry = AoE4RPG.CLASS_VALUE_REGISTRY
+    registry.initialized = false
+    registry.profiles = {}
+    registry.entity_profile_keys = {}
+    AoE4RPG.CLASS_BRACKET_ATTRIBUTE_UPGRADES = {}
+end
+
+-- IMPORTANT: Returns a stable player identifier for the class-wide native-upgrade state.
+-- Player wrappers are unwrapped so a numeric PlayerID is used consistently.
+function AoE4RPG_CLASS_GetPlayerIdentifier(player)
+    if AoE4RPG_RUNTIME_GetPlayerIdentifier then
+        return AoE4RPG_RUNTIME_GetPlayerIdentifier(player)
+    end
+    if type(player) == "number" then
+        return player
+    end
+    if not player then
+        return nil
+    end
+    if player.PlayerID then
+        return player.PlayerID
+    end
+    if player.id then
+        return AoE4RPG_CLASS_GetPlayerIdentifier(player.id)
+    end
+    if Player_GetID then
+        return Player_GetID(player)
+    end
+    return nil
+end
+
+-- IMPORTANT: Returns the persistent automatic-upgrade state for one player and class. `by_bracket` records the selected native upgrade; `stars` feeds the derived statistic tooltip without requiring the UI to inspect native upgrade state.
+function AoE4RPG_CLASS_GetBracketAttributeUpgradeState(player, class_name)
+    local player_id = AoE4RPG_CLASS_GetPlayerIdentifier(player)
+    if not player_id or not class_name then
+        return nil
+    end
+    local player_state = AoE4RPG.CLASS_BRACKET_ATTRIBUTE_UPGRADES[player_id]
+    if not player_state then
+        player_state = {}
+        AoE4RPG.CLASS_BRACKET_ATTRIBUTE_UPGRADES[player_id] = player_state
+    end
+    if not player_state[class_name] then
+        player_state[class_name] = {
+            by_bracket = {},
+            stars = { health = 0, armor = 0, weapon_range = 0, speed = 0, siege_setup = 0 },
+            speed_upgrade_acquired = false,
+            siege_setup_upgrade_acquired = false,
+        }
+    end
+    return player_state[class_name]
+end
+
+-- Siege units replace the general Speed roll with Siege Setup.
+-- Byzantine Ha Mac siege heroes are explicitly excluded from both unlevelled upgrades.
+function AoE4RPG_CLASS_IsSiegeSetupEligible(entity, unit_data)
+    if not entity or not Entity_IsOfType or not Entity_IsOfType(entity, "siege") then
+        return false
+    end
+    unit_data = unit_data or (entity.EntityID and AoE4RPG_GetUnitData
+        and AoE4RPG_GetUnitData(entity.EntityID))
+    local civilization = unit_data
+        and (unit_data.player_civilization or unit_data.civilization)
+        or (AoE4RPG_GetUnitCivilization and AoE4RPG_GetUnitCivilization(entity))
+        or nil
+    return civilization ~= "byzantine_ha_mac"
+end
+
+-- Returns whether the entity uses the normal unlevelled Speed roll.
+-- IMPORTANT: Siege entities never use Speed, even when their Siege Setup upgrade is unavailable.
+function AoE4RPG_CLASS_IsSpeedUpgradeEligible(entity)
+    return not Entity_IsOfType or not Entity_IsOfType(entity, "siege")
+end
+
+-- Performs the synchronized 10% roll used by an unlevelled upgrade.
+-- IMPORTANT: The deterministic fallback is only for environments without World_GetRand.
+function AoE4RPG_CLASS_RollUnlevelledUpgradeChance(entity, owner, class_name, bracket_index)
+    local chance = math.max(0, math.min(1,
+        tonumber(AoE4RPG.CLASS_UNLEVELLED_UPGRADE_CHANCE) or 0))
+    if chance <= 0 then
+        return false
+    end
+    if World_GetRand then
+        return World_GetRand(1, 100) <= math.floor(chance * 100 + 0.5)
+    end
+    local player_id = AoE4RPG_CLASS_GetPlayerIdentifier(owner) or 0
+    local seed = (tonumber(player_id) or 0) + (tonumber(bracket_index) or 0)
+        + #(class_name or "") + (entity and entity.EntityID or 0)
+    return seed % 100 < math.floor(chance * 100 + 0.5)
+end
+
+-- Returns one star count for Health, Armor, Weapon Range, Speed, and Siege Setup for a selected entity.
+-- IMPORTANT: The native range upgrade only changes ranged weapons, Health is restricted to melee entities, and Speed/Siege Setup are restricted to their corresponding unit type and civilization rules.
+function AoE4RPG_CLASS_GetAttributeUpgradeStars(entity, unit_data)
+    if not entity then
+        return { health = 0, armor = 0, weapon_range = 0, speed = 0, siege_setup = 0 }
+    end
+    unit_data = unit_data or (entity.EntityID and AoE4RPG_GetUnitData
+        and AoE4RPG_GetUnitData(entity.EntityID))
+    local class_name = unit_data and unit_data.class_name
+    local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        or nil
+    local state = AoE4RPG_CLASS_GetBracketAttributeUpgradeState(owner, class_name)
+    local stars = state and state.stars or nil
+    local health_stars = stars and stars.health or 0
+    if not AoE4RPG_EntityMatchesCombatType(entity, "melee") then
+        health_stars = 0
+    end
+    local range_stars = stars and stars.weapon_range or 0
+    if not AoE4RPG_EntityMatchesCombatType(entity, "ranged") then
+        range_stars = 0
+    end
+    local is_siege = Entity_IsOfType and Entity_IsOfType(entity, "siege") or false
+    local speed_stars = stars and stars.speed or 0
+    if is_siege then
+        speed_stars = 0
+    end
+    local siege_setup_stars = stars and stars.siege_setup or 0
+    if not AoE4RPG_CLASS_IsSiegeSetupEligible(entity, unit_data) then
+        siege_setup_stars = 0
+    end
+    return {
+        health = health_stars,
+        armor = stars and stars.armor or 0,
+        weapon_range = range_stars,
+        speed = speed_stars,
+        siege_setup = siege_setup_stars,
+    }
+end
+
+-- IMPORTANT: Applies one automatically selected native Health, Armor, or Weapon Range upgrade for a class at a reached bracket.
+-- IMPORTANT: The first bracket has no native tier suffix, so bracket 2 produces upgrade level 1 (`...health1`, etc.).
+-- Unlevelled upgrades are removed after being gained.
+-- Selection is stored before future respawns or UI refreshes can query it.
+function AoE4RPG_CLASS_ApplyRandomBracketAttributeUpgrade(entity, owner, class_name, bracket_index)
+    if not entity or not class_name or not bracket_index then
+        return false
+    end
+
+    local unit_data = entity.EntityID and AoE4RPG_GetUnitData
+        and AoE4RPG_GetUnitData(entity.EntityID)
+    local upgrade_level = (tonumber(bracket_index) or 0) - 1
+    if upgrade_level < 1 then
+        return false
+    end
+
+    owner = owner or (AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity) or nil)
+    local state = AoE4RPG_CLASS_GetBracketAttributeUpgradeState(owner, class_name)
+    if not state then
+        return false
+    end
+    if state.by_bracket[bracket_index] then
+        return true
+    end
+    if not AoE4RPG_GetTuningUpgradeBlueprint then
+        return false
+    end
+
+    local available_upgrades = {}
+    local function add_upgrade(upgrade_key, upgrade_suffix)
+        local upgrade_name = "upgrade_"
+            .. tostring(class_name)
+            .. "_"
+            .. tostring(upgrade_suffix)
+        local upgrade = AoE4RPG_GetTuningUpgradeBlueprint(upgrade_name)
+        if upgrade then
+            table.insert(available_upgrades, {
+                key = upgrade_key,
+                name = upgrade_name,
+                blueprint = upgrade,
+            })
+        end
+    end
+
+    -- Select the eligible unlevelled upgrade independently from the ordinary bracket pool.
+    -- IMPORTANT: This gives both upgrades their own 10% chance per bracket without allowing a siege unit to receive Speed as a fallback.
+    local unlevelled_upgrade_key = nil
+    if AoE4RPG_CLASS_IsSiegeSetupEligible(entity, unit_data) then
+        unlevelled_upgrade_key = "siege_setup"
+    elseif AoE4RPG_CLASS_IsSpeedUpgradeEligible(entity) then
+        unlevelled_upgrade_key = "speed"
+    end
+    local unlevelled_upgrade_acquired = unlevelled_upgrade_key == "speed"
+        and state.speed_upgrade_acquired == true
+        or unlevelled_upgrade_key == "siege_setup"
+            and state.siege_setup_upgrade_acquired == true
+    local unlevelled_upgrade = nil
+    if unlevelled_upgrade_key and not unlevelled_upgrade_acquired
+        and AoE4RPG_CLASS_RollUnlevelledUpgradeChance(
+            entity, owner, class_name, bracket_index
+        ) then
+        local suffix = AoE4RPG_CLASS_GetUnlevelledUpgradeSuffix(
+            unlevelled_upgrade_key
+        )
+        local upgrade_name = "upgrade_"
+            .. tostring(class_name)
+            .. "_"
+            .. suffix
+        local upgrade = AoE4RPG_GetTuningUpgradeBlueprint(upgrade_name)
+        if upgrade then
+            unlevelled_upgrade = {
+                key = unlevelled_upgrade_key,
+                name = upgrade_name,
+                blueprint = upgrade,
+            }
+        end
+    end
+
+    -- The ordinary levelled pool is always rolled once per reached bracket.
+    for _, upgrade_type in ipairs(AoE4RPG.CLASS_ATTRIBUTE_UPGRADE_TYPES or {}) do
+        -- Health is meaningful only for a melee entity, while Weapon Range is meaningful only for a ranged entity.
+        -- Armor is universal.
+        local is_type_eligible = (upgrade_type.key ~= "health"
+            or AoE4RPG_EntityMatchesCombatType(entity, "melee"))
+            and (upgrade_type.key ~= "weapon_range"
+                or AoE4RPG_EntityMatchesCombatType(entity, "ranged"))
+        if is_type_eligible then
+            add_upgrade(
+                upgrade_type.key,
+                tostring(upgrade_type.suffix) .. tostring(upgrade_level)
+            )
+        end
+    end
+
+    local selected_upgrades = {}
+    if #available_upgrades > 0 then
+        local selected_index
+        if World_GetRand then
+            selected_index = World_GetRand(1, #available_upgrades)
+        else
+            local player_id = AoE4RPG_CLASS_GetPlayerIdentifier(owner) or 0
+            selected_index = ((tonumber(player_id) or 0) + upgrade_level + #class_name)
+                % #available_upgrades + 1
+        end
+        selected_index = math.max(1, math.min(#available_upgrades, selected_index or 1))
+        table.insert(selected_upgrades, available_upgrades[selected_index])
+    end
+    if unlevelled_upgrade then
+        table.insert(selected_upgrades, unlevelled_upgrade)
+    end
+    if #selected_upgrades == 0 then
+        return false
+    end
+
+    local completed = false
+    for _, selected_upgrade in ipairs(selected_upgrades) do
+        if Player_CompleteUpgrade then
+            Player_CompleteUpgrade(owner, selected_upgrade.blueprint)
+            completed = true
+        elseif LocalCommand_PlayerUpgrade then
+            LocalCommand_PlayerUpgrade(owner, selected_upgrade.blueprint, true, false)
+            completed = true
+        end
+        if not completed then
+            return false
+        end
+    end
+
+    local upgrade_records = {}
+    for _, selected_upgrade in ipairs(selected_upgrades) do
+        table.insert(upgrade_records, {
+            upgrade_type = selected_upgrade.key,
+            upgrade_name = selected_upgrade.name,
+        })
+        state.stars[selected_upgrade.key] = (state.stars[selected_upgrade.key] or 0) + 1
+        if selected_upgrade.key == "speed" then
+            state.speed_upgrade_acquired = true
+        elseif selected_upgrade.key == "siege_setup" then
+            state.siege_setup_upgrade_acquired = true
+        end
+    end
+    state.by_bracket[bracket_index] = {
+        upgrade_level = upgrade_level,
+        upgrade_type = upgrade_records[1].upgrade_type,
+        upgrade_name = upgrade_records[1].upgrade_name,
+        upgrades = upgrade_records,
+    }
+    if AoE4RPG_MarkUnitDataChanged then
+        AoE4RPG_MarkUnitDataChanged(AoE4RPG_GetUnitData(entity.EntityID))
+    end
+    return true
+end
+
+function AoE4RPG_CLASS_GetValueProfile(civilization, class_name)
+    local registry = AoE4RPG.CLASS_VALUE_REGISTRY
+    if not registry.initialized then
+        AoE4RPG_CLASS_InitializeValueRegistry()
+    end
+    local civilization_profiles = registry.profiles[civilization]
+        or registry.profiles.default
+        or {}
+    return civilization_profiles[class_name]
+end
+
+-- IMPORTANT: Add one eligible live EntityID to its class profile.
+-- IMPORTANT: The set is sparse so a death removes one key without shifting any other entity's membership.
+function AoE4RPG_CLASS_RegisterEntity(entity, civilization, class_name)
+    local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
+        and AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+        or entity and entity.EntityID
+    if not entity or not entity_id or not class_name then
+        return nil
+    end
+    local profile = AoE4RPG_CLASS_GetValueProfile(civilization, class_name)
+    if not profile then
+        return nil
+    end
+
+    local registry = AoE4RPG.CLASS_VALUE_REGISTRY
+    local previous_key = registry.entity_profile_keys[entity_id]
+    if previous_key and previous_key ~= profile.key then
+        local previous_civilization, previous_class = string.match(previous_key, "^([^:]+):(.+)$")
+        local previous_profile = previous_civilization and registry.profiles[previous_civilization]
+            and registry.profiles[previous_civilization][previous_class]
+            or nil
+        if previous_profile then
+            previous_profile.entity_ids[entity_id] = nil
+        end
+    end
+    local progress = profile.entity_ids[entity_id]
+    if type(progress) ~= "table" then
+        progress = {
+            entity_id = entity_id,
+            damage_dealt = 0,
+            level = 0,
+            pending_level_ups = 0,
+        }
+        profile.entity_ids[entity_id] = progress
+    end
+    registry.entity_profile_keys[entity_id] = profile.key
+    return profile
+end
+
+function AoE4RPG_CLASS_UnregisterEntity(entity_id)
+    local registry = AoE4RPG.CLASS_VALUE_REGISTRY
+    local profile_key = entity_id and registry.entity_profile_keys[entity_id] or nil
+    if not profile_key then
+        return false
+    end
+    local civilization, class_name = string.match(profile_key, "^([^:]+):(.+)$")
+    local profile = civilization and registry.profiles[civilization]
+        and registry.profiles[civilization][class_name]
+        or nil
+    if profile then
+        profile.entity_ids[entity_id] = nil
+    end
+    registry.entity_profile_keys[entity_id] = nil
+    return true
+end
+
+function AoE4RPG_CLASS_GetEntityProfile(entity_or_id)
+    local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
+        and AoE4RPG_RUNTIME_GetEntityIdentifier(entity_or_id)
+        or type(entity_or_id) == "number" and entity_or_id
+        or entity_or_id and entity_or_id.EntityID
+    local profile_key = entity_id and AoE4RPG.CLASS_VALUE_REGISTRY.entity_profile_keys[entity_id] or nil
+    if not profile_key then
+        return nil
+    end
+    local civilization, class_name = string.match(profile_key, "^([^:]+):(.+)$")
+    return civilization and AoE4RPG.CLASS_VALUE_REGISTRY.profiles[civilization]
+        and AoE4RPG.CLASS_VALUE_REGISTRY.profiles[civilization][class_name]
+        or nil
+end
+
+-- Returns the synchronized progression state owned by an active class profile.
+-- IMPORTANT: The class profile stores this by EntityID so XP and level-up state remain attached to the same class membership used by the UI and modifier system.
+function AoE4RPG_CLASS_GetEntityProgress(entity_or_id)
+    local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
+        and AoE4RPG_RUNTIME_GetEntityIdentifier(entity_or_id)
+        or type(entity_or_id) == "number" and entity_or_id
+        or entity_or_id and entity_or_id.EntityID
+    local profile = entity_id and AoE4RPG_CLASS_GetEntityProfile(entity_id) or nil
+    return profile and profile.entity_ids[entity_id] or nil
+end
+
+-- Calculates how many ordinary RPG levels are currently affordable by the tracked damage_dealt value.
+-- IMPORTANT: Native state-model heroes expose their own level target and therefore do not use this threshold calculation.
+function AoE4RPG_CLASS_GetPendingLevelCount(entity, unit_data)
+    if not entity or not unit_data or unit_data.uses_native_experience then
+        return 0
+    end
+    local level = math.max(0, unit_data.level or 0)
+    local maximum_level = AoE4RPG.MaxLevel
+    if AoE4RPG_GetEffectiveLevelLimit then
+        maximum_level = AoE4RPG_GetEffectiveLevelLimit(entity, unit_data)
+    elseif unit_data.is_elite then
+        maximum_level = AoE4RPG.EliteMaxLevel
+    end
+
+    local remaining_damage = math.max(0, unit_data.damage_dealt or 0)
+    local pending_levels = 0
+    while level < maximum_level do
+        local required_exp = AoE4RPG_ExperienceRequired(level)
+        if remaining_damage < required_exp then
+            break
+        end
+        remaining_damage = remaining_damage - required_exp
+        level = level + 1
+        pending_levels = pending_levels + 1
+    end
+    return pending_levels
+end
+
+-- Mirrors one entity's mutable XP state into its class profile and tracker record.
+-- IMPORTANT: The unit record remains the gameplay working copy; the EntityID map is the authoritative class-owned index used for lookup and UI repopulation.
+function AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+    local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
+        and AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+        or entity and entity.EntityID
+    if not entity or not entity_id or not unit_data then
+        return false
+    end
+    local progress = AoE4RPG_CLASS_GetEntityProgress(entity)
+    if not progress then
+        return false
+    end
+
+    progress.entity_id = entity_id
+    progress.damage_dealt = unit_data.damage_dealt or 0
+    progress.level = unit_data.level or 0
+    progress.pending_level_ups = AoE4RPG_CLASS_GetPendingLevelCount(entity, unit_data)
+    progress.ui_revision = unit_data.ui_revision or 0
+
+    local tracked_record = AoE4RPG.ENTITY_TRACKER
+        and AoE4RPG.ENTITY_TRACKER.tracked_entity_records[entity_id]
+        or nil
+    if tracked_record then
+        tracked_record.progress = progress
+        tracked_record.damage_dealt = progress.damage_dealt
+        tracked_record.level = progress.level
+        tracked_record.pending_level_ups = progress.pending_level_ups
+    end
+    local ai_record = AoE4RPG.AI_TRACKER
+        and AoE4RPG.AI_TRACKER.tracked_entity_records
+        and AoE4RPG.AI_TRACKER.tracked_entity_records[entity_id]
+        or nil
+    if ai_record then
+        ai_record.progress = progress
+        ai_record.damage_dealt = progress.damage_dealt
+        ai_record.level = progress.level
+        ai_record.pending_level_ups = progress.pending_level_ups
+    end
+    return true
+end
+
+-- IMPORTANT: Rebuilds all cached class modifiers for the current level, then reapplies already-selected persistent bonuses to the current EntityID.
+-- IMPORTANT: This is called after a successful level increase so no incremental modifier can drift away from the class profile or a replaced native entity.
+function AoE4RPG_CLASS_ReapplyEntityBonuses(entity, unit_data)
+    if not entity or not unit_data then
+        return false
+    end
+    local profile = AoE4RPG_CLASS_GetEntityProfile(entity)
+    if not profile or not AoE4RPG_CLASS_ApplyCachedProfileToEntity then
+        return false
+    end
+
+    AoE4RPG_CLASS_ApplyCachedProfileToEntity(entity, unit_data, profile)
+    unit_data.random_bonus_force_reapply = true
+    if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+        AoE4RPG_BONUS_EnsureCurrentBracketOffer(entity, true)
+    end
+    AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+    return true
+end
+
+-- Return the class-owned attributes and derived stats for the selected entity.
+-- Per-entity flat/passive bonuses are merged after the cached class growth.
+function AoE4RPG_CLASS_GetEntityValues(entity, unit_data)
+    local profile = AoE4RPG_CLASS_GetEntityProfile(entity)
+    if not profile or not unit_data then
+        return nil
+    end
+    local growth = unit_data.class_attribute_growth or profile.attribute_growth
+    local level = math.max(0, unit_data.level or 0)
+    local non_bonus_attributes = AoE4RPG_CLASS_CopyAttributeValues(profile.base_attributes)
+    for _, attribute_name in ipairs(AoE4RPG_CLASS_ATTRIBUTE_NAMES) do
+        non_bonus_attributes[attribute_name] = non_bonus_attributes[attribute_name]
+            + (growth[attribute_name] or 0) * level
+    end
+    local values = {
+        class_name = profile.class_name,
+        civilization = profile.civilization,
+        base_attributes = AoE4RPG_CLASS_CopyAttributeValues(profile.base_attributes),
+        non_bonus_attributes = non_bonus_attributes,
+        attribute_bonuses = AoE4RPG_CLASS_CopyAttributeValues(unit_data.attribute_bonuses),
+        attribute_passive_multipliers = AoE4RPG_CLASS_CopyAttributeValues(unit_data.attribute_passive_multipliers),
+        random_bonus_totals = unit_data.random_bonus_totals or {},
+        attribute_upgrade_stars = AoE4RPG_CLASS_GetAttributeUpgradeStars(entity, unit_data),
+        weapon_range_bonus = unit_data.weapon_range_bonus or 0,
+        weapon_crit_damage_chance = unit_data.weapon_crit_damage_chance or 0,
+        weapon_crit_damage_factor = unit_data.weapon_crit_damage_factor or 0,
+    }
+    if AoE4RPG_RecalculateAttributeTotals then
+        AoE4RPG_RecalculateAttributeTotals(values)
+    end
+    values.derived_stats = AoE4RPG_TranslateAttributesToStats
+        and AoE4RPG_TranslateAttributesToStats(values)
+        or profile.derived_stats
+    return values
+end
+
+-- Track modifiers created by the class system separately from random bonuses.
+-- IMPORTANT: This makes tier conversion and EntityID reuse safe to rebuild.
+function AoE4RPG_CLASS_TrackModifier(entity, modifier_id)
+    if not entity or not entity.EntityID or not modifier_id then
+        return modifier_id
+    end
+    local unit_data = AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity.EntityID) or nil
+    if unit_data then
+        unit_data.class_modifier_ids = unit_data.class_modifier_ids or {}
+        table.insert(unit_data.class_modifier_ids, modifier_id)
+    end
+    return modifier_id
+end
+
+function AoE4RPG_CLASS_ApplyModifierToEntity(entity, modifier)
+    if not entity or not modifier or not Modifier_ApplyToEntity then
+        return nil
+    end
+    return AoE4RPG_CLASS_TrackModifier(
+        entity,
+        Modifier_ApplyToEntity(modifier, entity, 0)
+    )
+end
+
+function AoE4RPG_CLASS_ApplyModifierToSquad(entity, squad, modifier)
+    if not entity or not squad or not modifier or not Modifier_ApplyToSquad then
+        return nil
+    end
+    return AoE4RPG_CLASS_TrackModifier(
+        entity,
+        Modifier_ApplyToSquad(modifier, squad, 0)
+    )
+end
+
+function AoE4RPG_CLASS_RemoveEntityModifiers(entity_id, unit_data)
+    unit_data = unit_data or (AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[entity_id])
+    if unit_data and Modifier_Remove then
+        for _, modifier_id in ipairs(unit_data.class_modifier_ids or {}) do
+            if modifier_id then
+                Modifier_Remove(modifier_id)
+            end
+        end
+    end
+    if unit_data then
+        unit_data.class_modifier_ids = {}
+        unit_data.roamer_health_armor_applied = 0
+        unit_data.commander_self_regeneration_applied = 0
+        if unit_data.assassin_bracket_damage_modifier_id and Modifier_Remove then
+            Modifier_Remove(unit_data.assassin_bracket_damage_modifier_id)
+        end
+        unit_data.assassin_bracket_damage_modifier_id = nil
+        unit_data.assassin_bracket_damage_applied = 0
+        if unit_data.assassin_fifth_attack_modifier_id and Modifier_Remove then
+            Modifier_Remove(unit_data.assassin_fifth_attack_modifier_id)
+        end
+        unit_data.assassin_fifth_attack_modifier_id = nil
+        unit_data.assassin_fifth_attack_active = false
+        if unit_data.assassin_attack_count and unit_data.assassin_attack_count >= 4 then
+            unit_data.assassin_attack_count = 0
+        end
+        if unit_data.assassin_attack_movement_reduction_modifier_ids and Modifier_Remove then
+            for _, modifier_id in pairs(unit_data.assassin_attack_movement_reduction_modifier_ids) do
+                if modifier_id then
+                    Modifier_Remove(modifier_id)
+                end
+            end
+        end
+        unit_data.assassin_attack_movement_reduction_modifier_ids = {}
+        unit_data.assassin_attack_movement_reduction_multiplier = 1.0
+        if unit_data.duelist_attack_movement_speed_modifier_id and Modifier_Remove then
+            Modifier_Remove(unit_data.duelist_attack_movement_speed_modifier_id)
+        end
+        unit_data.duelist_attack_movement_speed_modifier_id = nil
+        unit_data.duelist_attack_movement_speed_effectiveness = 0
+        unit_data.duelist_attack_movement_speed_duration = 0
+        if unit_data.skirmisher_damage_received_movement_speed_modifier_id
+            and Modifier_Remove then
+            Modifier_Remove(unit_data.skirmisher_damage_received_movement_speed_modifier_id)
+        end
+        unit_data.skirmisher_damage_received_movement_speed_modifier_id = nil
+        unit_data.skirmisher_damage_received_movement_speed_active = false
+        unit_data.skirmisher_damage_received_movement_speed_multiplier = 1.0
+        unit_data.initiator_idle_seconds = 0
+        unit_data.initiator_idle_damage_applied = 0
+        if unit_data.initiator_idle_damage_modifier_id and Modifier_Remove then
+            Modifier_Remove(unit_data.initiator_idle_damage_modifier_id)
+        end
+        unit_data.initiator_idle_damage_modifier_id = nil
+        unit_data.strategist_attack_regeneration_stacks = 0
+        unit_data.strategist_attack_regeneration_last_attack_time = nil
+        unit_data.strategist_attack_regeneration_applied = 0
+        if unit_data.strategist_attack_regeneration_modifier_id and Modifier_Remove then
+            Modifier_Remove(unit_data.strategist_attack_regeneration_modifier_id)
+        end
+        unit_data.strategist_attack_regeneration_modifier_id = nil
+    end
+end
+
+-- IMPORTANT: Hides the native class tier upgrades from every player so heroes cannot purchase a tier independently of the RPG bracket system.
+--
+-- The bracket table is one-based and its first entry has no upgrade.
+-- Therefore the upgrade suffix is always `bracket_index - 1`, starting at damage1.
+function AoE4RPG_CLASS_HideNativeDamageUpgrades()
+    if not Player_SetUpgradeAvailability
+        or not AoE4RPG_GetTuningUpgradeBlueprint
+        or not World_GetPlayerCount
+        or not World_GetPlayerAt
+        or not ITEM_REMOVED then
+        return false
+    end
+
+    -- Player_SetUpgradeAvailability ultimately calls an internal function that requires a Player object.
+    local world_players = {}
+    for player_index = 1, World_GetPlayerCount() do
+        local player = World_GetPlayerAt(player_index)
+        if player then
+            table.insert(world_players, player)
+        end
+    end
+    if #world_players == 0 then
+        return false
+    end
+
+    local class_count = 0
+    local upgrade_types = { "damage", "health", "armor", "weapon_range", "speed", "siege_setup" }
+    for class_name in pairs(AoE4RPG.CLASS_DEFINITIONS or {}) do
+        class_count = class_count + 1
+        for bracket_index = 2, #(AoE4RPG.UPGRADE_BRACKETS or {}) do
+            local upgrade_level = bracket_index - 1
+            for _, upgrade_type in ipairs(upgrade_types) do
+                local upgrade_suffix = (upgrade_type == "speed" or upgrade_type == "siege_setup")
+                    and upgrade_type
+                    or upgrade_type .. tostring(upgrade_level)
+                local upgrade_name = "upgrade_"
+                    .. tostring(class_name)
+                    .. "_"
+                    .. upgrade_suffix
+                local upgrade = AoE4RPG_GetTuningUpgradeBlueprint(upgrade_name)
+                if upgrade then
+                    for _, player in ipairs(world_players) do
+                        Player_SetUpgradeAvailability(player, upgrade, ITEM_REMOVED)
+                    end
+                end
+            end
+        end
+    end
+
+    return class_count > 0
+end
+
+-- This picks a class by checking the unit's type tag.
+-- Change the tag strings or returned class names here when assigning classes to different units.
+function AoE4RPG_CLASS_GetClassForEntity(entity)
+    if not entity then
+        return nil
+    end
+
+    -- IMPORTANT: The native HRE Master Priest/monk blueprint is an RPG strategist even on builds where the engine does not expose the `bakery` type tag reliably.
+    local blueprint_name = AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName
+        and AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(entity)
+        or nil
+    if blueprint_name and string.match(blueprint_name, "^unit_shogun_k_monk_") then
+        return "strategist"
+    end
+
+    if Entity_IsOfType and Entity_IsOfType(entity, "sp_intel") then
+        return "assassin"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "hero") then
+        return "ranger"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "outlaw") then
+        return "skirmisher"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "spy") then
+        return "initiator"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "wolf") then
+        return "duelist"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "carpenter") then
+        return "technician"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "leader") then
+        return "commander"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "falcon") then
+        return "roamer"
+    elseif Entity_IsOfType and Entity_IsOfType(entity, "bakery") then
+        return "strategist"
+    end
+
+    return nil
+end
+
+-- This checks if a class unit is also an elite bodyguard.
+-- Change the "bodyguard" tag if the map uses another squad property for elites.
+function AoE4RPG_ClassIsElite(entity)
+    if not entity then
+        return false
+    end
+
+    local class_name = AoE4RPG_CLASS_GetClassForEntity(entity)
+    local tracking_entry = AoE4RPG_GetBlueprintTrackingEntryForEntity
+        and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+        or nil
+    if tracking_entry and tracking_entry.role == "elites" then
+        return true
+    end
+    local civilization = AoE4RPG_GetUnitCivilization
+        and AoE4RPG_GetUnitCivilization(entity)
+        or nil
+    if AoE4RPG_IsConfiguredElite
+        and AoE4RPG_IsConfiguredElite(entity, civilization, class_name) then
+        return true
+    end
+    if not class_name then
+        return false
+    end
+
+    local def = AoE4RPG.CLASS_DEFINITIONS[class_name]
+    if not def then
+        return false
+    end
+
+    if Entity_IsOfType and Entity_IsOfType(entity, AoE4RPG_BP_BODYGUARD or "bodyguard") then
+        return def.can_be_elite
+    end
+
+    return false
+end
+
+-- Class actions use the full action XP factor.
+-- Other actions use half of the action XP factor.
+AoE4RPG.CLASS_SPECIFIC_ACTION_XP_MULTIPLIER = 1.0
+AoE4RPG.GENERAL_ACTION_XP_MULTIPLIER = 0.5
+
+function AoE4RPG_CLASS_GetExpMultiplier(entity, unit_data, mode)
+    if not entity then
+        return AoE4RPG.GENERAL_ACTION_XP_MULTIPLIER
+    end
+
+    local profile = entity and AoE4RPG_CLASS_GetEntityProfile(entity) or nil
+    local class_name = unit_data and unit_data.class_name
+        or profile and profile.class_name
+    if not class_name then
+        return AoE4RPG.GENERAL_ACTION_XP_MULTIPLIER
+    end
+
+    if mode == "attack" then
+        if class_name == "assassin" or class_name == "ranger" or class_name == "skirmisher" then
+            return AoE4RPG.CLASS_SPECIFIC_ACTION_XP_MULTIPLIER
+        end
+    elseif mode == "damage_taken" then
+        if class_name == "initiator" or class_name == "duelist" or class_name == "technician" then
+            return AoE4RPG.CLASS_SPECIFIC_ACTION_XP_MULTIPLIER
+        end
+    elseif mode == "heal" then
+        if class_name == "commander" or class_name == "roamer" or class_name == "strategist" then
+            return AoE4RPG.CLASS_SPECIFIC_ACTION_XP_MULTIPLIER
+        end
+    elseif mode == "conversion" then
+        if class_name == "commander" or class_name == "strategist" then
+            return AoE4RPG.CLASS_SPECIFIC_ACTION_XP_MULTIPLIER
+        end
+    end
+
+    return AoE4RPG.GENERAL_ACTION_XP_MULTIPLIER
+end
+
+-- ==================== Assassin Fifth Attack ===============
+-- Assassins gain a fifth-hit damage burst and bracket-based weapon damage.
+-- IMPORTANT: The burst is armed after the fourth confirmed hit and removed by the fifth.
+-- ==================== Assassin Fifth Attack ===============
+
+AoE4RPG.ASSASSIN_FIFTH_ATTACK_REQUIRED = 5
+AoE4RPG.ASSASSIN_FIFTH_ATTACK_DAMAGE_FACTOR = 0.25
+AoE4RPG.ASSASSIN_BRACKET_DAMAGE_FACTOR = 0.125
+
+function AoE4RPG_CLASS_RemoveAssassinFifthAttackModifier(unit_data)
+    if not unit_data then
+        return false
+    end
+    if unit_data.assassin_fifth_attack_modifier_id and Modifier_Remove then
+        Modifier_Remove(unit_data.assassin_fifth_attack_modifier_id)
+    end
+    unit_data.assassin_fifth_attack_modifier_id = nil
+    unit_data.assassin_fifth_attack_active = false
+    return true
+end
+
+function AoE4RPG_CLASS_RefreshAssassinBracketDamage(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "assassin"
+        or not (unit_data.is_hero or unit_data.is_elite)
+        or not Modifier_Create or not Modifier_ApplyToEntity then
+        return false
+    end
+
+    local bracket = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 1
+    local desired_bonus = math.max(0, tonumber(bracket) or 0)
+        * AoE4RPG.ASSASSIN_BRACKET_DAMAGE_FACTOR
+    local previous_bonus = tonumber(unit_data.assassin_bracket_damage_applied) or 0
+    if unit_data.assassin_bracket_damage_modifier_id
+        and math.abs(previous_bonus - desired_bonus) <= 0.0001 then
+        return true
+    end
+
+    if unit_data.assassin_bracket_damage_modifier_id and Modifier_Remove then
+        Modifier_Remove(unit_data.assassin_bracket_damage_modifier_id)
+    end
+    unit_data.assassin_bracket_damage_modifier_id = nil
+    unit_data.assassin_bracket_damage_applied = 0
+    if desired_bonus <= 0 then
+        return true
+    end
+
+    local modifier_id = Modifier_ApplyToEntity(
+        Modifier_Create(
+            MAT_Weapon,
+            "damage_weapon_modifier",
+            MUT_MultiplicationAddition,
+            false,
+            desired_bonus,
+            ""
+        ),
+        entity,
+        0
+    )
+    if not modifier_id then
+        return false
+    end
+    unit_data.assassin_bracket_damage_modifier_id = modifier_id
+    unit_data.assassin_bracket_damage_applied = desired_bonus
+    return true
+end
+
+function AoE4RPG_CLASS_ArmAssassinFifthAttack(entity, unit_data)
+    if not entity or not unit_data or unit_data.assassin_fifth_attack_active
+        or not Modifier_Create or not Modifier_ApplyToEntity then
+        return false
+    end
+    local modifier_id = Modifier_ApplyToEntity(
+        Modifier_Create(
+            MAT_Weapon,
+            "damage_weapon_modifier",
+            MUT_MultiplicationAddition,
+            false,
+            AoE4RPG.ASSASSIN_FIFTH_ATTACK_DAMAGE_FACTOR,
+            ""
+        ),
+        entity,
+        0
+    )
+    if not modifier_id then
+        return false
+    end
+    unit_data.assassin_fifth_attack_modifier_id = modifier_id
+    unit_data.assassin_fifth_attack_active = true
+    return true
+end
+
+function AoE4RPG_CLASS_RecordAssassinAttack(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "assassin"
+        or not (unit_data.is_hero or unit_data.is_elite) then
+        return false
+    end
+
+    local current_time = World_GetGameTime and World_GetGameTime() or nil
+    if current_time ~= nil and unit_data.assassin_last_attack_time == current_time then
+        return false
+    end
+    unit_data.assassin_last_attack_time = current_time
+
+    if unit_data.assassin_fifth_attack_active then
+        AoE4RPG_CLASS_RemoveAssassinFifthAttackModifier(unit_data)
+        unit_data.assassin_attack_count = 0
+        return true
+    end
+
+    local required_attacks = math.max(2,
+        tonumber(AoE4RPG.ASSASSIN_FIFTH_ATTACK_REQUIRED) or 5)
+    unit_data.assassin_attack_count = (unit_data.assassin_attack_count or 0) + 1
+    if unit_data.assassin_attack_count >= required_attacks - 1 then
+        AoE4RPG_CLASS_ArmAssassinFifthAttack(entity, unit_data)
+    end
+    return true
+end
+
+-- This gives the Initiator a different extra growth table for melee, ranged, or hybrid units.
+-- Change the three returned tables to tune each weapon profile.
+function AoE4RPG_CLASS_GetInitiatorGrowthProfile(entity)
+    if not entity then
+        return { agility = 0.0, endurance = 0.0, vitality = 0.0 }
+    end
+
+    local is_melee = Entity_IsOfType and Entity_IsOfType(entity, "melee")
+    local is_ranged = Entity_IsOfType and Entity_IsOfType(entity, "ranged")
+
+    if is_melee and is_ranged then
+        return { agility = 0.50, endurance = 1.25, vitality = 1.50 }
+    elseif is_melee then
+        return { agility = 0.00, endurance = 1.50, vitality = 1.75 }
+    elseif is_ranged then
+        return { agility = 1.00, endurance = 0.75, vitality = 0.75 }
+    end
+
+    return { agility = 0.0, endurance = 0.0, vitality = 0.0 }
+end
+
+-- This applies one level of class growth, special bonuses, and the final damage bonus.
+-- Most balance values are the multipliers in this function; base growth is in CLASS_DEFINITIONS above.
+-- ADJUST: edit one class branch at a time so unrelated classes keep their current balance.
+function AoE4RPG_RecalculateAttributeTotals(unit_data)
+    if not unit_data then
+        return
+    end
+    unit_data.base_attributes = unit_data.base_attributes or {}
+    unit_data.non_bonus_attributes = unit_data.non_bonus_attributes or {}
+    unit_data.attribute_bonuses = unit_data.attribute_bonuses or {}
+    unit_data.attribute_passive_multipliers = unit_data.attribute_passive_multipliers or {}
+    unit_data.passive_attribute_bonuses = unit_data.passive_attribute_bonuses or {}
+    unit_data.attributes = unit_data.attributes or {}
+    for _, attribute_name in ipairs({ "agility", "endurance", "vitality" }) do
+        local non_bonus = unit_data.non_bonus_attributes[attribute_name]
+            or unit_data.base_attributes[attribute_name]
+            or 0
+        local flat_bonus = unit_data.attribute_bonuses[attribute_name] or 0
+        local passive_multiplier = unit_data.attribute_passive_multipliers[attribute_name] or 0
+        local passive_bonus = non_bonus * passive_multiplier
+        local bonus = flat_bonus + passive_bonus
+        unit_data.non_bonus_attributes[attribute_name] = AoE4RPG_RoundToStep(non_bonus, 0.25)
+        unit_data.attribute_bonuses[attribute_name] = AoE4RPG_RoundToStep(flat_bonus, 0.25)
+        unit_data.passive_attribute_bonuses[attribute_name] = AoE4RPG_RoundToStep(passive_bonus, 0.25)
+        unit_data.attributes[attribute_name] = AoE4RPG_RoundToStep(
+            unit_data.non_bonus_attributes[attribute_name] + bonus,
+            0.25
+        )
+    end
+end
+
+-- Registers a passive multiplier that is calculated from Total Non Bonus Attribute.
+-- Example: multiplier 0.10 grants 10% of the non-bonus value.
+function AoE4RPG_SetAttributePassive(unit_data, attribute_name, multiplier)
+    if not unit_data or not attribute_name then
+        return
+    end
+    unit_data.attribute_passive_multipliers = unit_data.attribute_passive_multipliers or {}
+    unit_data.attribute_passive_multipliers[attribute_name] = multiplier or 0
+    AoE4RPG_RecalculateAttributeTotals(unit_data)
+end
+
+function AoE4RPG_CLASS_ApplyGrowth(entity, class_name, level, growth_override, base_only)
+    if not entity or not class_name then
+        return
+    end
+
+    if AoE4RPG_GetGrowthTargetEntity then
+        entity = AoE4RPG_GetGrowthTargetEntity(entity)
+    end
+
+    local def = AoE4RPG.CLASS_DEFINITIONS[class_name]
+    if not def then
+        return
+    end
+
+    local unit_data = AoE4RPG_GetUnitData(entity.EntityID)
+    local civ = AoE4RPG_GetUnitCivilization(entity)
+    local profile = AoE4RPG_CLASS_GetEntityProfile(entity)
+        or AoE4RPG_CLASS_GetValueProfile(civ, class_name)
+    local growth = growth_override
+        or (profile and profile.attribute_growth)
+        or def.attribute_growth
+
+    if class_name == "initiator" and not growth_override then
+        local initiator_profile = AoE4RPG_CLASS_GetInitiatorGrowthProfile(entity)
+        growth = {
+            agility = (growth.agility or 0) + (initiator_profile.agility or 0),
+            endurance = (growth.endurance or 0) + (initiator_profile.endurance or 0),
+            vitality = (growth.vitality or 0) + (initiator_profile.vitality or 0),
+        }
+    end
+
+    local agility_gain = growth.agility or 0
+    local endurance_gain = growth.endurance or 0
+    local vitality_gain = growth.vitality or 0
+    if agility_gain > 0 then
+        -- Halve the common Agility attack-speed contribution.
+        -- Ranger's extra class-specific contribution remains at its original value.
+        local common_attack_speed_bonus = agility_gain * 0.025
+        local class_attack_speed_bonus = class_name == "ranger"
+            and agility_gain * 0.05
+            or 0
+        AoE4RPG_ApplyStatModifier(
+            entity,
+            "attack_speed",
+            common_attack_speed_bonus + class_attack_speed_bonus
+        )
+        if class_name == "skirmisher" and Modifier_ApplyToEntity then
+            AoE4RPG_CLASS_ApplyModifierToEntity(
+                entity,
+                Modifier_Create(MAT_Entity, "health_regeneration_modifier", MUT_Addition, false, agility_gain * 0.025, "")
+            )
+        end
+    end
+
+    if endurance_gain > 0 then
+        -- Halve common Endurance health.
+        -- Commander keeps its original extra 25% class contribution (2.5 health per Endurance point).
+        local common_health_bonus = endurance_gain * 5
+        local class_health_bonus = class_name == "commander"
+            and endurance_gain * 2.5
+            or 0
+        AoE4RPG_ApplyStatModifier(
+            entity,
+            "health",
+            common_health_bonus + class_health_bonus
+        )
+        if class_name == "commander" and Modifier_ApplyToEntity then
+            AoE4RPG_CLASS_ApplyModifierToEntity(
+                entity,
+                Modifier_Create(MAT_Entity, "health_regeneration_modifier", MUT_Addition, false, endurance_gain * 0.075, "")
+            )
+        end
+        if class_name == "roamer" then
+            AoE4RPG_CLASS_UpdateRoamerHealthArmor(entity, unit_data)
+        end
+    end
+
+    if vitality_gain > 0 then
+        -- Halve common Vitality armor.
+        -- Duelist's original +0.6 class-specific armor contribution is retained separately from the common +0.6.
+        local common_vitality_armor = vitality_gain * 0.3
+        local class_vitality_armor = class_name == "duelist"
+            and vitality_gain * 0.6
+            or 0
+        AoE4RPG_ApplyStatModifier(
+            entity,
+            "armor",
+            common_vitality_armor + class_vitality_armor
+        )
+        if class_name == "initiator" and Entity_IsOfType and Entity_IsOfType(entity, "melee") then
+            AoE4RPG_ApplyStatModifier(entity, "health", vitality_gain * 5)
+        elseif class_name == "initiator" and Entity_IsOfType and Entity_IsOfType(entity, "ranged") and Modifier_ApplyToEntity then
+            AoE4RPG_CLASS_ApplyModifierToEntity(
+                entity,
+                Modifier_Create(MAT_Weapon, "range_weapon_modifier", MUT_MultiplicationAddition, false, vitality_gain * 0.02, "")
+            )
+            unit_data.weapon_range_bonus = (unit_data.weapon_range_bonus or 0) + vitality_gain * 0.02
+        end
+    end
+
+    if class_name and unit_data.is_hero then
+        AoE4RPG_CLASS_ApplyBurstFireBracketBonus(entity, unit_data)
+    end
+
+    if class_name == "technician" and Modifier_ApplyToEntity then
+        AoE4RPG_CLASS_ApplyModifierToEntity(
+            entity,
+            Modifier_Create(MAT_Entity, "repair_rate_modifier", MUT_MultiplicationAddition, false, vitality_gain * 0.02, "")
+        )
+    end
+
+    -- IMPORTANT: Repair has a confirmed UAGS modifier; build/train bonuses remain tracked for production systems that expose those modifiers in the host map.
+    if class_name == "technician" then
+        unit_data.build_speed_bonus = AoE4RPG_Round((unit_data.build_speed_bonus or 0) + vitality_gain * 0.50, 1)
+        unit_data.train_speed_bonus = AoE4RPG_Round((unit_data.train_speed_bonus or 0) + vitality_gain * 0.50, 1)
+        unit_data.production_speed_bonus = AoE4RPG_Round((unit_data.production_speed_bonus or 0) + vitality_gain * 0.50, 1)
+    end
+
+    if not base_only then
+        unit_data.non_bonus_attributes = unit_data.non_bonus_attributes or {}
+        unit_data.non_bonus_attributes.agility = (unit_data.non_bonus_attributes.agility or 0) + agility_gain
+        unit_data.non_bonus_attributes.endurance = (unit_data.non_bonus_attributes.endurance or 0) + endurance_gain
+        unit_data.non_bonus_attributes.vitality = (unit_data.non_bonus_attributes.vitality or 0) + vitality_gain
+        AoE4RPG_RecalculateAttributeTotals(unit_data)
+    end
+    unit_data.class_name = class_name
+    unit_data.civilization = civ
+    if profile then
+        unit_data.class_profile_key = profile.key
+        if not growth_override then
+            unit_data.class_attribute_growth = AoE4RPG_CLASS_CopyAttributeValues(growth)
+        end
+    end
+    unit_data.derived_stats = AoE4RPG_TranslateAttributesToStats(unit_data)
+
+    if class_name == "skirmisher"
+        and unit_data.skirmisher_damage_received_movement_speed_active
+        and AoE4RPG_CLASS_RefreshSkirmisherDamageReceivedMovementSpeed then
+        AoE4RPG_CLASS_RefreshSkirmisherDamageReceivedMovementSpeed(entity, unit_data)
+    end
+
+    -- Strategist health regeneration also reduces weapon cooldown, but more gently than Agility.
+    if class_name == "strategist" and Modifier_ApplyToEntity then
+        local desired_weapon_cooldown = unit_data.attributes.endurance * 0.050
+            * AoE4RPG_GetPrimaryStatBonus(class_name) * 0.025
+        local previous_weapon_cooldown = unit_data.strategist_weapon_cooldown_applied or 0
+        local delta_weapon_cooldown = desired_weapon_cooldown - previous_weapon_cooldown
+        if math.abs(delta_weapon_cooldown) > 0.0001 then
+            AoE4RPG_CLASS_ApplyModifierToEntity(
+                entity,
+                Modifier_Create(MAT_Weapon, "cooldown_weapon_modifier", MUT_MultiplicationAddition, false, delta_weapon_cooldown, "")
+            )
+            unit_data.strategist_weapon_cooldown_applied = desired_weapon_cooldown
+        end
+
+        -- Health regeneration also shortens ability recharge time.
+        -- Apply the incremental reduction as a multiplicative factor, matching UAGS.
+        local desired_ability_reduction = unit_data.derived_stats.ability_cooldown_modifier or 0
+        local previous_ability_reduction = unit_data.strategist_ability_cooldown_applied or 0
+        local delta_ability_reduction = desired_ability_reduction - previous_ability_reduction
+        if math.abs(delta_ability_reduction) > 0.0001 then
+            local ability_factor = math.max(0.01, 1 - delta_ability_reduction)
+            AoE4RPG_CLASS_ApplyModifierToEntity(
+                entity,
+                Modifier_Create(MAT_Ability, "ability_recharge_time_modifier", MUT_Multiplication, false, ability_factor, "")
+            )
+            unit_data.strategist_ability_cooldown_applied = desired_ability_reduction
+        end
+        if AoE4RPG_CLASS_ReapplyStrategistAbilityEffects then
+            AoE4RPG_CLASS_ReapplyStrategistAbilityEffects(entity, unit_data)
+        end
+    end
+
+    -- IMPORTANT: Apply only the difference from the previous level so modifiers do not repeatedly reapply historical attribute totals.
+    if AoE4RPG_CalculateClassDamageBonus and Modifier_ApplyToEntity then
+        local desired_damage_bonus = AoE4RPG_CalculateClassDamageBonus(entity, unit_data)
+        local previous_damage_bonus = unit_data.damage_bonus_applied or 0
+        local delta_damage_bonus = desired_damage_bonus - previous_damage_bonus
+        if math.abs(delta_damage_bonus) > 0.0001 then
+            if AoE4RPG_ApplyWeaponDamageToAttachments then
+                AoE4RPG_ApplyWeaponDamageToAttachments(entity, delta_damage_bonus)
+            end
+            unit_data.damage_bonus_applied = desired_damage_bonus
+        end
+    end
+
+    -- Siege engines use the same attribute growth but gain faster setup time from Agility
+    if Entity_IsOfType and Entity_IsOfType(entity, "siege") and Modifier_ApplyToEntity then
+        local setup_factor = math.max(0.25, 1 - (agility_gain or 0) * 0.01)
+        local modifier_id = Modifier_ApplyToEntity(
+            Modifier_Create(MAT_Weapon, "weapon_setup_modifier", MUT_Multiplication, false, setup_factor, ""),
+            entity,
+            0
+        )
+        AoE4RPG_CLASS_TrackModifier(entity, modifier_id)
+    end
+end
+
+-- Rebuild one spawned entity from its class profile and persistent RPG level.
+-- IMPORTANT: This is used for fresh EntityIDs and blueprint/tier replacements, so the class cache remains the source of truth while native modifiers stay local to the current entity instance.
+function AoE4RPG_CLASS_ApplyCachedProfileToEntity(entity, unit_data, profile)
+    if not entity or not entity.EntityID or not unit_data then
+        return false
+    end
+    profile = profile or AoE4RPG_CLASS_GetEntityProfile(entity)
+    if not profile then
+        return false
+    end
+
+    local class_name = profile.class_name
+    local player_civilization = unit_data.player_civilization or unit_data.civilization
+    local growth = profile.attribute_growth
+    if class_name == "initiator" then
+        local initiator_profile = AoE4RPG_CLASS_GetInitiatorGrowthProfile(entity)
+        growth = AoE4RPG_CLASS_AddAttributeValues(growth, initiator_profile)
+    end
+
+    local assassin_fifth_attack_was_active =
+        unit_data.assassin_fifth_attack_active == true
+    AoE4RPG_CLASS_RemoveEntityModifiers(entity.EntityID, unit_data)
+    unit_data.class_profile_key = profile.key
+    unit_data.class_name = class_name
+    unit_data.player_civilization = player_civilization
+    unit_data.growth_civilization = profile.civilization
+    unit_data.civilization = player_civilization or profile.civilization
+    unit_data.entity_id = entity.EntityID
+    unit_data.class_attribute_growth = AoE4RPG_CLASS_CopyAttributeValues(growth)
+    unit_data.base_attributes = AoE4RPG_CLASS_CopyAttributeValues(profile.base_attributes)
+    unit_data.non_bonus_attributes = AoE4RPG_CLASS_CopyAttributeValues(profile.base_attributes)
+    for _, attribute_name in ipairs(AoE4RPG_CLASS_ATTRIBUTE_NAMES) do
+        unit_data.non_bonus_attributes[attribute_name] = unit_data.non_bonus_attributes[attribute_name]
+            + (growth[attribute_name] or 0) * math.max(0, unit_data.level or 0)
+    end
+
+    -- These cumulative markers describe the old entity instance.
+    -- Reset them before replaying the base profile and each completed level.
+    unit_data.damage_bonus_applied = 0
+    unit_data.strategist_weapon_cooldown_applied = 0
+    unit_data.strategist_ability_cooldown_applied = 0
+    unit_data.weapon_crit_damage_chance = 0
+    unit_data.weapon_crit_damage_factor = 0
+    unit_data.weapon_range_bonus = 0
+    unit_data.build_speed_bonus = 0
+    unit_data.train_speed_bonus = 0
+    unit_data.production_speed_bonus = 0
+    if AoE4RPG_RecalculateAttributeTotals then
+        AoE4RPG_RecalculateAttributeTotals(unit_data)
+    end
+
+    -- Class and unique growth are then replayed once per completed internal level.
+    AoE4RPG_CLASS_ApplyGrowth(entity, class_name, 0, profile.base_attributes, true)
+    for level = 1, math.max(0, unit_data.level or 0) do
+        AoE4RPG_CLASS_ApplyGrowth(entity, class_name, level, nil, true)
+    end
+    if AoE4RPG_TranslateAttributesToStats then
+        AoE4RPG_TranslateAttributesToStats(unit_data)
+    end
+    if AoE4RPG_CLASS_RefreshAssassinBracketDamage then
+        AoE4RPG_CLASS_RefreshAssassinBracketDamage(entity, unit_data)
+    end
+    if assassin_fifth_attack_was_active
+        and AoE4RPG_CLASS_ArmAssassinFifthAttack then
+        unit_data.assassin_attack_count = math.max(0,
+            (tonumber(AoE4RPG.ASSASSIN_FIFTH_ATTACK_REQUIRED) or 5) - 1)
+        AoE4RPG_CLASS_ArmAssassinFifthAttack(entity, unit_data)
+    end
+    AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+    return true
+end
+
+-- This saves the detected class and civilization into the unit's RPG data.
+-- Change class detection in GetClassForEntity instead of changing this helper.
+function AoE4RPG_CLASS_BindUnit(entity)
+    if not entity then
+        return
+    end
+
+    local eid = entity.EntityID
+    if not eid then
+        return
+    end
+
+    local profile = AoE4RPG_CLASS_GetEntityProfile(entity)
+    if profile then
+        local data = AoE4RPG_GetUnitData(eid)
+        local player_civilization = data.player_civilization or data.civilization
+        data.class_name = profile.class_name
+        data.player_civilization = player_civilization
+        data.growth_civilization = profile.civilization
+        data.civilization = player_civilization or profile.civilization
+        -- IMPORTANT: Units created after match start get the same one-time critical setup as starting units when they first enter the normal RPG bind path.
+        if AoE4RPG_EnableCriticalHits then
+            AoE4RPG_EnableCriticalHits(entity)
+        end
+    end
+end
+
+-- Returns the total numeric resource cost reported for an ability.
+function AoE4RPG_CLASS_GetAbilityTotalCost(player, ability)
+    if AoE4RPG_ABILITY_COST_GetTotalCost then
+        local manual_cost = AoE4RPG_ABILITY_COST_GetTotalCost(ability, player)
+        if manual_cost ~= nil then
+            return manual_cost
+        end
+    end
+    if not player or not ability or not Player_GetAbilityBPCost then
+        return 0
+    end
+    local cost = Player_GetAbilityBPCost(player, ability)
+    if type(cost) == "number" then
+        return math.max(0, cost)
+    end
+    if type(cost) ~= "table" then
+        return 0
+    end
+    local total_cost = 0
+    for _, resource_name in ipairs({ "food", "wood", "gold", "stone", "olive_oil", "relic" }) do
+        local resource_cost = tonumber(cost[resource_name]) or 0
+        total_cost = total_cost + math.max(0, resource_cost)
+    end
+    return total_cost
+end
+
+-- IMPORTANT: Charges the configured HP cost after the native ability requirement has already allowed the cast.
+function AoE4RPG_CLASS_ChargeHeroAbilityHealthCost(entity, ability)
+    if not entity or not ability
+        or not AoE4RPG_ABILITY_COST_GetTotalCost
+        or not Modifier_ApplyToEntity or not Entity_GetHealthMax then
+        return false
+    end
+    -- Ignore abilities without an RPG health cost before resolving the event executor.
+    local total_cost = AoE4RPG_ABILITY_COST_GetTotalCost(ability, entity)
+    if total_cost == nil then
+        return false
+    end
+
+    -- IMPORTANT: Event objects serialize entities as { EntityID = ... }, while other events can serialize players as { PlayerID = ... }.
+    -- IMPORTANT: Only call the native Entity_GetID API after SCAR confirms that an opaque value is an Entity; an arbitrary Lua table must never cross that engine boundary.
+    local entity_id = nil
+    if type(entity) == "number" then
+        entity_id = entity
+    elseif type(entity) == "table" and type(entity.EntityID) == "number" then
+        entity_id = entity.EntityID
+    elseif (not scartype or not ST_ENTITY or scartype(entity) == ST_ENTITY)
+        and Entity_GetID then
+        entity_id = Entity_GetID(entity)
+    end
+    if not entity_id then
+        return false
+    end
+    local live_entity = Entity_FromID and Entity_FromID(entity_id) or entity
+    if live_entity == nil then
+        return false
+    end
+    if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity_id) then
+        return false
+    end
+    local unit_data = AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity_id) or nil
+    if not unit_data then
+        return false
+    end
+    unit_data.ability_health_costs = unit_data.ability_health_costs or {}
+    local previous_cost = unit_data.ability_health_costs[ability] or 0
+    local added_cost = math.max(0, total_cost - previous_cost)
+    if added_cost <= 0 then
+        return false
+    end
+    local current_maximum_health = Entity_GetHealthMax(live_entity)
+    if not current_maximum_health or current_maximum_health <= 0 then
+        return false
+    end
+    Modifier_ApplyToEntity(
+        Modifier_Create(
+            MAT_Entity, "health_maximum_modifier", MUT_MultiplicationAddition,
+            false, -added_cost / current_maximum_health, ""
+        ),
+        live_entity,
+        0
+    )
+    unit_data.ability_health_costs[ability] = total_cost
+    unit_data.ability_health_cost_total =
+        (unit_data.ability_health_cost_total or 0) + added_cost
+    return true
+end
+
+-- Applies strategist ability effects once per entity/ability pair.
+function AoE4RPG_CLASS_ApplyStrategistAbilityEffects(entity, ability, owner)
+    if not entity or not ability or not owner then
+        return false
+    end
+    local entity_id = entity.EntityID
+    if not entity_id then
+        return false
+    end
+    if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity_id) then
+        return false
+    end
+    local unit_data = AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity_id) or nil
+    if not unit_data or unit_data.class_name ~= "strategist" then
+        return false
+    end
+
+    unit_data.strategist_ability_effects = unit_data.strategist_ability_effects or {}
+    local previous_effect = unit_data.strategist_ability_effects[ability] or {
+        reduction = 0,
+        total_cost = 0,
+    }
+
+    local reduction = math.max(0, math.min(0.95,
+        (unit_data.derived_stats and unit_data.derived_stats.ability_cooldown_modifier) or 0))
+    local reduction_factor = 1 - reduction
+    local previous_reduction_factor = 1 - (previous_effect.reduction or 0)
+    local reduction_delta_factor = reduction_factor / math.max(0.01, previous_reduction_factor)
+    local applied = false
+
+    if Modify_AbilityRechargeTime and math.abs(reduction_delta_factor - 1) > 0.0001 then
+        Modify_AbilityRechargeTime(entity, ability, reduction_delta_factor, MUT_Multiplication)
+        applied = true
+    end
+    -- The current ruleset does not define `ability_delay_time_modifier`.
+    -- IMPORTANT: Modify_AbilityDelayTime unconditionally creates that missing modifier, which raises a fatal SCAR error when an AI Strategist crosses a bracket.
+    -- IMPORTANT: Recharge time below remains the supported cooldown reduction path; do not call the unavailable delay-time helper as an optional fallback.
+    if Modify_AbilityCastTime and math.abs(reduction_delta_factor - 1) > 0.0001 then
+        Modify_AbilityCastTime(owner, ability, reduction_delta_factor, MUT_Multiplication)
+        applied = true
+    end
+    local channel_delta_factor = (1 + reduction) / (1 + (previous_effect.reduction or 0))
+    if Modify_AbilityChannelingTime and math.abs(channel_delta_factor - 1) > 0.0001 then
+        Modify_AbilityChannelingTime(owner, ability, channel_delta_factor, MUT_Multiplication)
+        applied = true
+    end
+
+    local total_cost = AoE4RPG_CLASS_GetAbilityTotalCost(owner, ability)
+    if AoE4RPG_CLASS_ChargeHeroAbilityHealthCost(entity, ability) then
+        applied = true
+    end
+
+    unit_data.strategist_ability_effects[ability] = {
+        reduction = reduction,
+        total_cost = math.max(previous_effect.total_cost or 0, total_cost),
+    }
+    return applied or previous_effect.reduction ~= reduction
+end
+
+-- IMPORTANT: Reapplies only the level-up delta to abilities already observed on this strategist, preventing the complete historical modifier from stacking again.
+function AoE4RPG_CLASS_ReapplyStrategistAbilityEffects(entity, unit_data)
+    if not entity or not unit_data or unit_data.class_name ~= "strategist"
+        or not unit_data.strategist_ability_effects or not Entity_GetPlayerOwner then
+        return false
+    end
+    local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        or nil
+    if not owner then
+        return false
+    end
+    local changed = false
+    for ability in pairs(unit_data.strategist_ability_effects) do
+        changed = AoE4RPG_CLASS_ApplyStrategistAbilityEffects(entity, ability, owner) or changed
+    end
+    return changed
+end
+
+-- ==================== Commander Regeneration Aura ==============
+-- Calculates the current aura radius and regeneration multiplier from the Commander's stored Attributes.
+-- Internal level 0 is the player's displayed starting level, so it uses the configured base radius.
+-- ==================== Commander Regeneration Aura ==============
+
+function AoE4RPG_CLASS_GetCommanderRegenerationAuraRadius(unit_data)
+    local level = math.max(0, tonumber(unit_data and unit_data.level) or 0)
+    local base_radius = math.max(0,
+        tonumber(AoE4RPG.COMMANDER_REGENERATION_AURA_BASE_RADIUS) or 0)
+    local radius_growth = math.max(0,
+        tonumber(AoE4RPG.COMMANDER_REGENERATION_AURA_RADIUS_PER_LEVEL) or 0)
+    return base_radius + level * radius_growth
+end
+
+function AoE4RPG_CLASS_GetCommanderRegenerationAuraFactor(unit_data)
+    local endurance = unit_data and unit_data.attributes
+        and tonumber(unit_data.attributes.endurance) or 0
+    local per_endurance = math.max(0,
+        tonumber(AoE4RPG.COMMANDER_REGENERATION_PER_ENDURANCE) or 0)
+    return 1 + math.max(0, endurance) * per_endurance
+end
+
+-- IMPORTANT: Removes one Commander aura modifier from a target.
+-- Target records are kept separately from class modifiers because ordinary units are not class-bound.
+function AoE4RPG_CLASS_RemoveCommanderRegenerationModifier(entity_id)
+    local record = entity_id
+        and AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS[entity_id]
+        or nil
+    if not record then
+        return false
+    end
+    if record.modifier_id and Modifier_Remove then
+        Modifier_Remove(record.modifier_id)
+    end
+    AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS[entity_id] = nil
+    return true
+end
+
+-- Marks the nearby-unit aura map for a synchronized rebuild on the next class-runtime tick.
+function AoE4RPG_CLASS_MarkCommanderRegenerationAuraDirty()
+    AoE4RPG.commander_regeneration_aura_dirty = true
+end
+
+local function AoE4RPG_CLASS_GetCommanderRegenerationAuraSignature(commander_entries)
+    local signature_parts = {}
+    for _, entry in ipairs(commander_entries or {}) do
+        local unit_data = entry.unit_data or {}
+        table.insert(signature_parts, table.concat({
+            tostring(entry.entity_id or 0),
+            tostring(tonumber(unit_data.level) or 0),
+            tostring(tonumber(unit_data.attributes and unit_data.attributes.endurance) or 0),
+        }, ":"))
+    end
+    return table.concat(signature_parts, "|")
+end
+
+-- Rebuilds the one-per-target Commander aura map.
+-- Buildings are excluded from this unit regeneration aura.
+function AoE4RPG_CLASS_MonitorCommanderRegenerationAura(commander_entries)
+    AoE4RPG.commander_regeneration_aura_elapsed =
+        (AoE4RPG.commander_regeneration_aura_elapsed or 0)
+        + AoE4RPG.CLASS_RUNTIME_REFRESH_INTERVAL
+    if commander_entries then
+        local signature = AoE4RPG_CLASS_GetCommanderRegenerationAuraSignature(
+            commander_entries
+        )
+        if signature ~= AoE4RPG.commander_regeneration_aura_signature then
+            AoE4RPG.commander_regeneration_aura_signature = signature
+            AoE4RPG.commander_regeneration_aura_dirty = true
+        end
+    end
+    if not AoE4RPG.commander_regeneration_aura_dirty
+        and AoE4RPG.commander_regeneration_aura_elapsed
+            < AoE4RPG.commander_regeneration_aura_refresh_interval then
+        return true
+    end
+    AoE4RPG.commander_regeneration_aura_dirty = false
+    AoE4RPG.commander_regeneration_aura_elapsed = 0
+    if commander_entries and #commander_entries == 0
+        and next(AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS) == nil then
+        return true
+    end
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local native_nearby_query_available = World_GetEntitiesNearPoint and OT_Ally
+    if not tracker
+        or (not commander_entries and not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity)
+        or (not native_nearby_query_available and not Player_GetAllEntitiesNearMarker)
+        or not EGroup_CreateIfNotFound
+        or not EGroup_Clear
+        or not EGroup_ForEach
+        or not Entity_GetPosition
+        or not Modifier_Create
+        or not Modifier_ApplyToSquad
+        or not Entity_GetSquad
+        or not MUT_Multiplication then
+        return false
+    end
+
+    local nearby_entities = EGroup_CreateIfNotFound(
+        "AoE4RPG_CommanderRegenerationAuraEntities"
+    )
+    if not nearby_entities then
+        return false
+    end
+
+    local function get_sorted_keys(value)
+        if AoE4RPG_RUNTIME_GetSortedKeys then
+            return AoE4RPG_RUNTIME_GetSortedKeys(value)
+        end
+        local keys = {}
+        for key in pairs(value or {}) do
+            table.insert(keys, key)
+        end
+        table.sort(keys)
+        return keys
+    end
+
+    local desired = {}
+    local function process_commander(commander, commander_id, unit_data)
+        unit_data = unit_data
+            or (AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[commander_id])
+            or nil
+        if not unit_data or unit_data.class_name ~= "commander"
+            or not (unit_data.is_hero or unit_data.is_elite) then
+            return
+        end
+
+        local position = Entity_GetPosition(commander)
+        local radius = AoE4RPG_CLASS_GetCommanderRegenerationAuraRadius(unit_data)
+        local factor = AoE4RPG_CLASS_GetCommanderRegenerationAuraFactor(unit_data)
+        if not position or radius <= 0 or factor <= 1 then
+            return
+        end
+
+        -- IMPORTANT: The aura must query the commander's owner, not Game_GetLocalPlayer.
+        local commander_record = tracker.tracked_entity_records[commander_id]
+        local commander_player = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+            and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(commander)
+            or nil
+        local commander_player_id = commander_record and commander_record.player_id
+            or (commander_player
+                and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(commander_player))
+        local commander_player_handle = AoE4RPG_RUNTIME_GetPlayerHandle
+            and AoE4RPG_RUNTIME_GetPlayerHandle(commander_player or commander_player_id)
+            or commander_player
+        if not commander_player_id or not commander_player_handle then
+            return
+        end
+        EGroup_Clear(nearby_entities)
+        if native_nearby_query_available then
+            World_GetEntitiesNearPoint(
+                commander_player_handle,
+                nearby_entities,
+                position,
+                radius,
+                OT_Ally
+            )
+        else
+            -- Compatibility fallback for hosts that expose the older query helper.
+            Player_GetAllEntitiesNearMarker(
+                commander_player_handle,
+                nearby_entities,
+                position,
+                radius
+            )
+        end
+        EGroup_ForEach(nearby_entities, function(_, _, target)
+            if not target then
+                return
+            end
+            local target_id = target.EntityID
+                or (Entity_GetID and Entity_GetID(target))
+                or nil
+            if not target_id or target_id == commander_id
+                or (Entity_IsValid and not Entity_IsValid(target_id)) then
+                return
+            end
+            local is_building = Entity_IsBuilding and Entity_IsBuilding(target)
+                or (Entity_IsOfType and Entity_IsOfType(target, "building"))
+                or false
+            if is_building then
+                return
+            end
+            local target_squad = Entity_GetSquad(target)
+            if not target_squad then
+                return
+            end
+
+            local current = desired[target_id]
+            if not current
+                or factor > current.factor
+                or (factor == current.factor and commander_id < current.source_entity_id) then
+                desired[target_id] = {
+                    factor = factor,
+                    source_entity_id = commander_id,
+                    squad = target_squad,
+                }
+            end
+        end)
+    end
+
+    if commander_entries then
+        for _, entry in ipairs(commander_entries) do
+            process_commander(entry.entity, entry.entity_id, entry.unit_data)
+        end
+    else
+        AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(process_commander)
+    end
+
+    local current_target_ids = get_sorted_keys(
+        AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS
+    )
+    for _, target_id in ipairs(current_target_ids) do
+        local wanted = desired[target_id]
+        local current = AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS[target_id]
+        if not wanted or math.abs((current.factor or 1) - wanted.factor) > 0.000001 then
+            AoE4RPG_CLASS_RemoveCommanderRegenerationModifier(target_id)
+        elseif current then
+            current.source_entity_id = wanted.source_entity_id
+        end
+    end
+
+    local desired_target_ids = get_sorted_keys(desired)
+    for _, target_id in ipairs(desired_target_ids) do
+        local wanted = desired[target_id]
+        if not AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS[target_id] then
+            local modifier_id = wanted.squad and Modifier_ApplyToSquad(
+                    Modifier_Create(
+                        MAT_Entity,
+                        "health_regeneration_modifier",
+                        MUT_Multiplication,
+                        false,
+                        wanted.factor,
+                        ""
+                    ),
+                    wanted.squad,
+                    0
+                )
+                or nil
+            if modifier_id then
+                AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS[target_id] = {
+                    factor = wanted.factor,
+                    source_entity_id = wanted.source_entity_id,
+                    modifier_id = modifier_id,
+                }
+            end
+        end
+    end
+    return true
+end
+
+function AoE4RPG_CLASS_StartCommanderRegenerationAura()
+    if AoE4RPG.class_runtime_monitor_registered then
+        return true
+    end
+    if AoE4RPG.commander_regeneration_aura_monitor_registered then
+        return true
+    end
+    if not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(AoE4RPG_CLASS_MonitorCommanderRegenerationAura, 0.25)
+    AoE4RPG.commander_regeneration_aura_monitor_registered = true
+    return true
+end
+
+function AoE4RPG_CLASS_StopCommanderRegenerationAura()
+    if AoE4RPG.commander_regeneration_aura_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_CLASS_MonitorCommanderRegenerationAura)
+    end
+    AoE4RPG.commander_regeneration_aura_monitor_registered = false
+    AoE4RPG.commander_regeneration_aura_dirty = true
+    AoE4RPG.commander_regeneration_aura_elapsed =
+        AoE4RPG.commander_regeneration_aura_refresh_interval
+    AoE4RPG.commander_regeneration_aura_signature = nil
+    for entity_id in pairs(AoE4RPG.COMMANDER_REGENERATION_AURA_MODIFIERS) do
+        AoE4RPG_CLASS_RemoveCommanderRegenerationModifier(entity_id)
+    end
+    return true
+end
+
+-- ==================== Class Runtime Monitor ==============
+-- One synchronized pass refreshes every class feature that uses the same interval.
+-- IMPORTANT: Add new interval-based class behavior to this dispatcher when possible.
+-- ==================== Class Runtime Monitor ==============
+
+function AoE4RPG_CLASS_MonitorRuntimeFeatures()
+    if not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity then
+        return false
+    end
+
+    local current_time = AoE4RPG_CLASS_GetStrategistAttackRegenerationTime()
+    local commander_entries = {}
+    AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(function(entity, entity_id)
+        local unit_data = entity_id and AoE4RPG_GetUnitData
+            and AoE4RPG_GetUnitData(entity_id)
+            or nil
+        if not unit_data or not (unit_data.is_hero or unit_data.is_elite) then
+            return
+        end
+
+        local class_name = unit_data.class_name
+        AoE4RPG_CLASS_TrackSelfHealing(entity, unit_data)
+        if class_name == "commander" then
+            AoE4RPG_CLASS_UpdateCommanderSelfRegeneration(entity, unit_data)
+            table.insert(commander_entries, {
+                entity = entity,
+                entity_id = entity_id,
+                unit_data = unit_data,
+            })
+        elseif class_name == "roamer" then
+            AoE4RPG_CLASS_UpdateRoamerHealthArmor(entity, unit_data)
+        elseif class_name == "initiator" and Entity_IsAttacking then
+            if Entity_IsAttacking(entity, AoE4RPG.CLASS_RUNTIME_REFRESH_INTERVAL) then
+                AoE4RPG_CLASS_ResetInitiatorIdleDamage(entity, unit_data)
+            else
+                unit_data.initiator_idle_seconds = math.max(0,
+                    tonumber(unit_data.initiator_idle_seconds) or 0)
+                    + AoE4RPG.CLASS_RUNTIME_REFRESH_INTERVAL
+                AoE4RPG_CLASS_UpdateInitiatorIdleDamage(entity, unit_data)
+            end
+        elseif class_name == "strategist" and current_time ~= nil then
+            local last_attack_time = unit_data.strategist_attack_regeneration_last_attack_time
+            local reset_seconds = AoE4RPG_CLASS_GetStrategistAttackRegenerationResetSeconds(
+                entity,
+                unit_data
+            )
+            if last_attack_time ~= nil
+                and current_time - last_attack_time >= reset_seconds then
+                unit_data.strategist_attack_regeneration_stacks = 0
+                unit_data.strategist_attack_regeneration_last_attack_time = nil
+            end
+            AoE4RPG_CLASS_UpdateStrategistAttackRegeneration(entity, unit_data)
+        end
+    end)
+
+    AoE4RPG_CLASS_MonitorCommanderRegenerationAura(commander_entries)
+    return true
+end
+
+function AoE4RPG_CLASS_StartRuntimeMonitors()
+    if AoE4RPG.class_runtime_monitor_registered then
+        return true
+    end
+    if not Rule_AddInterval then
+        return false
+    end
+
+    AoE4RPG_CLASS_StopCommanderRegenerationAura()
+    AoE4RPG_CLASS_StopCommanderSelfRegeneration()
+    AoE4RPG_CLASS_StopRoamerHealthArmor()
+    AoE4RPG_CLASS_StopInitiatorIdleDamage()
+    AoE4RPG_CLASS_StopStrategistAttackRegeneration()
+    Rule_AddInterval(
+        AoE4RPG_CLASS_MonitorRuntimeFeatures,
+        AoE4RPG.CLASS_RUNTIME_REFRESH_INTERVAL
+    )
+    AoE4RPG.class_runtime_monitor_registered = true
+    return true
+end
+
+function AoE4RPG_CLASS_StopRuntimeMonitors()
+    if AoE4RPG.class_runtime_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_CLASS_MonitorRuntimeFeatures)
+    end
+    AoE4RPG.class_runtime_monitor_registered = false
+    AoE4RPG_CLASS_StopCommanderRegenerationAura()
+    AoE4RPG_CLASS_StopCommanderSelfRegeneration()
+    AoE4RPG_CLASS_StopRoamerHealthArmor()
+    AoE4RPG_CLASS_StopInitiatorIdleDamage()
+    AoE4RPG_CLASS_StopStrategistAttackRegeneration()
+    return true
+end

@@ -1,0 +1,218 @@
+-- ================= AoE4RPG Random Bonus UI ===============
+-- AoE4RPG Random Bonus - UI Bonus Choice Presenter shows and submits the current random bonus choices.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_random_bonus.scar and AoE4RPG_ui_panel.scar.
+-- ================= AoE4RPG Random Bonus UI ===============
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+AoE4RPG.BONUS_UI = {
+    initialized = false,
+    current_entity_id = nil,
+    current_bracket_index = nil,
+    context = {
+        visible = false,
+        bracket_text = "",
+        selection_command = nil,
+        candidate1 = { icon = "", head = "", text = "" },
+        candidate2 = { icon = "", head = "", text = "" },
+        candidate3 = { icon = "", head = "", text = "" },
+    },
+}
+
+function AoE4RPG_BONUS_UI_Hide()
+    AoE4RPG.BONUS_UI.current_entity_id = nil
+    AoE4RPG.BONUS_UI.current_bracket_index = nil
+    AoE4RPG.BONUS_UI.context.visible = false
+    if AoE4RPG_UI_PanelSetData then
+        AoE4RPG_UI_PanelSetData("AoE4RPG_RandomBonusChoices", AoE4RPG.BONUS_UI.context)
+    elseif UI_SetDataContext then
+        UI_SetDataContext("AoE4RPG_RandomBonusChoices", AoE4RPG.BONUS_UI.context)
+    end
+end
+
+-- Returns true only when the supplied entity belongs to the local player.
+function AoE4RPG_BONUS_UI_IsLocallyOwned(entity)
+    if not entity or not Entity_GetPlayerOwner or not Game_GetLocalPlayer then
+        return false
+    end
+    local entity_owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        or nil
+    if not entity_owner then
+        return false
+    end
+    local local_player = Game_GetLocalPlayer()
+    return AoE4RPG_BONUS_GetPlayerIdentifier(entity_owner)
+        == AoE4RPG_BONUS_GetPlayerIdentifier(local_player)
+end
+
+function AoE4RPG_BONUS_UI_UpdateForEntity(entity)
+    local normalized_entity = entity
+    local entity_id = entity and entity.EntityID or entity
+    if AoE4RPG_UI_NormalizeEntity then
+        normalized_entity, entity_id = AoE4RPG_UI_NormalizeEntity(entity)
+    end
+    if not normalized_entity or not entity_id or not AoE4RPG_BONUS_UI_IsLocallyOwned(normalized_entity) then
+        AoE4RPG_BONUS_UI_Hide()
+        return
+    end
+    -- IMPORTANT: Riders are progression-only attachments and must never open the parent hero's bonus panel from a direct rider selection.
+    if Entity_IsOfType and Entity_IsOfType(normalized_entity, "rider") then
+        AoE4RPG_BONUS_UI_Hide()
+        return
+    end
+
+    if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity_id) then
+        AoE4RPG_BONUS_UI_Hide()
+        return
+    end
+    local unit_data = AoE4RPG_GetExistingUnitData
+        and AoE4RPG_GetExistingUnitData(entity_id)
+        or nil
+
+    -- Candidate generation is synchronized by the spawn/tracker and Start scans.
+    local offer = AoE4RPG_BONUS_GetActiveOffer(entity_id)
+    if not offer or #offer.choices ~= 3 then
+        AoE4RPG_BONUS_UI_Hide()
+        return
+    end
+
+    local first_name, first_description = AoE4RPG_BONUS_GetChoiceDisplay(offer.choices[1], unit_data)
+    local second_name, second_description = AoE4RPG_BONUS_GetChoiceDisplay(offer.choices[2], unit_data)
+    local third_name, third_description = AoE4RPG_BONUS_GetChoiceDisplay(offer.choices[3], unit_data)
+    if not first_name or not second_name or not third_name then
+        AoE4RPG_BONUS_UI_Hide()
+        return
+    end
+
+    AoE4RPG.BONUS_UI.current_entity_id = entity_id
+    AoE4RPG.BONUS_UI.current_bracket_index = offer.bracket_index
+    local context = AoE4RPG.BONUS_UI.context
+    context.visible = true
+    context.bracket_text = string.format("BRACKET %d BONUS", offer.bracket_index)
+    -- Keep candidate tables separate, as in the working boon selector.
+    -- IMPORTANT: The currently selected EntityID remains outside the context so hero A can never submit hero B's visible offer.
+    context.candidate1 = {
+        head = first_name,
+        text = first_description,
+        icon = "icons\\races\\crucible_mode\\boons\\upgrade_roulette",
+    }
+    context.candidate2 = {
+        head = second_name,
+        text = second_description,
+        icon = "icons\\races\\crucible_mode\\boons\\upgrade_roulette",
+    }
+    context.candidate3 = {
+        head = third_name,
+        text = third_description,
+        icon = "icons\\races\\crucible_mode\\boons\\upgrade_roulette",
+    }
+    if AoE4RPG_UI_PanelSetData then
+        AoE4RPG_UI_PanelSetData("AoE4RPG_RandomBonusChoices", context)
+    elseif UI_SetDataContext then
+        UI_SetDataContext("AoE4RPG_RandomBonusChoices", context)
+    end
+end
+
+-- Local button callback.
+function AoE4RPG_BONUS_UI_SelectChoice(choice_parameter)
+    local choice_index = tonumber(choice_parameter)
+    local entity_id = AoE4RPG.BONUS_UI.current_entity_id
+    local bracket_index = AoE4RPG.BONUS_UI.current_bracket_index
+    if not choice_index or not entity_id or not bracket_index or not Network_CallEvent then
+        return
+    end
+
+    local data = string.format("%d,%d,%d", entity_id, bracket_index, choice_index)
+    Network_CallEvent(AoE4RPG.BONUS.network_event_name, data)
+    AoE4RPG_BONUS_UI_Hide()
+end
+
+-- Called by the synchronized handler.
+function AoE4RPG_BONUS_UI_OnSelectionApplied(entity_id)
+    if AoE4RPG.BONUS_UI.current_entity_id == entity_id then
+        AoE4RPG_BONUS_UI_Hide()
+    end
+end
+
+-- Creates the left-side vertical one-column, three-row choice panel once.
+function AoE4RPG_BONUS_UI_Initialize()
+    if AoE4RPG.BONUS_UI.initialized then
+        return true
+    end
+    if (not AoE4RPG_UI_PanelCreate and (not UI_AddChild or not UI_CreateDataContext)) or not UI_CreateCommand then
+        return false
+    end
+
+    AoE4RPG.BONUS_UI.context.selection_command = UI_CreateCommand("AoE4RPG_BONUS_UI_SelectChoice")
+    local xaml = [[<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      HorizontalAlignment="Center" VerticalAlignment="Center"
+      Visibility="{Binding [visible], Converter={StaticResource BoolToVis}}">
+  <Grid.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="pack://application:,,,ui/Resources/HUDResources.xaml" />
+      </ResourceDictionary.MergedDictionaries>
+    </ResourceDictionary>
+  </Grid.Resources>
+  <StackPanel Orientation="Vertical" HorizontalAlignment="Center">
+    <TextBlock Text="{Binding [bracket_text]}" Margin="10,10,10,20"
+               HorizontalAlignment="Center" Style="{StaticResource TitleTextBlockStyle}" />
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+      <Button Width="430" Height="320" Style="{StaticResource SecondaryCard}"
+              Command="{Binding [selection_command]}" CommandParameter="1">
+        <Grid><Rectangle Style="{StaticResource CanvasBackgroundRectangle}" /><StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+          <Image Source="{Binding [candidate1][icon]}" Width="64" Height="64" />
+          <TextBlock Text="{Binding [candidate1][head]}" Margin="0,10,0,0" MaxWidth="350" TextAlignment="Center" Style="{StaticResource TitleTextBlockStyle}" />
+          <TextBlock Text="{Binding [candidate1][text]}" Margin="10,8,20,0" MaxWidth="350" TextAlignment="Center" TextWrapping="Wrap" Style="{StaticResource BodyTextBlockStyle}" />
+        </StackPanel></Grid>
+      </Button>
+      <Button Width="430" Height="320" Margin="20,0,0,0" Style="{StaticResource SecondaryCard}"
+              Command="{Binding [selection_command]}" CommandParameter="2">
+        <Grid><Rectangle Style="{StaticResource CanvasBackgroundRectangle}" /><StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+          <Image Source="{Binding [candidate2][icon]}" Width="64" Height="64" />
+          <TextBlock Text="{Binding [candidate2][head]}" Margin="0,10,0,0" MaxWidth="350" TextAlignment="Center" Style="{StaticResource TitleTextBlockStyle}" />
+          <TextBlock Text="{Binding [candidate2][text]}" Margin="10,8,20,0" MaxWidth="350" TextAlignment="Center" TextWrapping="Wrap" Style="{StaticResource BodyTextBlockStyle}" />
+        </StackPanel></Grid>
+      </Button>
+      <Button Width="430" Height="320" Margin="20,0,0,0" Style="{StaticResource SecondaryCard}"
+              Command="{Binding [selection_command]}" CommandParameter="3">
+        <Grid><Rectangle Style="{StaticResource CanvasBackgroundRectangle}" /><StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+          <Image Source="{Binding [candidate3][icon]}" Width="64" Height="64" />
+          <TextBlock Text="{Binding [candidate3][head]}" Margin="0,10,0,0" MaxWidth="350" TextAlignment="Center" Style="{StaticResource TitleTextBlockStyle}" />
+          <TextBlock Text="{Binding [candidate3][text]}" Margin="10,8,20,0" MaxWidth="350" TextAlignment="Center" TextWrapping="Wrap" Style="{StaticResource BodyTextBlockStyle}" />
+        </StackPanel></Grid>
+      </Button>
+    </StackPanel>
+  </StackPanel>
+</Grid>]]
+
+    local created
+    if AoE4RPG_UI_PanelCreate then
+        created = AoE4RPG_UI_PanelCreate(
+            "AoE4RPG_RandomBonusChoices",
+            xaml,
+            AoE4RPG.BONUS_UI.context,
+            true,
+            "ScarNotReplay"
+        )
+    else
+        created = pcall(function()
+            UI_AddChild("ScarNotReplay", "XamlPresenter", "AoE4RPG_RandomBonusChoices", {
+                IsHitTestVisible = true,
+                Xaml = xaml,
+                DataContext = UI_CreateDataContext(AoE4RPG.BONUS_UI.context),
+            })
+        end)
+    end
+    if not created then
+        return false
+    end
+    AoE4RPG.BONUS_UI.initialized = true
+    return true
+end

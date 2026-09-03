@@ -1,0 +1,346 @@
+-- ================= AoE4RPG King Growth ===============
+-- AoE4RPG King Growth - Regicide Growth applies interval-based growth to registered Regicide kings.
+-- Author: Hikitomi
+-- Referenced: native Regicide mode, king blueprints, and native UAGS APIs.
+-- ================= AoE4RPG King Growth ===============
+
+AoE4RPG = AoE4RPG or {}
+
+AoE4RPG.KING_GROWTH = AoE4RPG.KING_GROWTH or {
+    maximum_steps = 25,
+    health_per_step = 100,
+    regeneration_per_step = 2,
+    -- The initial king census is intentionally separate from the growth interval.
+    -- IMPORTANT: Kings cannot respawn in Regicide, so the interval must never enumerate every player or query Player_GetSquadsFromType again.
+    king_entity_ids = {},
+    king_entity_index_by_id = {},
+    king_records_by_entity = {},
+    initial_scan_completed = false,
+    applied_steps_by_entity = {},
+    monitor_registered = false,
+}
+
+-- Regicide is now one independent AGS-style victory checkbox.
+-- King growth is enabled whenever that condition is checked, even alongside other outcomes.
+function AoE4RPG_KING_GROWTH_IsRegicideEnabled()
+    return AoE4RPG.SETTINGS ~= nil
+        and AoE4RPG.SETTINGS.victory_conditions ~= nil
+        and AoE4RPG.SETTINGS.victory_conditions.regicide == true
+end
+
+-- Returns the absolute elapsed-time step.
+-- Calculating from world time prevents interval-rule drift while the cached startup kings receive missed steps.
+function AoE4RPG_KING_GROWTH_GetCurrentStep()
+    local minutes_per_step = AoE4RPG.SETTINGS
+        and AoE4RPG.SETTINGS.king_level_minutes
+        or 5
+    if type(minutes_per_step) ~= "number" or minutes_per_step <= 0 then
+        return 0
+    end
+    local elapsed_seconds = World_GetGameTime and World_GetGameTime() or 0
+    return math.min(
+        AoE4RPG.KING_GROWTH.maximum_steps,
+        math.floor(elapsed_seconds / (minutes_per_step * 60))
+    )
+end
+
+-- Applies only the steps that this exact king entity has not received yet.
+-- IMPORTANT: MultiplicationAddition converts each absolute health amount into the native maximum-health modifier's required ratio while regeneration is additive.
+function AoE4RPG_KING_GROWTH_ApplyCurrentStepToEntity(entity, target_step)
+    if entity == nil then
+        return false
+    end
+    local entity_id = entity.EntityID
+    if not entity_id and Entity_GetID
+        and (not scartype or not ST_ENTITY or scartype(entity) == ST_ENTITY) then
+        entity_id = Entity_GetID(entity)
+    end
+    if type(entity_id) ~= "number"
+        or (Entity_IsValid and not Entity_IsValid(entity_id))
+        or (Entity_IsOfType and not Entity_IsOfType(entity, "King")) then
+        return false
+    end
+
+    local applied_step =
+        AoE4RPG.KING_GROWTH.applied_steps_by_entity[entity_id] or 0
+    local missing_steps = target_step - applied_step
+    if missing_steps <= 0 then
+        return false
+    end
+
+    if Modifier_Create and Modifier_ApplyToEntity and Entity_GetHealthMax then
+        local health_gain =
+            AoE4RPG.KING_GROWTH.health_per_step * missing_steps
+        local king_record = AoE4RPG.KING_GROWTH.king_records_by_entity[entity_id]
+        local base_maximum_health = king_record
+            and king_record.base_maximum_health
+            or Entity_GetHealthMax(entity)
+        base_maximum_health = math.max(1, base_maximum_health)
+        Modifier_ApplyToEntity(
+            Modifier_Create(
+                MAT_Entity,
+                "health_maximum_modifier",
+                MUT_MultiplicationAddition,
+                false,
+                health_gain / base_maximum_health,
+                ""
+            ),
+            entity,
+            0
+        )
+        Modifier_ApplyToEntity(
+            Modifier_Create(
+                MAT_Entity,
+                "health_regeneration_modifier",
+                MUT_Addition,
+                false,
+                AoE4RPG.KING_GROWTH.regeneration_per_step * missing_steps,
+                ""
+            ),
+            entity,
+            0
+        )
+        AoE4RPG.KING_GROWTH.applied_steps_by_entity[entity_id] = target_step
+        return true
+    end
+    return false
+end
+
+local function AoE4RPG_KING_GROWTH_GetPlayerIdentifier(player)
+    if type(player) == "number" then
+        return player
+    end
+    if type(player) == "table" then
+        local identifier = player.id or player.PlayerID
+        if type(identifier) == "number" then
+            return identifier
+        end
+    end
+    if player and Player_GetID then
+        local success, identifier = pcall(Player_GetID, player)
+        if success and type(identifier) == "number" then
+            return identifier
+        end
+    end
+    return nil
+end
+
+local function AoE4RPG_KING_GROWTH_GetEntityIdentifier(entity)
+    if AoE4RPG_RUNTIME_GetEntityIdentifier then
+        return AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+    end
+    if type(entity) == "number" then
+        return entity
+    end
+    if type(entity) == "table" and type(entity.EntityID) == "number" then
+        return entity.EntityID
+    end
+    if entity and Entity_GetID
+        and (not scartype or not ST_ENTITY or scartype(entity) == ST_ENTITY) then
+        local success, entity_id = pcall(Entity_GetID, entity)
+        if success and type(entity_id) == "number" then
+            return entity_id
+        end
+    end
+    return nil
+end
+
+local function AoE4RPG_KING_GROWTH_GetEntityBlueprintData(entity)
+    if not entity or not Entity_GetBlueprint then
+        return nil, nil
+    end
+    local success, blueprint = pcall(Entity_GetBlueprint, entity)
+    if not success or not blueprint then
+        return nil, nil
+    end
+    local blueprint_name = blueprint
+    if BP_GetName then
+        local name_success, resolved_name = pcall(BP_GetName, blueprint)
+        if name_success and resolved_name then
+            blueprint_name = resolved_name
+        end
+    end
+    return blueprint, blueprint_name
+end
+
+local function AoE4RPG_KING_GROWTH_AddPlayerIdentifier(player_ids, seen, players_by_id, player)
+    local player_handle = player
+    if AoE4RPG_RUNTIME_GetPlayerHandle then
+        player_handle = AoE4RPG_RUNTIME_GetPlayerHandle(player_handle)
+    end
+    if type(player_handle) == "number" then
+        local player_from_id = Player_FromId or Player_FromID
+        player_handle = player_from_id and player_from_id(player_handle) or nil
+    end
+    local player_id = AoE4RPG_KING_GROWTH_GetPlayerIdentifier(player_handle or player)
+    if type(player_id) == "number" and not seen[player_id] then
+        seen[player_id] = true
+        players_by_id[player_id] = player_handle
+        table.insert(player_ids, player_id)
+    end
+end
+
+-- Builds one deterministic startup census.
+-- PLAYERS contains both human and AI players, so no AI-specific branch is needed and no AI king is skipped.
+-- IMPORTANT: The generic `king` type is the same native type used by Regicide starting conditions and supports civilization-specific king entity blueprints.
+function AoE4RPG_KING_GROWTH_CacheInitialKings()
+    local growth = AoE4RPG.KING_GROWTH
+    growth.king_entity_ids = {}
+    growth.king_entity_index_by_id = {}
+    growth.king_records_by_entity = {}
+    growth.applied_steps_by_entity = {}
+
+    local player_ids = {}
+    local seen_players = {}
+    local players_by_id = {}
+    if type(PLAYERS) == "table" then
+        for _, player in pairs(PLAYERS) do
+            AoE4RPG_KING_GROWTH_AddPlayerIdentifier(
+                player_ids,
+                seen_players,
+                players_by_id,
+                player
+            )
+        end
+    elseif World_GetPlayerCount and World_GetPlayerAt then
+        for index = 1, World_GetPlayerCount() do
+            AoE4RPG_KING_GROWTH_AddPlayerIdentifier(
+                player_ids,
+                seen_players,
+                players_by_id,
+                World_GetPlayerAt(index)
+            )
+        end
+    end
+    table.sort(player_ids)
+
+    if not Player_GetSquadsFromType or not SGroup_ForEach then
+        growth.initial_scan_completed = true
+        return 0
+    end
+
+    for _, player_id in ipairs(player_ids) do
+        local player = players_by_id[player_id]
+        local king_squads = player and Player_GetSquadsFromType(player, "king") or nil
+        if king_squads then
+            SGroup_ForEach(king_squads, function(group_id, index, squad)
+                local entity = Squad_GetFirstEntity and Squad_GetFirstEntity(squad)
+                local entity_id = AoE4RPG_KING_GROWTH_GetEntityIdentifier(entity)
+                if entity and entity_id
+                    and (not Entity_IsValid or Entity_IsValid(entity_id))
+                    and (not Entity_IsOfType or Entity_IsOfType(entity, "King"))
+                    and not growth.king_records_by_entity[entity_id] then
+                    local blueprint, blueprint_name =
+                        AoE4RPG_KING_GROWTH_GetEntityBlueprintData(entity)
+                    table.insert(growth.king_entity_ids, entity_id)
+                    growth.king_entity_index_by_id[entity_id] =
+                        #growth.king_entity_ids
+                    growth.king_records_by_entity[entity_id] = {
+                        entity_id = entity_id,
+                        player_id = player_id,
+                        player = player,
+                        squad_type = "king",
+                        blueprint = blueprint,
+                        blueprint_name = blueprint_name,
+                        entity = entity,
+                        base_maximum_health = Entity_GetHealthMax
+                            and math.max(1, Entity_GetHealthMax(entity))
+                            or 1,
+                    }
+                end
+            end)
+        end
+    end
+
+    table.sort(growth.king_entity_ids)
+    for index, entity_id in ipairs(growth.king_entity_ids) do
+        growth.king_entity_index_by_id[entity_id] = index
+    end
+    growth.initial_scan_completed = true
+    return #growth.king_entity_ids
+end
+
+-- Removes a dead king from the immutable startup census.
+-- IMPORTANT: No replacement scan is performed because Regicide ends the owner's game when its king dies.
+function AoE4RPG_KING_GROWTH_OnEntityKilled(context)
+    local victim = context and (context.victim or context.entity) or nil
+    local entity_id = AoE4RPG_KING_GROWTH_GetEntityIdentifier(victim)
+    local growth = AoE4RPG.KING_GROWTH
+    if not entity_id or not growth.king_records_by_entity[entity_id] then
+        return false
+    end
+
+    local index = growth.king_entity_index_by_id[entity_id]
+    local last_index = #growth.king_entity_ids
+    local last_entity_id = growth.king_entity_ids[last_index]
+    if index and last_entity_id then
+        growth.king_entity_ids[index] = last_entity_id
+        growth.king_entity_index_by_id[last_entity_id] = index
+        growth.king_entity_ids[last_index] = nil
+    end
+    growth.king_entity_index_by_id[entity_id] = nil
+    growth.king_records_by_entity[entity_id] = nil
+    growth.applied_steps_by_entity[entity_id] = nil
+    if #growth.king_entity_ids == 0 then
+        AoE4RPG_KING_GROWTH_Stop()
+    end
+    return true
+end
+
+-- The interval applies time-based growth only to the cached king EntityIDs.
+-- It performs no player/squad census after CacheInitialKings completes.
+function AoE4RPG_KING_GROWTH_Update()
+    if not AoE4RPG_KING_GROWTH_IsRegicideEnabled() then
+        AoE4RPG_KING_GROWTH_Stop()
+        return
+    end
+
+    local target_step = AoE4RPG_KING_GROWTH_GetCurrentStep()
+    if target_step <= 0 then
+        return
+    end
+
+    local growth = AoE4RPG.KING_GROWTH
+    for _, entity_id in ipairs(growth.king_entity_ids) do
+        local record = growth.king_records_by_entity[entity_id]
+        if record then
+            -- Keep the startup entity handle hot.
+            -- IMPORTANT: Entity_FromID is only a compatibility fallback and is never a roster scan.
+            local entity = record.entity
+                or (Entity_FromID and Entity_FromID(entity_id))
+            AoE4RPG_KING_GROWTH_ApplyCurrentStepToEntity(entity, target_step)
+        end
+    end
+end
+
+-- Starts only for the selected Kill the King condition.
+function AoE4RPG_KING_GROWTH_Start()
+    if not AoE4RPG_KING_GROWTH_IsRegicideEnabled()
+        or AoE4RPG.KING_GROWTH.monitor_registered
+        or not Rule_AddInterval
+        or AoE4RPG.KING_GROWTH.initial_scan_completed then
+        return false
+    end
+
+    AoE4RPG_KING_GROWTH_CacheInitialKings()
+    Rule_AddInterval(AoE4RPG_KING_GROWTH_Update, 1.0)
+    AoE4RPG.KING_GROWTH.monitor_registered = true
+    AoE4RPG_KING_GROWTH_Update()
+    return true
+end
+
+function AoE4RPG_KING_GROWTH_Stop()
+    if AoE4RPG.KING_GROWTH.monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_KING_GROWTH_Update)
+    end
+    AoE4RPG.KING_GROWTH.monitor_registered = false
+end
+
+function AoE4RPG_KING_GROWTH_Shutdown()
+    AoE4RPG_KING_GROWTH_Stop()
+    AoE4RPG.KING_GROWTH.king_entity_ids = {}
+    AoE4RPG.KING_GROWTH.king_entity_index_by_id = {}
+    AoE4RPG.KING_GROWTH.king_records_by_entity = {}
+    AoE4RPG.KING_GROWTH.initial_scan_completed = false
+    AoE4RPG.KING_GROWTH.applied_steps_by_entity = {}
+end

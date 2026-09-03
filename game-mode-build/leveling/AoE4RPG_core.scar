@@ -1,0 +1,2170 @@
+-- ================= AoE4RPG Core ===============
+-- AoE4RPG Core - Leveling Engine tracks experience, levels, brackets, and derived progression.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_classes.scar, AoE4RPG_entity_tracker.scar, and AoE4RPG_random_bonus.scar.
+-- ================= AoE4RPG Core ===============
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+-- ==================== Normalization ====================
+-- ==================== Normalization ====================
+
+function AoE4RPG_Round(value, decimal_places)
+    local places = decimal_places or 2
+    local factor = 10 ^ places
+    return math.floor((value or 0) * factor + 0.5) / factor
+end
+
+function AoE4RPG_RoundToStep(value, step)
+    local increment = step or 1
+    return AoE4RPG_Round((value or 0) / increment, 0) * increment
+end
+
+AoE4RPG.VERSION = "1.0.0"
+AoE4RPG.TUNING_MOD_GUID = "98552b27dfde4300a0ed44aa6e97017d"
+
+-- Qualifies one custom property-bag short name with this tuning pack's GUID.
+function AoE4RPG_GetQualifiedTuningBlueprintName(blueprint_short_name)
+    if type(blueprint_short_name) ~= "string" or blueprint_short_name == "" then
+        return nil
+    end
+    if string.find(blueprint_short_name, ":", 1, true) then
+        return blueprint_short_name
+    end
+    return tostring(AoE4RPG.TUNING_MOD_GUID) .. ":" .. blueprint_short_name
+end
+
+-- Returns an AoE4RPG tuning upgrade by its XML filename.
+-- Already-qualified names remain unchanged so callers can also provide the exact compiled identity when needed.
+function AoE4RPG_GetTuningUpgradeBlueprint(upgrade_short_name)
+    if not BP_GetUpgradeBlueprint
+        or type(upgrade_short_name) ~= "string"
+        or upgrade_short_name == "" then
+        return nil
+    end
+
+    local qualified_name = AoE4RPG_GetQualifiedTuningBlueprintName(upgrade_short_name)
+    return BP_GetUpgradeBlueprint(qualified_name)
+end
+
+-- Returns an ability copied into the AoE4RPG tuning pack.
+-- Ability XML files use the same mod-qualified short-name format as custom upgrades.
+function AoE4RPG_GetTuningAbilityBlueprint(ability_short_name)
+    if not BP_GetAbilityBlueprint then
+        return nil
+    end
+    local qualified_name = AoE4RPG_GetQualifiedTuningBlueprintName(ability_short_name)
+    if not qualified_name then
+        return nil
+    end
+    return BP_GetAbilityBlueprint(qualified_name)
+end
+
+AoE4RPG.LEVEL_OFFSET = 1    -- 0 to display starting Lv = 0.
+AoE4RPG.MaxLevel = 24       -- Heroes Max Level. 24 + LEVEL_OFFSET = 25.
+AoE4RPG.EliteMaxLevel = 9   -- Elites Max Level. 9 + LEVEL_OFFSET = 10.
+AoE4RPG.XPBonusMultiplier = 0.5 -- Final XP multiplier.
+AoE4RPG.TECHNICIAN_BUILDING_EXPERIENCE_RATIO = 0.25 -- Technicians action XP multiplier.
+-- Healing XP is based on actual health restored, excluding overheal.
+AoE4RPG.HEALING_EXPERIENCE_RATIO = 1.0
+AoE4RPG.TECHNICIAN_DROPOFF_EXPERIENCE_RATIO = 1.0 -- Each resource dropped off grants one base XP.
+AoE4RPG.TECHNICIAN_PRODUCED_UNIT_BONUS_RATIO = 0.10 -- Produced units receive 10% of the selected Technician's derived stats.
+AoE4RPG.LEVEL_UP_SOUND = "sfx_campaign_scripted_small_group_celebrate"  -- Level up sound.
+AoE4RPG.BRACKET_LEVEL_UP_SOUND = "mus_stinger_campaign_triumph_short"   -- Tier up sound.
+-- This flag enables a special leveling rule for Jeanne and both Khan.
+AoE4RPG.UNIT_DATA = {}
+AoE4RPG.NATIVE_EXPERIENCE_ENTITY_IDS = {}
+AoE4RPG.native_experience_monitor_registered = false
+-- GE_ConstructionComplete identifies the building but not its builders.
+-- Record only Technicians observed adding construction health, keyed by building ID.
+AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS = {}
+AoE4RPG.TECHNICIAN_INHERITED_ENTITY_MODIFIERS = {}
+AoE4RPG.TECHNICIAN_INHERITED_SQUADS = {}
+AoE4RPG.TECHNICIAN_CARRIED_RESOURCES = {}
+AoE4RPG.technician_resource_dropoff_monitor_registered = false
+AoE4RPG.UPGRADE_BRACKETS = {
+    { min = 0, max = 3, upgrade = nil },
+    { min = 4, max = 8, upgrade = "damage1" },
+    { min = 9, max = 13, upgrade = "damage2" },
+    { min = 14, max = 18, upgrade = "damage3" },
+    { min = 19, max = 24, upgrade = "damage4" },
+}
+-- ============================ Derived Stats ===================================
+-- ============================ Derived Stats ===================================
+
+function AoE4RPG_GetUnitData(entity_id)
+    if not AoE4RPG.UNIT_DATA[entity_id] then
+        AoE4RPG.UNIT_DATA[entity_id] = {
+            entity_id = entity_id,
+            level = 0,
+            exp = 0,
+            base_exp = 0,
+            damage_dealt = 0,
+            kills = 0,
+            damage_bonus_applied = 0,
+            initiator_idle_seconds = 0,
+            initiator_idle_damage_applied = 0,
+            initiator_idle_damage_modifier_id = nil,
+            strategist_attack_regeneration_stacks = 0,
+            strategist_attack_regeneration_last_attack_time = nil,
+            strategist_attack_regeneration_applied = 0,
+            strategist_attack_regeneration_modifier_id = nil,
+            strategist_weapon_cooldown_applied = 0,
+            strategist_ability_cooldown_applied = 0,
+            assassin_attack_count = 0,
+            assassin_last_attack_time = nil,
+            assassin_fifth_attack_modifier_id = nil,
+            assassin_fifth_attack_active = false,
+            assassin_bracket_damage_modifier_id = nil,
+            assassin_bracket_damage_applied = 0,
+            assassin_attack_movement_reduction_modifier_ids = {},
+            assassin_attack_movement_reduction_multiplier = 1.0,
+            skirmisher_damage_received_movement_speed_modifier_id = nil,
+            skirmisher_damage_received_movement_speed_active = false,
+            skirmisher_damage_received_movement_speed_multiplier = 1.0,
+            weapon_crit_damage_chance = 0,
+            weapon_crit_damage_factor = 0,
+            weapon_range_bonus = 0,
+            build_speed_bonus = 0,
+            train_speed_bonus = 0,
+            production_speed_bonus = 0,
+            class_profile_key = nil,
+            class_attribute_growth = nil,
+            class_modifier_ids = {},
+            attributes = {
+                agility = 0,
+                endurance = 0,
+                vitality = 0,
+            },
+            base_attributes = {
+                agility = 0,
+                endurance = 0,
+                vitality = 0,
+            },
+            non_bonus_attributes = {
+                agility = 0,
+                endurance = 0,
+                vitality = 0,
+            },
+            attribute_bonuses = {
+                agility = 0,
+                endurance = 0,
+                vitality = 0,
+            },
+            attribute_passive_multipliers = {
+                agility = 0,
+                endurance = 0,
+                vitality = 0,
+            },
+            -- Random-bonus skills retain their first-choice slot for the custom five-slot selection overlay.
+            skill_slots = {},
+            skill_slot_by_key = {},
+            -- Internal level 0 is displayed as level 1.
+            -- IMPORTANT: This flag records that the cached class/base profile has been applied to this EntityID.
+            initial_attribute_bonus_applied = false,
+            derived_stats = {
+                weapon_reload_modifier = 0,
+                weapon_cooldown_modifier = 0,
+                health = 0,
+                health_regeneration = 0,
+                armor = 0,
+                ability_cooldown_modifier = 0,
+            },
+            buff_heal_changes = 0,
+            owner = nil,
+            class_name = nil,
+            civilization = nil,
+            player_civilization = nil,
+            growth_civilization = nil,
+            is_hero = false,
+            is_elite = false,
+            critical_hits_enabled = false,
+            applied_bracket_upgrades = {},
+            uses_native_experience = false,
+            native_experience_total = 0,
+            native_experience_current = 0,
+            native_experience_required = 0,
+            -- Incremented whenever player-visible RPG values change.
+            -- The hero UI compares this small counter instead of rebuilding every tick.
+            ui_revision = 0,
+        }
+    end
+
+    return AoE4RPG.UNIT_DATA[entity_id]
+end
+
+-- Returns an existing RPG record without creating simulation state.
+-- IMPORTANT: UI and selection code must use this read-only lookup.
+function AoE4RPG_GetExistingUnitData(entity_id)
+    if entity_id == nil or not AoE4RPG.UNIT_DATA then
+        return nil
+    end
+    return AoE4RPG.UNIT_DATA[entity_id]
+end
+
+-- Marks one RPG record as changed for the local hero-panel monitor.
+-- Call this after changing experience, level, attributes, or displayed bonuses.
+function AoE4RPG_MarkUnitDataChanged(unit_data)
+    if not unit_data then
+        return 0
+    end
+
+    unit_data.ui_revision = (unit_data.ui_revision or 0) + 1
+    return unit_data.ui_revision
+end
+
+-- Records critical-hit eligibility for one registered RPG unit.
+-- IMPORTANT: Runtime critical bonuses remain in the RPG record until a proven weapon modifier or entity-scoped state-tree API is available.
+function AoE4RPG_EnableCriticalHits(entity)
+    if not entity or not entity.EntityID then
+        return false
+    end
+    if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity.EntityID) then
+        return false
+    end
+
+    local unit_data = AoE4RPG_GetUnitData(entity.EntityID)
+    local blueprint = Entity_GetBlueprint and Entity_GetBlueprint(entity) or nil
+    local blueprint_name = blueprint
+    if blueprint and BP_GetName then
+        local resolved_name = BP_GetName(blueprint)
+        if type(resolved_name) == "string" and resolved_name ~= "" then
+            blueprint_name = resolved_name
+        end
+    end
+    blueprint_name = AoE4RPG_NormalizeBlueprintName
+        and AoE4RPG_NormalizeBlueprintName(blueprint_name)
+        or tostring(blueprint_name or "")
+    local same_entity = unit_data.critical_hits_enabled_entity_id == entity.EntityID
+    local same_blueprint = unit_data.critical_hits_enabled_blueprint_name == blueprint_name
+    if unit_data.critical_hits_enabled and same_entity and same_blueprint then
+        return true
+    end
+    unit_data.critical_hit_enable_modifier_ids = {}
+    unit_data.critical_hits_enabled = true
+    unit_data.critical_hits_enabled_entity_id = entity.EntityID
+    unit_data.critical_hits_enabled_blueprint_name = blueprint_name
+    return true
+end
+
+-- ADJUST: add or remove eligible units in _blueprints.scar instead of filtering here.
+function AoE4RPG_EnableCriticalHitsForRegisteredUnits()
+    if not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity then
+        return
+    end
+    AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(function(entity)
+        AoE4RPG_EnableCriticalHits(entity)
+    end)
+end
+
+-- Returns the XP required to advance from the displayed level.
+-- Each new five-level bracket increases the XP addition by another 400.
+-- IMPORTANT: Internal level zero is displayed as level one and requires 600 XP.
+function AoE4RPG_ExperienceRequired(level)
+    local internal_level = math.max(0, math.floor(tonumber(level) or 0))
+    if internal_level <= 3 then
+        return 600 + 400 * internal_level
+    end
+
+    local levels_after_first_bracket = internal_level - 3
+    local complete_brackets = math.floor(levels_after_first_bracket / 5)
+    local levels_in_current_bracket = levels_after_first_bracket % 5
+    local bracket_step_total = 5 * complete_brackets * (complete_brackets + 3) / 2
+        + levels_in_current_bracket * (complete_brackets + 2)
+    return 1800 + 400 * bracket_step_total
+end
+
+-- Maps the 3 RPG attributes to their actual runtime stat effects.
+-- Strategist (bakery) only: health regeneration reduces ability cooldown.
+-- ADJUST: change the shared attribute-family values, not individual classes using the same main stat.
+function AoE4RPG_GetPrimaryStatBonus(class_name)
+    local class_bonus = {
+        assassin = 1.40,
+        ranger = 1.30,
+        skirmisher = 1.20,
+        initiator = 1.35,
+        duelist = 1.30,
+        technician = 1.10,
+        commander = 1.30,
+        roamer = 1.20,
+        strategist = 1.25,
+    }
+
+    return class_bonus[class_name] or 1.0
+end
+
+-- ADJUST: change the small multipliers below to tune each attribute's derived bonuses.
+function AoE4RPG_TranslateAttributesToStats(unit_data)
+    local attrs = (unit_data and unit_data.attributes) or { agility = 0, endurance = 0, vitality = 0 }
+    local class_name = (unit_data and unit_data.class_name) or ""
+    local primary_bonus = AoE4RPG_GetPrimaryStatBonus(class_name)
+    local random_bonus_totals = (unit_data and unit_data.random_bonus_totals) or {}
+    local health_regen = attrs.endurance * 0.075 * primary_bonus
+    local ability_cooldown_reduction = 0                          -- Base ability cooldown reduction is 0.
+    local strategist_weapon_cooldown_bonus = 0                    -- Base strategist weapon cooldown bonus is 0.
+    if class_name == "strategist" then
+        ability_cooldown_reduction = attrs.endurance * 0.15 * primary_bonus * 0.25 -- Preserve the Strategist-specific conversion.
+        -- Health regeneration contributes to weapon cooldown, but at 1/4 of the Agility-per-point coefficient.
+        strategist_weapon_cooldown_bonus = attrs.endurance * 0.15 * primary_bonus * 0.025
+    end
+
+    local result = {
+        weapon_reload_modifier = AoE4RPG_Round((attrs.agility * 0.005 * primary_bonus)
+            + (random_bonus_totals.attack_speed_modifier or 0), 1),                         -- Additive attack speed bonuses from random rewards are applied here.
+        weapon_cooldown_modifier = AoE4RPG_Round((attrs.agility * 0.0025 * primary_bonus)
+            + strategist_weapon_cooldown_bonus                                              -- Strategist health regeneration contributes to cooldown reduction here.
+            + (random_bonus_totals.attack_speed_modifier or 0), 1),                         -- Additive attack speed bonuses from random rewards are applied here.
+        health = AoE4RPG_RoundToStep(attrs.endurance * 5 * primary_bonus, 0.25),
+        health_regeneration = AoE4RPG_RoundToStep(health_regen + (random_bonus_totals.health_regeneration_bonus or 0), 0.25),
+        armor = AoE4RPG_RoundToStep(attrs.vitality * 0.25 * primary_bonus, 0.25),
+        ability_cooldown_modifier = AoE4RPG_Round(ability_cooldown_reduction, 1),             -- Health regeneration contributes to ability cooldown reduction for Strategist.
+        movement_speed_modifier = AoE4RPG_RoundToStep(random_bonus_totals.movement_speed_modifier or 0, 0.25),  -- Movement speed bonuses from random rewards are applied here.
+        weapon_range_modifier = AoE4RPG_RoundToStep((unit_data and unit_data.weapon_range_bonus or 0)           -- Weapon range bonuses from random rewards are applied here.
+            + (random_bonus_totals.weapon_range_modifier or 0), 0.25),
+        critical_hit_chance = AoE4RPG_RoundToStep((unit_data and unit_data.weapon_crit_damage_chance or 0)      -- Weapon critical hit chance bonuses from random rewards are applied here.
+            + (random_bonus_totals.critical_hit_chance or 0), 0.5),
+        teardown_speed_modifier = AoE4RPG_Round(random_bonus_totals.teardown_speed_modifier or 0, 1),           -- Teardown speed bonuses from random rewards are applied here.
+        health_per_attack_ratio = AoE4RPG_RoundToStep(random_bonus_totals.health_per_attack_ratio or 0, 0.25),  -- Life steal bonuses from random rewards are applied here.
+    }
+
+    if unit_data then
+        unit_data.derived_stats = result
+    end
+
+    return result
+end
+
+-- IMPORTANT: Identifies whether an entity is a hero or elite unit and stores that state on the record so death logic can apply the proper XP and level penalty rules.
+-- ADJUST: change the type-tag checks below if hero or elite squad properties change.
+function AoE4RPG_AssignEntityRole(entity, unit_data)
+    if not entity then
+        return false, false
+    end
+
+    -- Riders are attached representations of a parent hero.
+    -- IMPORTANT: They contribute growth through the parent target, but are never selectable RPG entries.
+    if Entity_IsOfType and Entity_IsOfType(entity, "rider") then
+        return false, false
+    end
+
+    -- If the caller already has a unit_data record, use it.
+    -- Otherwise, fetch the record from the registry.
+    -- This lets the caller avoid a second lookup.
+    local data = unit_data or AoE4RPG_GetUnitData(entity.EntityID)
+    if not data then
+        return false, false
+    end
+
+    -- IMPORTANT: Once the spawn tracker has assigned the EntityID, the class registry is authoritative.
+    -- This avoids repeating blueprint/type discovery from UI, leveling, and bonus paths.
+    local tracked_record = AoE4RPG.ENTITY_TRACKER
+        and AoE4RPG.ENTITY_TRACKER.tracked_entity_records[entity.EntityID]
+        or nil
+    if tracked_record then
+        data.is_hero = tracked_record.role == "heroes"
+        data.is_elite = tracked_record.role == "elites"
+        return data.is_hero, data.is_elite
+    end
+
+    -- The registry record may already have a class name and civilization.
+    -- If not, resolve them from the entity and store them for future use.
+    local class_name = data.class_name or (AoE4RPG_CLASS_GetClassForEntity and AoE4RPG_CLASS_GetClassForEntity(entity))
+    local tracking_entry = AoE4RPG_GetBlueprintTrackingEntryForEntity
+        and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+        or nil
+
+    -- IMPORTANT: Registry rows are authoritative for hero/elite UI roles.
+    -- This lets every nonempty class row contribute one hero without relying on broad type tags.
+    local is_structure = Entity_IsOfType and Entity_IsOfType(entity, "building") or false   -- IMPORTANT: Structures are never heroes or elites.
+    local is_bodyguard = Entity_IsOfType                                                    -- Bodyguards are always elites, even if they have a hero class name.
+        and Entity_IsOfType(entity, AoE4RPG_BP_BODYGUARD or "bodyguard")
+        or false
+    local tracking_civilization = tracking_entry and tracking_entry.civilization            -- Use the registry row's civilization if it exists
+        or data.civilization                                                                -- otherwise, fall back to the entity's civilization if it can be resolved.
+        or (AoE4RPG_GetUnitCivilization and AoE4RPG_GetUnitCivilization(entity))
+    local is_dynamic_elite = AoE4RPG_IsEntityDynamicElite                                   -- Elites with dynamic limits, like Daimyo.
+        and AoE4RPG_IsEntityDynamicElite(entity, tracking_civilization, class_name)
+        or false
+    local is_elite = tracking_entry                                                         -- Check if Elites have dynamic_elite role.
+        and (is_bodyguard or is_dynamic_elite or tracking_entry.role == "elites")
+        or false
+    local is_hero = tracking_entry and tracking_entry.role == "heroes"                      -- Check if eligible as Heroes.
+        and not is_bodyguard and not is_dynamic_elite and not is_structure or false
+    if not tracking_entry then
+        is_hero = not is_structure and ((Entity_IsOfType and Entity_IsOfType(entity, "hero"))
+            or class_name == "ranger"
+            or class_name == "assassin"
+            or class_name == "strategist"
+            or class_name == "commander")
+        is_elite = AoE4RPG_ClassIsElite and AoE4RPG_ClassIsElite(entity) or false
+    end
+
+    data.is_hero = is_hero
+    data.is_elite = is_elite
+    return is_hero, is_elite
+end
+
+-- ======================== Death penalties ==================================
+-- IMPORTANT: Applies the appropriate death penalty based on the unit's role.
+-- ======================== Death penalties ==================================
+
+function AoE4RPG_ApplyDeathPenalty(entity, unit_data)
+    if not entity or not unit_data then
+        return
+    end
+
+    local is_hero, is_elite = AoE4RPG_AssignEntityRole(entity, unit_data)
+
+    -- IMPORTANT: Jeanne's native experience belongs to the base game and must never be reduced or replaced by this module's hero death penalty.
+    local special_leveling_rule = AoE4RPG_GetSpecialLevelingRule
+        and AoE4RPG_GetSpecialLevelingRule(entity, unit_data)
+        or nil
+    if special_leveling_rule
+        and special_leveling_rule.experience_source == "player_state_model" then
+        return
+    end
+
+    local keep_experience = false
+    if AoE4RPG.SETTINGS and AoE4RPG.SETTINGS.ai_keep_experience_on_death
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_IsComputerPlayer then
+        local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        keep_experience = owner ~= nil
+            and AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(owner)
+    end
+
+    -- IMPORTANT: Heroes lose all XP on death unless the AI-only preservation option applies.
+    if is_hero then
+        if not keep_experience then
+            unit_data.damage_dealt = 0
+            AoE4RPG_MarkUnitDataChanged(unit_data)
+        end
+        return
+    end
+
+    -- IMPORTANT: Elites lose one level and all XP unless the AI-only preservation option applies.
+    if is_elite then
+        unit_data.level = math.max(0, unit_data.level - 1)
+        if not keep_experience then
+            unit_data.damage_dealt = 0
+        end
+        AoE4RPG_MarkUnitDataChanged(unit_data)
+        return
+    end
+end
+
+-- Returns the special leveling rule for the given entity, if applicable.
+function AoE4RPG_GetSpecialLevelingRule(entity, unit_data)
+    local class_name = unit_data and unit_data.class_name
+        or (AoE4RPG_CLASS_GetEntityProfile and AoE4RPG_CLASS_GetEntityProfile(entity)
+            and AoE4RPG_CLASS_GetEntityProfile(entity).class_name)
+    local civilization = unit_data and unit_data.civilization
+        or (AoE4RPG_GetUnitCivilization and AoE4RPG_GetUnitCivilization(entity))
+        or "default"
+    local leveling_rule = AoE4RPG_SPECIAL_LEVELING_RULES
+        and AoE4RPG_SPECIAL_LEVELING_RULES[civilization]
+        or nil
+    if not leveling_rule or leveling_rule.class_name ~= class_name then
+        return nil
+    end
+    return leveling_rule
+end
+
+-- IMPORTANT: Selects the normal five bands or a native hero's four six-level bands.
+function AoE4RPG_GetLevelBracketsForUnit(entity, unit_data)
+    local leveling_rule = AoE4RPG_GetSpecialLevelingRule(entity, unit_data)
+    return leveling_rule and leveling_rule.level_brackets or AoE4RPG.UPGRADE_BRACKETS
+end
+
+-- ========================== Level Brackets =====================================
+-- ========================== Level Brackets =====================================
+
+function AoE4RPG_GetLevelBracketStep(level, entity, unit_data)
+    local current_level = level or 0
+    if current_level < 0 then
+        current_level = 0
+    end
+
+    local level_brackets = AoE4RPG_GetLevelBracketsForUnit(entity, unit_data)
+    -- IMPORTANT: After levels 24, uncapped mode creates one bonus bracket every ten internal levels without attempting another native upgrade.
+    -- Level 34 grant the fifth bracket, then every 10 levels after that.
+    if AoE4RPG.UNCAPPED_HERO_ELITE_LEVELS and current_level >= 34 then
+        return 5 + math.floor((current_level - 24) / 10)
+    end
+    for index, bracket in ipairs(level_brackets) do
+        if current_level >= bracket.min and current_level <= bracket.max then
+            return index
+        end
+    end
+
+    return #level_brackets
+end
+
+-- ==================== Attribute Calculation ====================
+-- Derived stats are recalculated whenever attributes or passive bonuses change.
+-- ==================== Attribute Calculation ====================
+
+function AoE4RPG_ApplyAttributeStats(entity, unit_data)
+    if not entity or not unit_data then
+        return
+    end
+
+    local translated = AoE4RPG_TranslateAttributesToStats(unit_data)
+
+    if translated.weapon_reload_modifier ~= 0 and Modifier_ApplyToEntity then
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Weapon, "reload_weapon_modifier", MUT_MultiplicationAddition, false, translated.weapon_reload_modifier, ""), entity, 0)
+    end
+
+    if translated.weapon_cooldown_modifier ~= 0 and Modifier_ApplyToEntity then
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Weapon, "cooldown_weapon_modifier", MUT_MultiplicationAddition, false, translated.weapon_cooldown_modifier, ""), entity, 0)
+    end
+
+    -- IMPORTANT: Current Health and Max Health will apportionally scale with the new health modifier.
+    -- IMPORTANT: This is a multiplication addition modifier, so the current health will scale with the max health.
+    if translated.health ~= 0 and Modifier_ApplyToEntity then
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "health_maximum_modifier", MUT_MultiplicationAddition, false, translated.health / math.max(1, Entity_GetHealthMax(entity)), ""), entity, 0)
+    end
+
+    if translated.health_regeneration ~= 0 and Modifier_ApplyToEntity then
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "health_regeneration_modifier", MUT_Addition, false, translated.health_regeneration, ""), entity, 0) -- Health Regeneration.
+    end
+
+    -- IMPORTANT: This is the total sum of all different sources of cooldown reduction and is applied as a single modifier to the entity.
+    if translated.ability_cooldown_modifier ~= 0 and Modifier_ApplyToEntity then
+        local reduction_factor = 1 - translated.ability_cooldown_modifier
+        if reduction_factor <= 0 then
+            reduction_factor = 0.01
+        end
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Ability, "ability_recharge_time_modifier", MUT_Multiplication, false, reduction_factor, ""), entity, 0)  -- Ability Cooldown Reduction.
+    end
+
+    -- Armor increases uniformally across all damage types.
+    if translated.armor ~= 0 and Modifier_ApplyToEntity then
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "armor_scalar_for_fire_damage", MUT_Addition, false, translated.armor, ""), entity, 0)       -- Fire Damage Armor.
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "armor_scalar_for_melee_damage", MUT_Addition, false, translated.armor, ""), entity, 0)      -- Melee Damage Armor.
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "armor_scalar_for_ranged_damage", MUT_Addition, false, translated.armor, ""), entity, 0)     -- Ranged Damage Armor.
+        Modifier_ApplyToEntity(Modifier_Create(MAT_Entity, "armor_scalar_for_truedamage_damage", MUT_Addition, false, translated.armor, ""), entity, 0) -- Siege Damage Armor.
+    end
+end
+
+-- ==================== Technician Inherited Bonuses ==============
+-- Copies the derived combat bonuses of the strongest live Technician onto a squad produced by that player.
+-- ==================== Technician Inherited Bonuses ==============
+
+function AoE4RPG_GetTechnicianPlayerIdentifier(player)
+    if AoE4RPG_RUNTIME_GetPlayerIdentifier then
+        return AoE4RPG_RUNTIME_GetPlayerIdentifier(player)
+    end
+    if AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+        return AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+    end
+    if type(player) == "number" then
+        return player
+    end
+    if not player then
+        return nil
+    end
+    if player.PlayerID then
+        return player.PlayerID
+    end
+    if player.id then
+        return player.id
+    end
+    if Player_GetID then
+        return Player_GetID(player)
+    end
+    return nil
+end
+
+-- Chooses one live tracked Technician for a player.
+function AoE4RPG_GetTechnicianInheritanceSource(player, target_is_building, candidate_ids)
+    if not player or not AoE4RPG.UNIT_DATA or not Entity_FromID then
+        return nil
+    end
+
+    local player_id = AoE4RPG_GetTechnicianPlayerIdentifier(player)
+    if not player_id then
+        return nil
+    end
+
+    local best_data = nil
+    local best_level = -1
+    local best_damage = -1
+    local best_entity_id = nil
+    for entity_id, unit_data in pairs(AoE4RPG.UNIT_DATA) do
+        local source_id = unit_data and (unit_data.entity_id or entity_id) or nil
+        local is_technician = unit_data
+            and unit_data.class_name == "technician"
+            and (unit_data.is_hero or unit_data.is_elite)
+        local is_candidate = not candidate_ids or candidate_ids[source_id]
+        local is_hre_elite = unit_data
+            and unit_data.civilization == "hre"
+            and unit_data.is_elite == true
+        if source_id and is_technician and is_candidate
+            and (target_is_building or not is_hre_elite)
+            and (not Entity_IsValid or Entity_IsValid(source_id)) then
+            local source_entity = Entity_FromID(source_id)
+            local owner = source_entity and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+                and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(source_entity)
+                or nil
+            local owner_id = owner and AoE4RPG_GetTechnicianPlayerIdentifier(owner) or nil
+            if owner_id == player_id then
+                local level = math.max(0, tonumber(unit_data.level) or 0)
+                local damage = math.max(0, tonumber(unit_data.damage_dealt) or 0)
+                if level > best_level
+                    or (level == best_level and damage > best_damage)
+                    or (level == best_level and damage == best_damage
+                        and (not best_entity_id or source_id < best_entity_id)) then
+                    best_data = unit_data
+                    best_level = level
+                    best_damage = damage
+                    best_entity_id = source_id
+                end
+            end
+        end
+    end
+    return best_data
+end
+
+-- IMPORTANT: Applies one supported derived modifier either to the complete spawned squad or to one completed building.
+function AoE4RPG_ApplyTechnicianInheritedModifier(modifier, target_entity, target_squad, modifier_ids)
+    if not modifier then
+        return false
+    end
+    local modifier_id = nil
+    if target_squad and Modifier_ApplyToSquad then
+        modifier_id = Modifier_ApplyToSquad(modifier, target_squad, 0)
+    elseif target_entity and Modifier_ApplyToEntity then
+        modifier_id = Modifier_ApplyToEntity(modifier, target_entity, 0)
+    end
+    if modifier_id then
+        table.insert(modifier_ids, modifier_id)
+        return true
+    end
+    return false
+end
+
+-- Applies the Technician's derived values at the configured ratio.
+-- IMPORTANT: Values that currently have no confirmed native modifier remain class-local and are not invented here; this keeps inheritance limited to the derived modifiers the project already applies safely to heroes and elites.
+function AoE4RPG_ApplyTechnicianDerivedBonuses(target_entity, target_squad, source_data, target_is_building)
+    if not source_data or not (target_entity or target_squad)
+        or not Modifier_Create then
+        return false
+    end
+
+    if source_data.civilization == "hre" and source_data.is_elite == true
+        and not target_is_building then
+        return false
+    end
+
+    local target_entity_id = type(target_entity) == "number"
+        and target_entity
+        or target_entity and target_entity.EntityID
+        or nil
+    local target_key = target_squad
+        and "squad:" .. tostring(Squad_GetID and Squad_GetID(target_squad) or target_squad)
+        or target_entity_id and "entity:" .. tostring(target_entity_id)
+        or nil
+    if not target_key then
+        return false
+    end
+    if AoE4RPG.TECHNICIAN_INHERITED_SQUADS[target_key]
+        or AoE4RPG.TECHNICIAN_INHERITED_ENTITY_MODIFIERS[target_key] then
+        return false
+    end
+
+    local stats = source_data.derived_stats
+    if not stats and AoE4RPG_TranslateAttributesToStats then
+        stats = AoE4RPG_TranslateAttributesToStats(source_data)
+    end
+    if not stats then
+        return false
+    end
+
+    local ratio = math.max(0, tonumber(AoE4RPG.TECHNICIAN_PRODUCED_UNIT_BONUS_RATIO) or 0)
+    if ratio <= 0 then
+        return false
+    end
+
+    local modifier_ids = {}
+    local function apply_modifier(application_type, modifier_name, usage_type, value)
+        if value and math.abs(value) > 0.0001 then
+            AoE4RPG_ApplyTechnicianInheritedModifier(
+                Modifier_Create(application_type, modifier_name, usage_type, false, value, ""),
+                target_entity,
+                target_squad,
+                modifier_ids
+            )
+        end
+    end
+
+    -- Weapon derived values are reductions.
+    -- ScarDoc's MUT_Multiplication expects the remaining factor, so 10% of a 20% reduction becomes 0.98.
+    if MUT_Multiplication then
+        local reload_reduction = math.max(0, (stats.weapon_reload_modifier or 0) * ratio)
+        local cooldown_reduction = math.max(0, (stats.weapon_cooldown_modifier or 0) * ratio)
+        if reload_reduction > 0 then
+            apply_modifier(MAT_Weapon, "reload_weapon_modifier", MUT_Multiplication,
+                math.max(0.01, 1 - reload_reduction))
+        end
+        if cooldown_reduction > 0 then
+            apply_modifier(MAT_Weapon, "cooldown_weapon_modifier", MUT_Multiplication,
+                math.max(0.01, 1 - cooldown_reduction))
+        end
+    end
+
+    local target_max_health = target_entity and Entity_GetHealthMax
+        and Entity_GetHealthMax(target_entity)
+        or target_squad and Squad_GetFirstEntity and Entity_GetHealthMax
+        and Entity_GetHealthMax(Squad_GetFirstEntity(target_squad))
+        or 0
+    if MUT_MultiplyAdd and target_max_health and target_max_health > 0 then
+        apply_modifier(MAT_Entity, "health_maximum_modifier", MUT_MultiplyAdd,
+            (stats.health or 0) * ratio / target_max_health)
+    end
+    apply_modifier(MAT_Entity, "health_regeneration_modifier", MUT_Addition,
+        (stats.health_regeneration or 0) * ratio)
+
+    local armor_bonus = (stats.armor or 0) * ratio
+    for _, armor_modifier_name in ipairs({
+        "armor_scalar_for_fire_damage",
+        "armor_scalar_for_melee_damage",
+        "armor_scalar_for_ranged_damage",
+        "armor_scalar_for_truedamage_damage",
+    }) do
+        apply_modifier(MAT_Entity, armor_modifier_name, MUT_Addition, armor_bonus)
+    end
+
+    local ability_reduction = math.max(0, (stats.ability_cooldown_modifier or 0) * ratio)
+    if ability_reduction > 0 then
+        apply_modifier(MAT_Ability, "ability_recharge_time_modifier",
+            MUT_Multiplication, math.max(0.01, 1 - ability_reduction))
+    end
+
+    if #modifier_ids == 0 then
+        return false
+    end
+    if target_squad then
+        AoE4RPG.TECHNICIAN_INHERITED_SQUADS[target_key] = {
+            source_entity_id = source_data.entity_id,
+            modifier_ids = modifier_ids,
+        }
+    else
+        AoE4RPG.TECHNICIAN_INHERITED_ENTITY_MODIFIERS[target_key] = {
+            source_entity_id = source_data.entity_id,
+            modifier_ids = modifier_ids,
+        }
+    end
+    return true
+end
+
+-- Applies inherited bonuses to a completed production squad.
+function AoE4RPG_ApplyTechnicianProducedUnitBonus(context)
+    if not context or not context.player or not context.spawnedSquad
+        or not Squad_GetFirstEntity then
+        return false
+    end
+    local target_entity = Squad_GetFirstEntity(context.spawnedSquad)
+    if not target_entity then
+        return false
+    end
+    -- GE_BuildItemComplete is used here for trained/spawned squads.
+    if Entity_IsBuilding and Entity_IsBuilding(target_entity) then
+        return false
+    end
+    local source_data = AoE4RPG_GetTechnicianInheritanceSource(
+        context.player,
+        false,
+        nil
+    )
+    return AoE4RPG_ApplyTechnicianDerivedBonuses(
+        target_entity,
+        context.spawnedSquad,
+        source_data,
+        false
+    )
+end
+
+-- Applies the HRE elite Technician inheritance to buildings after construction completes.
+function AoE4RPG_ApplyTechnicianBuildingBonus(context, contributor_ids)
+    if not context or not context.player or not context.entity
+        or not Entity_IsBuilding or not Entity_IsBuilding(context.entity) then
+        return false
+    end
+    local source_data = AoE4RPG_GetTechnicianInheritanceSource(
+        context.player,
+        true,
+        contributor_ids
+    )
+    if not source_data or source_data.civilization ~= "hre"
+        or source_data.is_elite ~= true then
+        return false
+    end
+    return AoE4RPG_ApplyTechnicianDerivedBonuses(
+        context.entity,
+        nil,
+        source_data,
+        true
+    )
+end
+
+-- IMPORTANT: Removes inherited entity modifiers before an EntityID can be reused.
+function AoE4RPG_RemoveTechnicianInheritedEntityModifiers(entity_id)
+    local target_key = entity_id and "entity:" .. tostring(entity_id) or nil
+    local record = target_key and AoE4RPG.TECHNICIAN_INHERITED_ENTITY_MODIFIERS[target_key] or nil
+    if not record then
+        return false
+    end
+    if Modifier_Remove then
+        for _, modifier_id in ipairs(record.modifier_ids or {}) do
+            if modifier_id then
+                Modifier_Remove(modifier_id)
+            end
+        end
+    end
+    AoE4RPG.TECHNICIAN_INHERITED_ENTITY_MODIFIERS[target_key] = nil
+    return true
+end
+
+-- ================================ Max Level ===========================================
+-- Returns Maximum Level for the given entity, based on its class and any special leveling rules.
+-- ================================ Max Level ===========================================
+
+function AoE4RPG_GetEffectiveLevelLimit(entity, unit_data)
+    if not entity then
+        return AoE4RPG.MaxLevel
+    end
+
+    -- IMPORTANT: The tracker role is authoritative for the level limit.
+    -- This keeps elites on EliteMaxLevel even when their blueprint also has a hero tag.
+    local entity_id = entity.EntityID
+    local tracked_record = entity_id
+        and AoE4RPG.ENTITY_TRACKER
+        and AoE4RPG.ENTITY_TRACKER.tracked_entity_records[entity_id]
+        or nil
+    if not tracked_record and entity_id and AoE4RPG_AI_GetTrackedRecord then
+        tracked_record = AoE4RPG_AI_GetTrackedRecord(entity_id)
+    end
+    local is_elite = tracked_record and tracked_record.role == "elites"
+        or unit_data and unit_data.is_elite == true
+        or false
+    if not is_elite then
+        local _, assigned_elite = AoE4RPG_AssignEntityRole(entity, unit_data)
+        is_elite = assigned_elite
+            or (AoE4RPG_ClassIsElite and AoE4RPG_ClassIsElite(entity))
+            or false
+    end
+    if is_elite then
+        -- IMPORTANT: Elite classification and elite rules remain authoritative.
+        local civilization = tracked_record
+            and (tracked_record.growth_civilization
+                or tracked_record.player_civilization
+                or tracked_record.civilization)
+            or unit_data and unit_data.civilization
+        if not civilization and AoE4RPG_GetUnitCivilization then
+            civilization = AoE4RPG_GetUnitCivilization(entity)
+        end
+        local class_name = tracked_record and tracked_record.class_name
+            or unit_data and unit_data.class_name
+        if not class_name and AoE4RPG_CLASS_GetClassForEntity then
+            class_name = AoE4RPG_CLASS_GetClassForEntity(entity)
+        end
+        local override = AoE4RPG_GetEliteLevelOverride
+            and AoE4RPG_GetEliteLevelOverride(civilization, class_name)
+        if override then
+            local maximum_level = tonumber(override.maximum_internal_level or override.max_level)
+            if maximum_level then
+                return math.max(0, maximum_level)
+            end
+        end
+        return AoE4RPG.EliteMaxLevel
+    end
+
+    -- IMPORTANT: Unlimited mode lifts native hero ceilings too.
+    -- IMPORTANT: Their native blueprint progression may stop, but AoE4RPG attribute growth continues normally.
+    if AoE4RPG.UNCAPPED_HERO_ELITE_LEVELS then
+        return AoE4RPG.MaxLevel
+    end
+
+    -- Use the special leveling rule for Jeanne and both Khan, if applicable.
+    local leveling_rule = AoE4RPG_GetSpecialLevelingRule(entity, unit_data)
+    if leveling_rule and leveling_rule.maximum_internal_level then
+        return leveling_rule.maximum_internal_level
+    end
+
+    return AoE4RPG.MaxLevel
+end
+
+-- Applies exactly one RPG level worth of class growth and bracket rewards.
+-- IMPORTANT: This shared path keeps native Jeanne XP and ordinary AoE4RPG XP stat-identical.
+function AoE4RPG_ApplySingleLevelIncrease(entity, owner, unit_data, grant_bonus, play_sound)
+
+    -- Rider heroes share progression with their parent hero.
+    if AoE4RPG_GetGrowthTargetEntity then
+        local growth_target = AoE4RPG_GetGrowthTargetEntity(entity)
+        if growth_target and growth_target ~= entity then
+            entity = growth_target
+            unit_data = AoE4RPG_GetUnitData(entity.EntityID)
+        end
+    end
+    if not unit_data then
+        return
+    end
+    local previous_level = unit_data.level or 0
+    unit_data.level = previous_level + 1
+
+    -- The first bracket reward is earned at first level up (internal level 0 -> 1).
+    if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+        AoE4RPG_BONUS_EnsureCurrentBracketOffer(entity, true)
+    end
+
+    -- Starting attributes are now a separate civilization/unit-type profile.
+    -- IMPORTANT: The first real level-up must therefore apply the normal class growth.
+    if AoE4RPG_CLASS_ApplyGrowth
+        and unit_data.level >= 1 then
+        local class_name = unit_data.class_name
+            or (AoE4RPG_CLASS_GetEntityProfile
+                and AoE4RPG_CLASS_GetEntityProfile(entity)
+                and AoE4RPG_CLASS_GetEntityProfile(entity).class_name)
+        if class_name then
+            AoE4RPG_CLASS_ApplyGrowth(entity, class_name, unit_data.level)
+            AoE4RPG_TranslateAttributesToStats(unit_data)
+        end
+    end
+
+    -- Bracket upgrades are applied when the unit crosses a bracket threshold.
+    local new_bracket = AoE4RPG_GetLevelBracketStep(unit_data.level, entity, unit_data)
+    local previous_bracket = AoE4RPG_GetLevelBracketStep(previous_level, entity, unit_data)
+    local reached_new_bracket = new_bracket > previous_bracket
+    if reached_new_bracket then
+        local class_name = unit_data.class_name
+            or (AoE4RPG_CLASS_GetEntityProfile
+                and AoE4RPG_CLASS_GetEntityProfile(entity)
+                and AoE4RPG_CLASS_GetEntityProfile(entity).class_name)
+        if class_name then
+            AoE4RPG_ApplyBracketUpgrade(entity, owner, class_name, new_bracket)
+            -- IMPORTANT: Each class receives one automatic native Health, Armor, or Weapon Range upgrade for this bracket; it never creates a UI choice and is persisted in the player/class state.
+            if AoE4RPG_CLASS_ApplyRandomBracketAttributeUpgrade then
+                AoE4RPG_CLASS_ApplyRandomBracketAttributeUpgrade(
+                    entity,
+                    owner,
+                    class_name,
+                    new_bracket
+                )
+            end
+        end
+        if AoE4RPG_BONUS_CreateOffer then
+            AoE4RPG_BONUS_CreateOffer(entity, owner, new_bracket)
+        end
+        if AoE4RPG_BONUS_ReapplyUniqueSkillScaling then
+            AoE4RPG_BONUS_ReapplyUniqueSkillScaling(entity, unit_data)
+        end
+    end
+
+    -- Rebuild the complete cached class state after the level increment.
+    -- IMPORTANT: Keeps every derived modifier aligned with the EntityID-owned class profile, including bonuses that were applied before this level.
+    if AoE4RPG_CLASS_ReapplyEntityBonuses then
+        AoE4RPG_CLASS_ReapplyEntityBonuses(entity, unit_data)
+    end
+    -- Mark the record as changed so the hero panel can refresh.
+    if grant_bonus and AoE4RPG_GrantLevelUpReward then
+        AoE4RPG_GrantLevelUpReward(entity, owner, unit_data)
+    end
+    if play_sound and AoE4RPG_PlayLevelUpSound then
+        AoE4RPG_PlayLevelUpSound(owner, reached_new_bracket)
+    end
+    AoE4RPG_MarkUnitDataChanged(unit_data)
+    return reached_new_bracket
+end
+
+-- IMPORTANT: Converts Jeanne's cumulative native experience to displayed RPG levels 1-24.
+-- IMPORTANT: The first three native XP spans each fill six RPG levels.
+-- IMPORTANT: Reaching the final native threshold completes the fourth six-level band because native XP stops accumulating after Jeanne reaches tier four.
+function AoE4RPG_GetNativeExperienceTargetLevel(total_experience, leveling_rule)
+    local thresholds = leveling_rule and leveling_rule.native_experience_tier_thresholds or nil
+    local levels_per_tier = leveling_rule and leveling_rule.levels_per_tier or 6
+    if not thresholds or #thresholds < 2 then
+        return 0, 0, 0
+    end
+
+    local experience = math.max(0, total_experience or 0)
+    local final_threshold = thresholds[#thresholds]
+    if experience >= final_threshold then
+        local native_maximum_level = leveling_rule.maximum_internal_level
+            or (#thresholds * levels_per_tier - 1)
+        if not AoE4RPG.UNCAPPED_HERO_ELITE_LEVELS then
+            return native_maximum_level, 0, 0
+        end
+
+        -- IMPORTANT: Jeanne's native tier conversion ends at the final threshold, but the cumulative player-state XP can continue increasing.
+        -- IMPORTANT: Consume that overflow with the ordinary RPG XP curve so unlimited mode continues granting class growth beyond her last native level.
+        local target_level = native_maximum_level
+        local overflow_experience = experience - final_threshold
+        local maximum_level = AoE4RPG.MaxLevel or 99999
+        local required_experience = AoE4RPG_ExperienceRequired(target_level)
+        while target_level < maximum_level
+            and overflow_experience >= required_experience do
+            overflow_experience = overflow_experience - required_experience
+            target_level = target_level + 1
+            required_experience = AoE4RPG_ExperienceRequired(target_level)
+        end
+        return target_level, overflow_experience, required_experience
+    end
+
+    for tier_index = 1, #thresholds - 1 do
+        local tier_start = thresholds[tier_index]
+        local tier_end = thresholds[tier_index + 1]
+        if experience >= tier_start and experience < tier_end then
+            local tier_span = math.max(1, tier_end - tier_start)
+            local tier_experience = experience - tier_start
+            local completed_levels = math.floor((tier_experience / tier_span) * levels_per_tier)
+            completed_levels = math.max(0, math.min(levels_per_tier - 1, completed_levels))
+            local target_level = ((tier_index - 1) * levels_per_tier) + completed_levels
+            return target_level, tier_experience, tier_span
+        end
+    end
+    return 0, experience, thresholds[2] - thresholds[1]
+end
+
+-- Use Jeanne XP value to write to the RPG record and apply any level increases.
+-- This is called per second to catch Jeanne XP gained from actions, passive gain, or nearby kills.
+function AoE4RPG_SynchronizeNativeExperience(entity, owner, unit_data)
+    local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
+        and AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+        or entity and entity.EntityID
+    if not entity or not entity_id or not unit_data then
+        return false, false
+    end
+    local leveling_rule = AoE4RPG_GetSpecialLevelingRule(entity, unit_data)
+    if not leveling_rule or leveling_rule.experience_source ~= "player_state_model"
+        or not Player_GetStateModelFloat or not leveling_rule.experience_state_model then
+        return false, false
+    end
+    
+    local entity_owner = owner or (AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity) or nil)
+    if not entity_owner then
+        return true, false
+    end
+    -- Player_GetStateModelFloat requires the engine Player* object.
+    -- IMPORTANT: Some compatibility callers, including the debug-cheat path, provide only a numeric PlayerID; resolve it before calling the native state-model API.
+    if AoE4RPG_RUNTIME_GetPlayerHandle then
+        entity_owner = AoE4RPG_RUNTIME_GetPlayerHandle(entity_owner)
+    elseif type(entity_owner) == "number" then
+        local player_from_id = Player_FromId or Player_FromID
+        entity_owner = player_from_id and player_from_id(entity_owner) or nil
+    end
+    if not entity_owner then
+        return true, false
+    end
+    local total_experience = Player_GetStateModelFloat(
+        entity_owner,
+        leveling_rule.experience_state_model
+    ) or 0
+    local target_level, current_experience, required_experience =
+        AoE4RPG_GetNativeExperienceTargetLevel(total_experience, leveling_rule)
+
+    local experience_changed = unit_data.native_experience_total ~= total_experience
+        or unit_data.native_experience_current ~= current_experience
+        or unit_data.native_experience_required ~= required_experience
+    unit_data.uses_native_experience = true
+    unit_data.native_experience_total = total_experience
+    unit_data.native_experience_current = current_experience
+    unit_data.native_experience_required = required_experience
+    unit_data.damage_dealt = current_experience
+    unit_data.base_exp = required_experience
+    AoE4RPG.NATIVE_EXPERIENCE_ENTITY_IDS[entity_id] = true
+    if AoE4RPG_CLASS_SyncEntityProgress then
+        AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+    end
+
+    local previous_bracket = AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+    local leveled = false
+    while (unit_data.level or 0) < target_level do
+        AoE4RPG_ApplySingleLevelIncrease(entity, entity_owner, unit_data, false, false)
+        leveled = true
+    end
+    if leveled and AoE4RPG_PlayLevelUpSound then
+        local current_bracket = AoE4RPG_GetLevelBracketStep(unit_data.level, entity, unit_data)
+        AoE4RPG_PlayLevelUpSound(entity_owner, current_bracket > previous_bracket)
+    elseif experience_changed then
+        AoE4RPG_MarkUnitDataChanged(unit_data)
+    end
+
+    -- ScarDoc have nothing about blueprint-conversion global event.
+    -- IMPORTANT: Jeanne is already monitored for native XP, so use the same narrow pass to detect her tier/ form blueprint change and safely rebuild persisted random modifiers.
+    if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+        AoE4RPG_BONUS_EnsureCurrentBracketOffer(entity, true)
+    end
+    return true, leveled
+end
+
+-- Returns the configured match XP multiplier for the entity receiving XP.
+-- Missing owner information safely falls back to the human value.
+function AoE4RPG_GetMatchExperienceMultiplier(entity_id)
+    local multiplier_set = AoE4RPG.SETTINGS
+        and AoE4RPG.SETTINGS.xp_multipliers
+        or nil
+    if type(multiplier_set) ~= "table" then
+        return tonumber(AoE4RPG.SETTINGS and AoE4RPG.SETTINGS.xp_multiplier) or 1.0
+    end
+
+    local owner_id = nil
+    local owner = nil
+    local entity = nil
+    if entity_id and Entity_FromID
+        and (not Entity_IsValid or Entity_IsValid(entity_id)) then
+        entity = Entity_FromID(entity_id)
+    end
+    if entity and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+        owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        if AoE4RPG_RUNTIME_GetPlayerHandle then
+            owner = AoE4RPG_RUNTIME_GetPlayerHandle(owner)
+        end
+        owner_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(owner)
+    end
+    local is_ai = false
+    if owner and AI_IsAIPlayer then
+        local success, result = pcall(AI_IsAIPlayer, owner)
+        is_ai = success and result == true
+    end
+    return tonumber(multiplier_set[is_ai and "ai" or "human"]) or 1.0
+end
+
+-- Canonical ordinary RPG progress field.
+-- IMPORTANT: All combat and support XP is stored in damage_dealt so level/UI systems do not maintain a second XP counter.
+function AoE4RPG_AddExperience(unit_data, amount, entity_id)
+    if not unit_data or not amount or amount <= 0 then
+        return 0
+    end
+    -- IMPORTANT: Native progression is authoritative.
+    -- IMPORTANT: Jeanne's experience comes from the game's player state model and must never be changed by RPG XP events or by the RPG/match XP multiplier.
+    -- IMPORTANT: The second check covers callers that try to award XP before the first native synchronization marks the record.
+    if unit_data.uses_native_experience then
+        return 0
+    end
+    if entity_id and Entity_FromID and AoE4RPG_GetSpecialLevelingRule
+        and (not Entity_IsValid or Entity_IsValid(entity_id)) then
+        local entity = Entity_FromID(entity_id)
+        local native_rule = entity
+            and AoE4RPG_GetSpecialLevelingRule(entity, unit_data)
+            or nil
+        if native_rule and native_rule.experience_source == "player_state_model" then
+            return 0
+        end
+    end
+    -- Keeping this here covers combat, technician, resource, and conversion XP consistently.
+    local match_xp_multiplier = AoE4RPG_GetMatchExperienceMultiplier(entity_id)
+    local adjusted_amount = amount * match_xp_multiplier
+    if adjusted_amount <= 0 then
+        return 0
+    end
+    unit_data.damage_dealt = (unit_data.damage_dealt or 0) + adjusted_amount
+    AoE4RPG_MarkUnitDataChanged(unit_data)
+    entity_id = entity_id or unit_data.entity_id
+    if entity_id then
+        local entity = nil
+        if Entity_FromID
+            and (not Entity_IsValid or Entity_IsValid(entity_id)) then
+            entity = Entity_FromID(entity_id)
+        end
+        if entity and AoE4RPG_CLASS_SyncEntityProgress then
+            AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+        end
+    end
+    return adjusted_amount
+end
+
+-- Awards RPG XP to a tracked Commander, Roamer, or Strategist for health restored.
+-- IMPORTANT: Only the healer receives this support XP; native Jeanne progression remains untouched.
+function AoE4RPG_AwardHealingExperience(healer, restored_health, target)
+    if not healer or not healer.EntityID or not restored_health or restored_health <= 0
+        or not AoE4RPG_GetUnitData then
+        return false
+    end
+    if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(healer.EntityID) then
+        return false
+    end
+    local unit_data = AoE4RPG_GetUnitData(healer.EntityID)
+    if not unit_data or unit_data.uses_native_experience
+        or not (unit_data.is_hero or unit_data.is_elite) then
+        return false
+    end
+    local class_name = unit_data.class_name
+    if class_name ~= "commander" and class_name ~= "roamer" and class_name ~= "strategist" then
+        return false
+    end
+    local amount = restored_health * (AoE4RPG.HEALING_EXPERIENCE_RATIO or 1.0)
+    if AoE4RPG_CLASS_GetExpMultiplier then
+        amount = amount * AoE4RPG_CLASS_GetExpMultiplier(healer, unit_data, "heal")
+    end
+    amount = amount * (AoE4RPG.XPBonusMultiplier or 1.0)
+    local awarded = AoE4RPG_AddExperience(unit_data, amount, healer.EntityID)
+    if awarded > 0 and AoE4RPG_CheckAndApplyLevelUp then
+        local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+            and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(healer)
+            or unit_data.owner
+        AoE4RPG_CheckAndApplyLevelUp(healer, owner, unit_data, true)
+    end
+    return awarded > 0
+end
+
+function AoE4RPG_MonitorNativeExperience()
+    local entity_ids = {}
+    for entity_id in pairs(AoE4RPG.NATIVE_EXPERIENCE_ENTITY_IDS) do
+        table.insert(entity_ids, entity_id)
+    end
+    table.sort(entity_ids)
+    for _, entity_id in ipairs(entity_ids) do
+        local entity = nil
+        if not Entity_IsValid or Entity_IsValid(entity_id) then
+            entity = Entity_FromID and Entity_FromID(entity_id) or nil
+        end
+        if not entity then
+            AoE4RPG.NATIVE_EXPERIENCE_ENTITY_IDS[entity_id] = nil
+        else
+            local unit_data = AoE4RPG.UNIT_DATA[entity_id]
+            if unit_data then
+                AoE4RPG_SynchronizeNativeExperience(entity, nil, unit_data)
+            end
+        end
+    end
+end
+
+function AoE4RPG_InitializeNativeExperienceMonitor()
+    if AoE4RPG.native_experience_monitor_registered or not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(AoE4RPG_MonitorNativeExperience, 1.0)
+    AoE4RPG.native_experience_monitor_registered = true
+    return true
+end
+
+function AoE4RPG_ShutdownNativeExperienceMonitor()
+    if AoE4RPG.native_experience_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_MonitorNativeExperience)
+    end
+    AoE4RPG.native_experience_monitor_registered = false
+    AoE4RPG.NATIVE_EXPERIENCE_ENTITY_IDS = {}
+end
+
+-- ============================ Sound Plays =================================
+-- Play a light sound when a level up event fired.
+-- Stronger when there is a bracket change.
+-- ============================ Sound Plays =================================
+
+function AoE4RPG_PlayLevelUpSound(owner, reached_new_bracket)
+    if not Sound_Play2D then
+        return
+    end
+
+    -- Sound_Play2D is local, so only call it on the client that owns this unit.
+    if owner and Game_GetLocalPlayer then
+        local local_player = Game_GetLocalPlayer()
+        if local_player then
+            local owner_id = AoE4RPG_RUNTIME_GetPlayerIdentifier
+                and AoE4RPG_RUNTIME_GetPlayerIdentifier(owner)
+                or (type(owner) == "number" and owner)
+            local local_player_id = AoE4RPG_RUNTIME_GetPlayerIdentifier
+                and AoE4RPG_RUNTIME_GetPlayerIdentifier(local_player)
+                or (type(local_player) == "number" and local_player)
+            if owner_id ~= local_player_id then
+                return
+            end
+        end
+    end
+
+    local sound_event = reached_new_bracket
+        and AoE4RPG.BRACKET_LEVEL_UP_SOUND
+        or AoE4RPG.LEVEL_UP_SOUND
+    Sound_Play2D(sound_event)
+end
+
+-- Awards the completion portion of Technician construction XP.
+-- Grants each living Technician contributor scaled completion XP.
+function AoE4RPG_OnTechnicianConstructionComplete(context)
+    if not context or not context.entity or not context.player then
+        return
+    end
+
+    local building = context.entity
+    local building_id = type(building) == "number" and building or building.EntityID
+    local contributors = building_id
+        and AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS[building_id]
+        or nil
+    if not contributors then
+        return
+    end
+    AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS[building_id] = nil
+
+    if AoE4RPG_ApplyTechnicianBuildingBonus then
+        AoE4RPG_ApplyTechnicianBuildingBonus(context, contributors)
+    end
+
+    local maximum_health = Entity_GetHealthMax and Entity_GetHealthMax(building) or 0
+    local completion_experience = math.max(0, maximum_health)
+        * AoE4RPG.TECHNICIAN_BUILDING_EXPERIENCE_RATIO
+        * AoE4RPG.XPBonusMultiplier
+    if completion_experience <= 0 then
+        return
+    end
+
+    local technician_ids = {}
+    for technician_id in pairs(contributors) do
+        table.insert(technician_ids, technician_id)
+    end
+    table.sort(technician_ids)
+    for _, technician_id in ipairs(technician_ids) do
+        local technician = Entity_FromID and Entity_FromID(technician_id) or nil
+        if technician and technician.EntityID
+            and AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+            and AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(technician.EntityID) then
+            local technician_data = AoE4RPG_GetUnitData(technician_id)
+            if AoE4RPG_CLASS_BindUnit then
+                AoE4RPG_CLASS_BindUnit(technician)
+            end
+            local is_hero, is_elite = AoE4RPG_AssignEntityRole(
+                technician,
+                technician_data
+            )
+            if (is_hero or is_elite) and technician_data.class_name == "technician"
+                and not technician_data.uses_native_experience then
+                local technician_owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+                    and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(technician)
+                    or context.player
+                AoE4RPG_AddExperience(
+                    technician_data,
+                    completion_experience,
+                    technician.EntityID
+                )
+                AoE4RPG_CheckAndApplyLevelUp(
+                    technician,
+                    technician_owner,
+                    technician_data,
+                    true
+                )
+            end
+        end
+    end
+end
+
+-- ===================== Technician Resource Drop-Off XP =====================
+-- Tracks each Technician's carried resources and awards only its own deposits.
+-- ===================== Technician Resource Drop-Off XP =====================
+
+local function AoE4RPG_GetTechnicianCarriedResourceTypes()
+    return {
+        RT_Food,
+        RT_Wood,
+        RT_Gold,
+        RT_Stone,
+    }
+end
+
+-- Detects a drop-off when a previously carried resource resets to a lower value.
+-- IMPORTANT: Stable tracked EntityID and resource-type order keeps this monitor synchronized in multiplayer.
+function AoE4RPG_MonitorTechnicianResourceDropOff()
+    if not Entity_GetResource
+        or not AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity then
+        return
+    end
+    local active_technician_ids = {}
+    local resource_types = AoE4RPG_GetTechnicianCarriedResourceTypes()
+    AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(function(entity, entity_id, tracked_record)
+        entity_id = entity_id or (entity and entity.EntityID)
+        if not entity or not entity_id then return end
+        local unit_data = AoE4RPG_GetUnitData(entity_id)
+        local class_name = tracked_record and tracked_record.class_name
+            or unit_data and unit_data.class_name
+            or nil
+        local is_hero = tracked_record and tracked_record.role == "heroes"
+            or unit_data and unit_data.is_hero == true
+            or false
+        local is_elite = tracked_record and tracked_record.role == "elites"
+            or unit_data and unit_data.is_elite == true
+            or false
+        if not unit_data or not (is_hero or is_elite)
+            or class_name ~= "technician"
+            or unit_data.uses_native_experience then
+            AoE4RPG.TECHNICIAN_CARRIED_RESOURCES[entity_id] = nil
+            return
+        end
+
+        active_technician_ids[entity_id] = true
+        local carried = AoE4RPG.TECHNICIAN_CARRIED_RESOURCES[entity_id]
+        local current_resources = {}
+        local deposited_resources = 0
+        for resource_index, resource_type in ipairs(resource_types) do
+            local current_amount = math.max(
+                0,
+                Entity_GetResource(entity, resource_type) or 0
+            )
+            current_resources[resource_index] = current_amount
+            local previous_amount = carried and carried[resource_index] or nil
+            if previous_amount and previous_amount > 0
+                and current_amount < previous_amount then
+                deposited_resources = deposited_resources + previous_amount
+            end
+        end
+        AoE4RPG.TECHNICIAN_CARRIED_RESOURCES[entity_id] = current_resources
+        if deposited_resources <= 0 then return end
+
+        local experience = AoE4RPG_Round(
+            deposited_resources
+                * AoE4RPG.TECHNICIAN_DROPOFF_EXPERIENCE_RATIO
+                * AoE4RPG.XPBonusMultiplier,
+            2
+        )
+        if experience <= 0 then return end
+        local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+            and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+            or unit_data.owner
+        AoE4RPG_AddExperience(unit_data, experience, entity_id)
+        AoE4RPG_CheckAndApplyLevelUp(entity, owner, unit_data, true)
+    end)
+
+    local cached_entity_ids = {}
+    for entity_id in pairs(AoE4RPG.TECHNICIAN_CARRIED_RESOURCES) do
+        table.insert(cached_entity_ids, entity_id)
+    end
+    table.sort(cached_entity_ids)
+    for _, entity_id in ipairs(cached_entity_ids) do
+        if not active_technician_ids[entity_id] then
+            AoE4RPG.TECHNICIAN_CARRIED_RESOURCES[entity_id] = nil
+        end
+    end
+end
+
+function AoE4RPG_InitializeTechnicianResourceDropOffMonitor()
+    if AoE4RPG.technician_resource_dropoff_monitor_registered
+        or not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(AoE4RPG_MonitorTechnicianResourceDropOff, 0.25)
+    AoE4RPG.technician_resource_dropoff_monitor_registered = true
+    return true
+end
+
+function AoE4RPG_ShutdownTechnicianResourceDropOffMonitor()
+    if AoE4RPG.technician_resource_dropoff_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_MonitorTechnicianResourceDropOff)
+    end
+    AoE4RPG.technician_resource_dropoff_monitor_registered = false
+    AoE4RPG.TECHNICIAN_CARRIED_RESOURCES = {}
+end
+
+-- Handles damage and repair/construction health events.
+-- It tracks combat XP normally; Technicians additionally earn 25% of building health they restore or construct.
+-- Every result receives the final global XP multiplier.
+-- ADJUST: tune XP in the two Calculate...Exp functions so this event stays easy to follow.
+function AoE4RPG_LevelUp(context)
+    if not context then
+        return
+    end
+
+    if not context.attacker or not context.victim or context.damage == nil then
+        return
+    end
+
+    -- Repair and active construction arrive through GE_DamageReceived with isRepairing set.
+    -- Award 25% of the actual health added, then apply the same final global multiplier used by combat XP.
+    -- Construction contributors are retained only until that building emits GE_ConstructionComplete.
+    if context.isRepairing then
+        local technician = context.attacker
+        local building = context.victim
+        if not technician.EntityID or not building.EntityID
+            or not (Entity_IsBuilding and Entity_IsBuilding(building)) then
+            return
+        end
+
+        -- Only a tracked technician can enter the RPG repair path.
+        -- Keeps ordinary villagers from creating unit data or performing class checks during the global damage event.
+        if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+            or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(technician.EntityID) then
+            return
+        end
+
+        local technician_data = AoE4RPG_GetUnitData(technician.EntityID)
+        if AoE4RPG_CLASS_BindUnit then
+            AoE4RPG_CLASS_BindUnit(technician)
+        end
+        local is_hero, is_elite = AoE4RPG_AssignEntityRole(technician, technician_data)
+        if not (is_hero or is_elite) or technician_data.class_name ~= "technician" then
+            return
+        end
+
+        local health_added = math.max(
+            0,
+            (context.damage or 0) + (context.shieldDamage or 0)
+        )
+        if health_added <= 0 then
+            return
+        end
+
+        -- Entity_IsUnderConstruction expects the entity handle, not its numeric EntityID.
+        -- IMPORTANT: Keep this read synchronized and never pass the ID to the engine API.
+        if Entity_IsUnderConstruction and Entity_IsUnderConstruction(building) then
+            local contributors = AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS[building.EntityID]
+            if not contributors then
+                contributors = {}
+                AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS[building.EntityID] = contributors
+            end
+            contributors[technician.EntityID] = true
+        end
+
+        local gained_experience = health_added
+            * AoE4RPG.TECHNICIAN_BUILDING_EXPERIENCE_RATIO
+            * AoE4RPG.XPBonusMultiplier
+        if not technician_data.uses_native_experience then
+            local technician_owner = context.attackerOwner
+                or (AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+                    and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(technician))
+            AoE4RPG_AddExperience(
+                technician_data,
+                gained_experience,
+                technician.EntityID
+            )
+            AoE4RPG_CheckAndApplyLevelUp(
+                technician,
+                technician_owner,
+                technician_data,
+                true
+            )
+        end
+        return
+    end
+
+    if context.damage <= 0 then
+        return
+    end
+
+    -- Reactive effects receive the same synchronized positive-damage event as the RPG progression path.
+    -- Each passive decides whether its owner is the damaged victim and whether nearby targets should be affected.
+    if AoE4RPG_EFFECTS_TriggerPassives then
+        AoE4RPG_EFFECTS_TriggerPassives("damage_received", context)
+    end
+
+    local attacker = context.attacker
+    local victim = context.victim
+    local attacker_owner = context.attackerOwner
+    local victim_owner = context.victimOwner
+
+    if not attacker or not victim then
+        return
+    end
+
+    if not attacker.EntityID or not victim.EntityID then
+        return
+    end
+
+    if attacker.EntityID == victim.EntityID then
+        return
+    end
+
+    if World_OwnsEntity and World_OwnsEntity(attacker) then
+        return
+    end
+
+    if Entity_IsOfType and (Entity_IsOfType(victim, "animal") or Entity_IsOfType(attacker, "building")) then
+        return
+    end
+
+    local attacker_id = attacker.EntityID
+    local victim_id = victim.EntityID
+
+    -- GE_DamageReceived is global.
+    -- IMPORTANT: Restrict RPG processing to entity IDs that were assigned by the spawn tracker; regular units never trigger class discovery, role checks, or bonus reapplication here.
+    local attacker_tracked = AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        and AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(attacker_id)
+        or false
+    local victim_tracked = AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        and AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(victim_id)
+        or false
+    if not attacker_tracked and not victim_tracked then
+        return
+    end
+
+    local attacker_data = attacker_tracked and AoE4RPG_GetUnitData(attacker_id) or nil
+    local victim_data = victim_tracked and AoE4RPG_GetUnitData(victim_id) or nil
+
+    -- The class callback verifies the damaged victim identity again.
+    if victim_tracked and victim_data then
+        if AoE4RPG_CLASS_BindUnit then
+            AoE4RPG_CLASS_BindUnit(victim)
+        end
+        if AoE4RPG_CLASS_ApplySkirmisherDamageReceivedMovementSpeed then
+            AoE4RPG_CLASS_ApplySkirmisherDamageReceivedMovementSpeed(
+                victim,
+                victim_data,
+                context
+            )
+        end
+    end
+
+    -- Each side is processed independently.
+    -- IMPORTANT: A regular unit may damage a tracked hero, but it must not receive an RPG record or trigger role/class discovery merely because it participated in the same damage event.
+    if attacker_tracked and attacker_data then
+        if AoE4RPG_CLASS_BindUnit then
+            AoE4RPG_CLASS_BindUnit(attacker)
+        end
+        local attacker_uses_native_experience = false
+        if AoE4RPG_SynchronizeNativeExperience then
+            attacker_uses_native_experience = AoE4RPG_SynchronizeNativeExperience(
+                attacker,
+                attacker_owner,
+                attacker_data
+            )
+        end
+        if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+            AoE4RPG_BONUS_EnsureCurrentBracketOffer(attacker)
+        end
+
+        attacker_data.owner = attacker_owner
+
+        if AoE4RPG_EFFECT_LIST_RecordAttack then
+            AoE4RPG_EFFECT_LIST_RecordAttack(attacker, context)
+        end
+        if AoE4RPG_CLASS_RecordAssassinAttack then
+            AoE4RPG_CLASS_RecordAssassinAttack(attacker, attacker_data)
+        end
+        if AoE4RPG_CLASS_ApplyAssassinAttackMovementReduction then
+            AoE4RPG_CLASS_ApplyAssassinAttackMovementReduction(
+                attacker,
+                attacker_data,
+                context
+            )
+        end
+        if AoE4RPG_CLASS_ResetInitiatorIdleDamage then
+            AoE4RPG_CLASS_ResetInitiatorIdleDamage(attacker, attacker_data)
+        end
+        if AoE4RPG_CLASS_RecordStrategistAttack then
+            AoE4RPG_CLASS_RecordStrategistAttack(attacker, attacker_data)
+        end
+        if AoE4RPG_CLASS_ApplyDuelistAttackMovementSpeed then
+            AoE4RPG_CLASS_ApplyDuelistAttackMovementSpeed(attacker, attacker_data, context)
+        end
+
+        -- The global damage event is the synchronized proof that an attack landed.
+        -- Apply Health Per Attack before level-up calculations.
+        if AoE4RPG_BONUS_ApplyHealthPerAttack then
+            AoE4RPG_BONUS_ApplyHealthPerAttack(attacker, attacker_data)
+        end
+
+        if not attacker_uses_native_experience then
+            local attacker_exp = AoE4RPG_CalculateAttackerExp(
+                attacker,
+                victim,
+                context.damage,
+                attacker_owner,
+                victim_owner,
+                attacker_data
+            )
+            if AoE4RPG_CLASS_GetExpMultiplier then
+                attacker_exp = attacker_exp * AoE4RPG_CLASS_GetExpMultiplier(
+                    attacker,
+                    attacker_data,
+                    "attack"
+                )
+            end
+            attacker_exp = attacker_exp * AoE4RPG.XPBonusMultiplier
+            AoE4RPG_AddExperience(attacker_data, attacker_exp, attacker.EntityID)
+            AoE4RPG_CheckAndApplyLevelUp(attacker, attacker_owner, attacker_data, true)
+        end
+    end
+
+    -- IMPORTANT: The victim receives XP for surviving damage, but not for being killed.
+    if victim_tracked and victim_data
+        and not (Entity_IsOfType and (
+            Entity_IsOfType(attacker, "monk")
+            or Entity_IsOfType(attacker, "villager")
+            or Entity_IsOfType(attacker, "naval_fishing_ship")
+        )) then
+        local victim_uses_native_experience = false
+        if AoE4RPG_SynchronizeNativeExperience then
+            victim_uses_native_experience = AoE4RPG_SynchronizeNativeExperience(
+                victim,
+                victim_owner,
+                victim_data
+            )
+        end
+        if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+            AoE4RPG_BONUS_EnsureCurrentBracketOffer(victim)
+        end
+
+        if not victim_uses_native_experience then
+            local victim_exp = AoE4RPG_CalculateVictimExp(
+                victim,
+                attacker,
+                context.damage,
+                victim_owner,
+                attacker_owner,
+                victim_data
+            )
+            if AoE4RPG_CLASS_GetExpMultiplier then
+                victim_exp = victim_exp * AoE4RPG_CLASS_GetExpMultiplier(
+                    victim,
+                    victim_data,
+                    "damage_taken"
+                )
+            end
+            victim_exp = victim_exp * AoE4RPG.XPBonusMultiplier
+            AoE4RPG_AddExperience(victim_data, victim_exp, victim.EntityID)
+            AoE4RPG_CheckAndApplyLevelUp(victim, victim_owner, victim_data, false)
+        end
+    end
+end
+
+-- ADJUST: change the damage and kill reward numbers below for offensive XP balance.
+function AoE4RPG_CalculateAttackerExp(attacker, victim, damage, attacker_owner, victim_owner, unit_data)
+    if not unit_data then
+        unit_data = AoE4RPG_GetUnitData(attacker.EntityID)
+    end
+
+    -- The maximum health of the victim is used to calculate the kill bonus.
+    local victim_max_health = Entity_GetHealthMax and Entity_GetHealthMax(victim) or 100
+    local gained_exp = 0
+
+    -- Buildings grant only 10% of the damage dealt as XP, while units grant 50%.
+    if Entity_IsBuilding and Entity_IsBuilding(victim) then
+        gained_exp = damage * 0.1
+    else
+        gained_exp = damage * 0.5
+    end
+
+    if victim and Entity_GetHealth and Entity_GetHealth(victim) <= 0 then
+        local kill_bonus = victim_max_health * 0.5
+        gained_exp = gained_exp + kill_bonus
+        unit_data.kills = (unit_data.kills or 0) + 1
+    end
+
+    return gained_exp
+end
+
+-- ADJUST: change the damage fraction below for defensive XP balance.
+function AoE4RPG_CalculateVictimExp(victim, attacker, damage, victim_owner, attacker_owner, unit_data)
+    if not unit_data then
+        unit_data = AoE4RPG_GetUnitData(victim.EntityID)
+    end
+
+    local damage_taken = damage * 0.35
+    return damage_taken
+end
+
+-- ADJUST: keep LEVEL_OFFSET display-only; change XP and caps in their settings above.
+function AoE4RPG_CheckAndApplyLevelUp(entity, owner, unit_data, grant_bonus)
+    if not entity or not unit_data then
+        return false, 0
+    end
+    if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity.EntityID) then
+        return false, unit_data.level
+    end
+    if AoE4RPG_CLASS_SyncEntityProgress then
+        AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+    end
+
+    -- Rider heroes share progression with their parent hero.
+    -- Resolve this before reading level state so bracket upgrades and random bonuses are applied correctly.
+    local is_hero, is_elite = AoE4RPG_AssignEntityRole(entity, unit_data)
+    if not is_hero and not is_elite then
+        return false, unit_data.level
+    end
+
+    -- The maximum level is determined by the unit's class and whether it is an elite variant.
+    local max_level = AoE4RPG_GetEffectiveLevelLimit(entity, unit_data)
+    if unit_data.level >= max_level then
+        if (unit_data.damage_dealt or 0) ~= 0 then
+            unit_data.damage_dealt = 0
+            AoE4RPG_MarkUnitDataChanged(unit_data)
+        end
+        if AoE4RPG_CLASS_SyncEntityProgress then
+            AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+        end
+        return false, unit_data.level
+    end
+    -- If the unit has enough XP to level up, apply the level increase and any associated rewards.
+    local leveled = false
+    while unit_data.level < max_level do
+        local required_exp = AoE4RPG_ExperienceRequired(unit_data.level)
+        if (unit_data.damage_dealt or 0) < required_exp then
+            break
+        end
+        local overflow = unit_data.damage_dealt - required_exp
+        unit_data.damage_dealt = overflow
+        unit_data.base_exp = required_exp
+        if AoE4RPG_CLASS_SyncEntityProgress then
+            AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+        end
+        AoE4RPG_ApplySingleLevelIncrease(entity, owner, unit_data, grant_bonus, true)
+        if AoE4RPG_UI_UpdateHeroesDisplay then
+            AoE4RPG_UI_UpdateHeroesDisplay()
+        end
+        leveled = true
+    end
+    -- If the unit has reached the maximum level, reset its damage_dealt to 0.
+    if unit_data.level >= max_level then
+        if (unit_data.damage_dealt or 0) ~= 0 then
+            unit_data.damage_dealt = 0
+            AoE4RPG_MarkUnitDataChanged(unit_data)
+        end
+    end
+    if AoE4RPG_CLASS_SyncEntityProgress then
+        AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+    end
+    return leveled, unit_data.level
+end
+
+-- Calculates the class's absolute attribute damage addition.
+-- Every class uses its configured primary attribute and class damage rate.
+-- ADJUST: change primary-stat profile values instead of adding a second damage attribute.
+function AoE4RPG_CalculateClassDamageBonus(entity, unit_data)
+    if not entity or not unit_data then
+        return 0
+    end
+    -- The class damage bonus driver is the primary stat.
+    -- The class profile defines which attribute is primary and its scaling rate.
+    local attrs = unit_data.attributes or {}
+    local class_name = unit_data.class_name or ""
+    local profile = AoE4RPG_CLASS_DAMAGE_PROFILES and AoE4RPG_CLASS_DAMAGE_PROFILES[class_name]
+    local class_def = AoE4RPG.CLASS_DEFINITIONS and AoE4RPG.CLASS_DEFINITIONS[class_name]
+    if not profile or not class_def then
+        return 0
+    end
+
+    local primary = AoE4RPG_GetPrimaryStatBonus(class_name)
+    local primary_stat = class_def.stat_type
+    local primary_rate = profile[primary_stat] or 0
+    local attribute_damage_bonus = (attrs[primary_stat] or 0) * primary_rate * primary
+
+    local total_damage_bonus = attribute_damage_bonus
+    if class_name == "ranger" then
+        -- `weapon_reload_modifier` is stored as a decimal, while the design formula is expressed in percent.
+        -- Only Ranger receives the additional attribute-damage * (attack-speed percent / 2 / 100) component.
+        local derived_stats = AoE4RPG_TranslateAttributesToStats
+            and AoE4RPG_TranslateAttributesToStats(unit_data)
+            or unit_data.derived_stats
+            or {}
+        local attack_speed_percent = math.max(0,
+            tonumber(derived_stats.weapon_reload_modifier) or 0
+        ) * 100
+        local ranger_attack_speed_factor = attack_speed_percent / 2 / 100
+        total_damage_bonus = total_damage_bonus
+            + attribute_damage_bonus * ranger_attack_speed_factor
+    end
+
+    -- Burst weapons receive the normal class bonus divided across every shot in their configured burst.
+    if AoE4RPG_NormalizeBurstFireDamageBonus then
+        total_damage_bonus = AoE4RPG_NormalizeBurstFireDamageBonus(
+            entity,
+            total_damage_bonus
+        )
+    end
+    return math.max(0, total_damage_bonus)
+end
+
+-- IMPORTANT: Records the native tier transition when a hero or elite enters a new level band.
+-- IMPORTANT: The `damageN` name identifies the native upgrade that changes the hero blueprint tier; it is not an RPG weapon-damage bonus.
+-- ADJUST: change the upgrade names in UPGRADE_BRACKETS to swap bracket rewards.
+function AoE4RPG_ApplyBracketUpgrade(entity, owner, class_name, bracket_index)
+    if not entity or not class_name then
+        return
+    end
+
+    local unit_data = AoE4RPG_GetUnitData(entity.EntityID)
+    if not unit_data then
+        return
+    end
+
+    local bracket_table = AoE4RPG_GetLevelBracketsForUnit
+        and AoE4RPG_GetLevelBracketsForUnit(entity, unit_data)
+        or AoE4RPG.UPGRADE_BRACKETS
+
+    local is_golden_horde_khan = class_name == "commander"
+        and unit_data.civilization == "mongol_ha_gol"
+    if is_golden_horde_khan then
+        local player = owner
+        if AoE4RPG_RUNTIME_GetPlayerHandle then
+            player = AoE4RPG_RUNTIME_GetPlayerHandle(player)
+        end
+        if not player
+            and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner then
+            player = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        end
+        -- IMPORTANT: Golden Horde Khan's native tiers 1-4 are age-gated by the game.
+        -- Do not complete RPG damage-tier upgrades before Imperial Age.
+        if not player or not Player_GetCurrentAge
+            or Player_GetCurrentAge(player) < 4 then
+            return
+        end
+        owner = player
+    end
+
+    local first_bracket = is_golden_horde_khan and 2 or bracket_index
+    local last_bracket = bracket_index
+    if not bracket_table[last_bracket]
+        and AoE4RPG.UNCAPPED_HERO_ELITE_LEVELS
+        and last_bracket > #bracket_table then
+        -- IMPORTANT: Extended brackets grant a random offer only; there is no native damage upgrade beyond damage4.
+        return
+    end
+
+    local applied_upgrade = false
+    for current_bracket = first_bracket, last_bracket do
+        local bracket = bracket_table[current_bracket]
+        if bracket and bracket.upgrade then
+            local upgrade_name = "upgrade_"
+                .. tostring(class_name)
+                .. "_"
+                .. tostring(bracket.upgrade)
+            if not unit_data.applied_bracket_upgrades
+                or not unit_data.applied_bracket_upgrades[upgrade_name] then
+                if unit_data.applied_bracket_upgrades then
+                    unit_data.applied_bracket_upgrades[upgrade_name] = true
+                end
+
+                -- IMPORTANT: This is a native tier transition, not an RPG damage modifier.
+                -- Completing the parent upgrade loads the next hero squad and refreshes its riders.
+                local upgrade = AoE4RPG_GetTuningUpgradeBlueprint
+                    and AoE4RPG_GetTuningUpgradeBlueprint(upgrade_name)
+                    or nil
+                if upgrade then
+                    if Player_CompleteUpgrade then
+                        Player_CompleteUpgrade(owner, upgrade)
+                    elseif LocalCommand_PlayerUpgrade then
+                        LocalCommand_PlayerUpgrade(owner, upgrade, true, false)
+                    end
+                    applied_upgrade = true
+                end
+            end
+        end
+    end
+
+    if applied_upgrade and AoE4RPG_ENTITY_TRACKER_RequestClassRebind then
+        AoE4RPG_ENTITY_TRACKER_RequestClassRebind(class_name)
+    end
+end
+
+-- Applies Golden Horde Khan damage-tier upgrades that were deferred before Imperial Age.
+-- IMPORTANT: This is called after native Khan blueprint conversion, not from a permanent polling rule.
+function AoE4RPG_ApplyDeferredGoldenHordeKhanBracketUpgrades(entity, unit_data)
+    if not entity or not unit_data
+        or unit_data.class_name ~= "commander"
+        or unit_data.civilization ~= "mongol_ha_gol" then
+        return false
+    end
+    local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        or nil
+    if not owner then
+        return false
+    end
+    local current_bracket = AoE4RPG_GetLevelBracketStep
+        and AoE4RPG_GetLevelBracketStep(unit_data.level or 0, entity, unit_data)
+        or 1
+    AoE4RPG_ApplyBracketUpgrade(entity, owner, "commander", current_bracket)
+    return true
+end
+
+-- Applies weapon damage to the parent and separately-created rider weapons.
+-- IMPORTANT: The Mongol ram XML uses attachment entities with redirected damage, so a parent-only MAT_Weapon modifier does not reach those weapons.
+function AoE4RPG_ApplyWeaponDamageToAttachments(entity, value)
+    if not entity or not Modifier_ApplyToEntity then
+        return
+    end
+    local function apply_modifier(owner, target, modifier)
+        if AoE4RPG_CLASS_TrackModifier then
+            return AoE4RPG_CLASS_TrackModifier(
+                owner,
+                Modifier_ApplyToEntity(modifier, target, 0)
+            )
+        end
+        return Modifier_ApplyToEntity(modifier, target, 0)
+    end
+    local function apply_weapon_damage(target)
+        if type(target) == "number" and Entity_FromID then
+            target = Entity_FromID(target)
+        end
+        if target then
+            apply_modifier(
+                entity,
+                target,
+                Modifier_Create(MAT_Weapon, "damage_weapon_modifier", MUT_Addition, false, AoE4RPG_RoundToStep(value, 0.25), target)
+            )
+        end
+    end
+    apply_weapon_damage(entity)
+    local attachments = nil
+    if Entity_GetAttachedEntities then
+        attachments = Entity_GetAttachedEntities(entity)
+    elseif Entity_GetAttachments then
+        attachments = Entity_GetAttachments(entity)
+    end
+    if attachments then
+        -- Attachment APIs may return either a Lua table or an EGroup handle.
+        -- IMPORTANT: ScarDoc exposes the EGroup accessors separately, so handle both shapes before applying the same modifier to every attached weapon.
+        if type(attachments) == "table" then
+            for _, attachment in pairs(attachments) do
+                apply_weapon_damage(attachment)
+            end
+        elseif EGroup_CountSpawned then
+            for attachment_index = 1, EGroup_CountSpawned(attachments) do
+                local attachment = EGroup_GetSpawnedEntityAt
+                    and EGroup_GetSpawnedEntityAt(attachments, attachment_index)
+                    or EGroup_GetEntityAt and EGroup_GetEntityAt(attachments, attachment_index)
+                    or nil
+                apply_weapon_damage(attachment)
+            end
+        end
+    end
+end
+
+-- IMPORTANT: ADJUST: add another elseif branch when a new logical stat needs an engine modifier.
+function AoE4RPG_ApplyStatModifier(entity, stat_name, value)
+    if not entity then
+        return
+    end
+    
+    -- The logical stat names are used by the class system to apply raw attribute level-up bonuses.
+    -- The class system tracks the cumulative attribute values and applies only the delta when the unit levels up.
+    if stat_name == "attack_speed" and Modifier_ApplyToEntity then
+        local factor = math.max(0.01, 1 - value)
+        local function apply_modifier(modifier)
+            if AoE4RPG_CLASS_ApplyModifierToEntity then
+                return AoE4RPG_CLASS_ApplyModifierToEntity(entity, modifier)
+            end
+            return Modifier_ApplyToEntity(modifier, entity, 0)
+        end
+        apply_modifier(Modifier_Create(MAT_Weapon, "reload_weapon_modifier", MUT_Multiplication, false, factor, ""))
+        apply_modifier(Modifier_Create(MAT_Weapon, "cooldown_weapon_modifier", MUT_Multiplication, false, factor, ""))
+        apply_modifier(Modifier_Create(MAT_Weapon, "weapon_wind_up_modifier", MUT_Multiplication, false, factor, ""))
+        apply_modifier(Modifier_Create(MAT_Weapon, "weapon_wind_down_modifier", MUT_Multiplication, false, factor, ""))
+    elseif stat_name == "armor" and Modifier_ApplyToEntity then
+        local function apply_modifier(modifier)
+            if AoE4RPG_CLASS_ApplyModifierToEntity then
+                return AoE4RPG_CLASS_ApplyModifierToEntity(entity, modifier)
+            end
+            return Modifier_ApplyToEntity(modifier, entity, 0)
+        end
+        apply_modifier(Modifier_Create(MAT_Entity, "armor_scalar_for_truedamage_damage", MUT_Addition, false, value, ""))
+        apply_modifier(Modifier_Create(MAT_Entity, "armor_scalar_for_fire_damage", MUT_Addition, false, value, ""))
+        apply_modifier(Modifier_Create(MAT_Entity, "armor_scalar_for_melee_damage", MUT_Addition, false, value, ""))
+        apply_modifier(Modifier_Create(MAT_Entity, "armor_scalar_for_ranged_damage", MUT_Addition, false, value, ""))
+    elseif stat_name == "health" and Modifier_ApplyToEntity then
+        local previous_max_health = Entity_GetHealthMax and Entity_GetHealthMax(entity) or 0
+        local previous_health = Entity_GetHealth and Entity_GetHealth(entity) or 0
+        local previous_health_percentage = previous_max_health > 0
+            and math.max(0, math.min(1, previous_health / previous_max_health))
+            or nil
+        local health_modifier = Modifier_Create(
+            MAT_Entity,
+            "health_maximum_modifier",
+            MUT_MultiplicationAddition,
+            false,
+            value / math.max(1, previous_max_health),
+            ""
+        )
+        if AoE4RPG_CLASS_ApplyModifierToEntity then
+            AoE4RPG_CLASS_ApplyModifierToEntity(entity, health_modifier)
+        else
+            Modifier_ApplyToEntity(health_modifier, entity, 0)
+        end
+
+        -- IMPORTANT: Max-health modifiers do not restore current health automatically.
+        -- Preserve the unit's health percentage across the new maximum.
+        if previous_health_percentage and Entity_SetHealth then
+            Entity_SetHealth(entity, previous_health_percentage)
+        end
+    elseif stat_name == "damage" and Modifier_ApplyToEntity then
+        AoE4RPG_ApplyWeaponDamageToAttachments(entity, value)
+    end
+end
+
+-- IMPORTANT: Fire when an entity is killed so the module can apply the correct death rules.
+-- IMPORTANT: Heroes keep their level but lose XP, elite units lose one level, and regular units lose a partial XP value instead of carrying all progress into the next life or respawn.
+-- ADJUST: change AoE4RPG_ApplyDeathPenalty for balance; keep this event wrapper simple.
+function AoE4RPG_OnEntityKilled(context)
+    if not context then
+        return
+    end
+
+    local entity = context.victim or context.entity
+    if not entity then
+        return
+    end
+
+    -- IMPORTANT: Building and wall destruction is a native lifecycle event, not an RPG-unit event.
+    -- Exit before conversion, animal, passive, tracker, and construction bookkeeping can run.
+    -- Wall collapse can emit many kill events in one simulation frame, so this fast path prevents
+    -- every segment from entering the more expensive RPG death pipeline.
+    local is_building = Entity_IsBuilding and Entity_IsBuilding(entity) or false
+    if not is_building and Entity_IsOfType then
+        is_building = Entity_IsOfType(entity, "building")
+    end
+    if is_building then
+        return
+    end
+
+    if AoE4RPG_CONVERSION_OnEntityKilled then
+        AoE4RPG_CONVERSION_OnEntityKilled(context)
+    end
+    local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
+        and AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+        or entity.EntityID
+    if entity_id and AoE4RPG.TECHNICIAN_CARRIED_RESOURCES then
+        AoE4RPG.TECHNICIAN_CARRIED_RESOURCES[entity_id] = nil
+    end
+    local data = entity_id and AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[entity_id] or nil
+    -- IMPORTANT: Tracker cleanup removes the EntityID before this callback applies its death penalty.
+    -- Preserve the role decision now so human and AI heroes use the same deterministic path.
+    local was_tracked_rpg_unit = AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        and AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity_id)
+        or (data and (data.is_hero or data.is_elite))
+    if AoE4RPG_KING_GROWTH_OnEntityKilled then
+        AoE4RPG_KING_GROWTH_OnEntityKilled(context)
+    end
+    if AoE4RPG_SETTINGS_OnAnimalKilled then
+        AoE4RPG_SETTINGS_OnAnimalKilled(context)
+    end
+    if AoE4RPG_EFFECTS_RemoveAllPassives then
+        AoE4RPG_EFFECTS_RemoveAllPassives(entity)
+    end
+    -- IMPORTANT: Apply and synchronize the death penalty before tracker cleanup unregisters this EntityID.
+    if was_tracked_rpg_unit and data then
+        AoE4RPG_ApplyDeathPenalty(entity, data)
+        if AoE4RPG_CLASS_SyncEntityProgress then
+            AoE4RPG_CLASS_SyncEntityProgress(entity, data)
+        end
+    end
+    if AoE4RPG_ENTITY_TRACKER_OnEntityKilled then
+        AoE4RPG_ENTITY_TRACKER_OnEntityKilled(context)
+    end
+    if AoE4RPG_RemoveTechnicianInheritedEntityModifiers then
+        AoE4RPG_RemoveTechnicianInheritedEntityModifiers(entity_id)
+    end
+
+    -- Discard an unfinished building's contributor record with a direct lookup.
+    -- IMPORTANT: Scan contributor records only when the killed RPG unit was a Technician.
+    -- Building destruction can emit several kill events and must not scan every active construction record.
+    if entity_id and AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS then
+        AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS[entity_id] = nil
+        if was_tracked_rpg_unit and data and data.class_name == "technician" then
+            for _, contributor_ids in pairs(AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS) do
+                contributor_ids[entity_id] = nil
+            end
+        end
+    end
+
+    if not was_tracked_rpg_unit then
+        return
+    end
+
+    if not data then
+        return
+    end
+
+end

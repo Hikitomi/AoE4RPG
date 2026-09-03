@@ -1,0 +1,251 @@
+-- ================= AoE4RPG Ability List ===============
+-- AoE4RPG Ability List Ability Registry defines RPG ability costs, availability, and effect settings.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_effects_list.scar and AoE4RPG_effects.scar.
+-- ================= AoE4RPG Ability List ===============
+
+if not AoE4RPG then AoE4RPG = {} end
+
+
+
+-- =========================== Ability List ====================================
+-- Skills use their XML behavior.
+-- Only the RPG cost and skill name are registered here.
+-- Add listed special effects for them here.
+-- Effects are at effects_list.scar.
+-- =========================== Ability List ====================================
+AoE4RPG.ABILITY_LIST = AoE4RPG.ABILITY_LIST or {
+    -- Active skill listed here.
+    -- Careful when adding, be sure to check its statetree.
+    {
+        ability_name = "leader_armor_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 35, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = nil, effect_id = nil,
+        weapon_slot = nil, hardpoint = nil,
+    },
+    {
+        ability_name = "leader_attack_speed_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 50, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = nil, effect_id = nil,
+        weapon_slot = nil, hardpoint = nil,
+    },
+    {
+        ability_name = "leader_damage_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 180, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = nil, effect_id = nil,
+        weapon_slot = nil, hardpoint = nil,
+    },
+    {
+        ability_name = "leader_healing_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 100, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = nil, effect_id = nil,
+        weapon_slot = nil, hardpoint = nil,
+    },
+    {
+        ability_name = "leader_knight_damage_move_speed_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 75, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = 1, effect_id = nil,
+        weapon_slot = 1, hardpoint = nil,
+    },
+    {
+        ability_name = "leader_move_speed_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 20, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = 1, effect_id = nil,
+        weapon_slot = 1, hardpoint = nil,
+    },
+    {
+        ability_name = "leader_production_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 50, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = 1, effect_id = nil,
+        weapon_slot = 1, hardpoint = nil,
+    },
+    {
+        ability_name = "leader_siege_damage_activated", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 120, skill_type = "active",
+        availability = "all", availability_classes = {}, class_name = nil, civilizations = nil,
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = 1, effect_id = nil,
+        weapon_slot = 1, hardpoint = nil,
+    },
+    -- Unique skills belong to the listed heroes and scale with their brackets.
+    {
+        ability_name = "khan_attack_speed_signal_arrow_mon", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 100, skill_type = "unique",
+        availability = "only", availability_classes = { "commander" }, class_name = "commander",
+        civilizations = { "mongol", "mongol_ha_gol" },
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = 1, effect_id = nil,
+        weapon_slot = 1, hardpoint = nil,
+    },
+    {
+        ability_name = "khan_defensive_signal_arrow_mon", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 100, skill_type = "unique",
+        availability = "only", availability_classes = { "commander" }, class_name = "commander",
+        civilizations = { "mongol", "mongol_ha_gol" },
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = 1, effect_id = nil,
+        weapon_slot = 1, hardpoint = nil,
+    },
+    {
+        ability_name = "khan_maneuver_signal_arrow_mon", marker_type = "owner",
+        projectile_blueprint = nil, heading_side = nil, heading_angle = nil,
+        hp_cost = 50, skill_type = "unique",
+        availability = "only", availability_classes = { "commander" }, class_name = "commander",
+        civilizations = { "mongol", "mongol_ha_gol" },
+        effect_name = "", effect_level = 1, amount = 0, radius = 0,
+        affects = nil, duration = 0, tick_interval = 0, effect_growth = 0.20,
+        apply_effect = nil, apply_effect_data = nil, effect_delay = 0, delayed_effects = {},
+        ability = nil, ability_pbgid = nil, civilization = nil, target_scope = nil,
+        damage = 0, attack_damage = 0, damage_dealt = 0, attribute_name = nil,
+        ability_value_source = nil,
+        attribute = nil, source = nil,
+        health_ratio_mode = "threshold", threshold = 0.80, threshold_refresh_interval = 0.25, minimum_threshold = 0, threshold_reduction_per_level = 0.15,
+        required_attacks = 1, effect_id = nil,
+        weapon_slot = 1, hardpoint = nil,
+    },
+}
+
+function AoE4RPG_ABILITY_LIST_Get(ability)
+    local ability_name = ability
+    if ability and BP_GetName then
+        ability_name = BP_GetName(ability) or ability
+    end
+    for _, entry in ipairs(AoE4RPG.ABILITY_LIST or {}) do
+        if entry.ability == ability or entry.ability_name == ability
+            or entry.ability_name == ability_name then
+            return entry
+        end
+    end
+    return nil
+end
+-- Ability listing goes here.
+-- Add new abilities to the list above this comment.
+-- Returns the selected random-bonus skill level for one ability-list entry.
+function AoE4RPG_ABILITY_LIST_GetEffectLevel(entry, owner)
+    if not entry then return 1 end
+    local effect_level = math.max(1, tonumber(entry.effect_level) or 1)
+    local unit_data = owner and owner.EntityID and AoE4RPG_GetUnitData
+        and AoE4RPG_GetUnitData(owner.EntityID)
+        or nil
+    -- Unique skills are not random bonuses.
+    -- Their level is the current hero bracket so tier progression controls effect, cost, and cooldown scaling.
+    if entry.skill_type == "unique" then
+        if unit_data and AoE4RPG_GetLevelBracketStep then
+            return math.max(1, AoE4RPG_GetLevelBracketStep(unit_data.level or 0, owner, unit_data))
+        end
+        return effect_level
+    end
+    local skill_key = entry.ability_name or entry.ability or entry.ability_pbgid
+    local skill_levels = unit_data and unit_data.skill_effect_levels or nil
+    local selected_level = skill_levels and skill_levels[skill_key]
+    if selected_level == nil and entry.ability_name and skill_levels then
+        selected_level = skill_levels[tostring(entry.ability_name)]
+    end
+    return math.max(effect_level, tonumber(selected_level) or 0)
+end
+
+function AoE4RPG_ABILITY_LIST_GetEffectData(ability, owner)
+    local entry = AoE4RPG_ABILITY_LIST_Get(ability)
+    if not entry then return nil end
+    local data = {}
+    for key, value in pairs(entry) do data[key] = value end
+
+    -- IMPORTANT: Repeated random-bonus skill choices increase the effect level for the current EntityID.
+    -- Level one is the configured base effect.
+    data.effect_level = AoE4RPG_ABILITY_LIST_GetEffectLevel(entry, owner)
+    return data
+end

@@ -1,0 +1,2042 @@
+-- ================= AoE4RPG Entity Tracker ===============
+-- AoE4RPG Entity Tracker -- Hero and Elite Tracker tracks verified heroes and elites through synchronized events and one startup scan.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_blueprints.scar, AoE4RPG_core.scar, AoE4RPG_classes.scar, AoE4RPG_random_bonus.scar, AoE4RPG_class_slots.scar, and AoE4RPG_mapgen_tracker.scar.
+-- ================= AoE4RPG Entity Tracker ===============
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+AoE4RPG.ENTITY_TRACKER = {
+    initialized = false,
+    build_event_registered = false,
+    spawn_event_registered = false,
+    production_recovery_scheduled = false,
+    production_recovery_attempts_remaining = 0,
+    startup_scan_scheduled = false,
+    startup_scan_attempts_remaining = 0,
+    producible_entity_monitor_registered = false,
+    last_owned_entity_count_by_player = {},
+    ability_event_registered = false,
+    local_player = nil,
+    local_player_id = nil,
+    civilization = "default",
+    hero_class_configured_checks = {},
+    hero_class_remaining_checks = {},
+    tracked_entity_ids = {},
+    tracked_entity_records = {},
+    sorted_tracked_entity_ids = {},
+    tracked_entity_ids_dirty = true,
+    tracked_hero_entity_by_class = {},
+    tracked_hero_entity_by_player_class = {},
+    tracked_elite_count_by_limit_key = {},
+    tracked_elite_count_by_player_limit = {},
+    retired_hero_unit_data_by_class = {},
+    retired_hero_unit_data_by_player_class = {},
+    special_respawn_pending_by_class = {},
+    special_respawn_entity_scan_enabled_by_class = {},
+    special_respawn_monitor_registered = false,
+    special_respawn_executed_ability_blueprints = {},
+    jeanne_scan_scheduled = false,
+    jeanne_scan_attempts_remaining = 0,
+    class_rebind_pending = {},
+    class_rebind_attempts = {},
+    class_rebind_monitor_registered = false,
+}
+AoE4RPG.ENTITY_TRACKER.retired_hero_unit_data_by_player_class =
+    AoE4RPG.ENTITY_TRACKER.retired_hero_unit_data_by_player_class or {}
+
+-- Resolves a numeric PlayerID from either an engine player object or number.
+function AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+    if AoE4RPG_RUNTIME_GetPlayerIdentifier then
+        return AoE4RPG_RUNTIME_GetPlayerIdentifier(player)
+    end
+    if type(player) == "number" then
+        return player
+    end
+    if not player then
+        return nil
+    end
+    if player.PlayerID then
+        return player.PlayerID
+    end
+    if player.id then
+        return player.id
+    end
+    if Player_GetID then
+        return Player_GetID(player)
+    end
+    return nil
+end
+
+-- Resolves one stable EntityID from event wrappers, native entities, or numeric IDs.
+function AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+    if AoE4RPG_RUNTIME_GetEntityIdentifier then
+        return AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+    end
+    if type(entity) == "number" then
+        return entity
+    end
+    return entity and entity.EntityID or nil
+end
+
+function AoE4RPG_ENTITY_TRACKER_MarkTrackedEntityOrderDirty()
+    AoE4RPG.ENTITY_TRACKER.tracked_entity_ids_dirty = true
+end
+
+function AoE4RPG_ENTITY_TRACKER_GetSortedTrackedEntityIdentifiers()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if tracker.tracked_entity_ids_dirty then
+        local entity_ids = {}
+        for entity_id in pairs(tracker.tracked_entity_ids) do
+            table.insert(entity_ids, entity_id)
+        end
+        table.sort(entity_ids)
+        tracker.sorted_tracked_entity_ids = entity_ids
+        tracker.tracked_entity_ids_dirty = false
+    end
+    return tracker.sorted_tracked_entity_ids
+end
+
+-- Copies existing same-class elite progression into a newly tracked elite.
+-- IMPORTANT: Stable EntityID order keeps the selected source identical on every peer.
+function AoE4RPG_ENTITY_TRACKER_InheritEliteProgress(entity_id, owner_id, class_name, unit_data)
+    if not entity_id or owner_id == nil or not class_name or not unit_data
+        or not AoE4RPG.UNIT_DATA then
+        return false
+    end
+
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local source_data = nil
+    local source_level = -1
+    local source_experience = -1
+    local entity_ids = AoE4RPG_ENTITY_TRACKER_GetSortedTrackedEntityIdentifiers()
+    for _, candidate_id in ipairs(entity_ids) do
+        if candidate_id ~= entity_id then
+            local record = tracker.tracked_entity_records[candidate_id]
+            local candidate_data = AoE4RPG.UNIT_DATA[candidate_id]
+            if record
+                and record.role == "elites"
+                and record.player_id == owner_id
+                and record.class_name == class_name
+                and candidate_data
+                and not candidate_data.uses_native_experience then
+                local candidate_level = math.max(0, tonumber(candidate_data.level) or 0)
+                local candidate_experience = math.max(0, tonumber(candidate_data.damage_dealt) or 0)
+                if candidate_level > source_level
+                    or (candidate_level == source_level and candidate_experience > source_experience) then
+                    source_data = candidate_data
+                    source_level = candidate_level
+                    source_experience = candidate_experience
+                end
+            end
+        end
+    end
+
+    if not source_data then
+        return false
+    end
+    unit_data.level = source_level
+    unit_data.damage_dealt = source_experience
+    unit_data.base_exp = source_data.base_exp or 0
+    if AoE4RPG_MarkUnitDataChanged then
+        AoE4RPG_MarkUnitDataChanged(unit_data)
+    end
+    return true
+end
+
+function AoE4RPG_ENTITY_TRACKER_GetSortedKeys(value)
+    if AoE4RPG_RUNTIME_GetSortedKeys then
+        return AoE4RPG_RUNTIME_GetSortedKeys(value)
+    end
+    local keys = {}
+    for key in pairs(value or {}) do
+        table.insert(keys, key)
+    end
+    table.sort(keys)
+    return keys
+end
+
+-- Returns a player owner only for a live player-owned entity.
+function AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+    if not entity or not Entity_GetPlayerOwner then
+        return nil
+    end
+    if World_OwnsEntity and World_OwnsEntity(entity) then
+        return nil
+    end
+    local owner = Entity_GetPlayerOwner(entity)
+    -- Entity_GetPlayerOwner may return a numeric ID, while Player* APIs require the opaque Player handle.
+    if AoE4RPG_RUNTIME_GetPlayerHandle then
+        owner = AoE4RPG_RUNTIME_GetPlayerHandle(owner)
+    end
+    return owner
+end
+
+-- Returns true only for entities that have a real player owner.
+-- Neutral are rejected from further resolves.
+function AoE4RPG_ENTITY_TRACKER_IsPlayerOwnedEntity(entity)
+    return AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity) ~= nil
+end
+
+-- Selection-time guard for multiplayer.
+-- IMPORTANT: A selected allied/enemy entity may have a valid player owner, but it must never enter the local simulation tracker or trigger blueprint/class-slot mutation.
+function AoE4RPG_ENTITY_TRACKER_IsOwnedByLocalPlayer(entity)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+    local owner_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(owner)
+    return owner_id ~= nil
+        and tracker.local_player_id ~= nil
+        and owner_id == tracker.local_player_id
+end
+
+-- Returns true for computer players so the human simulation tracker does not duplicate the dedicated AI tracker.
+-- IMPORTANT: The check is deterministic because it depends only on the synchronized player identifier, never on the local UI.
+function AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(player)
+    if AoE4RPG_RUNTIME_GetPlayerHandle then
+        player = AoE4RPG_RUNTIME_GetPlayerHandle(player)
+    end
+    local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+    if not player_id or not AI_IsAIPlayer then
+        return false
+    end
+    local success, result = pcall(AI_IsAIPlayer, player)
+    return success and result == true
+end
+
+-- Returns active world players in numeric player order.
+function AoE4RPG_ENTITY_TRACKER_GetWorldPlayers()
+    local players = {}
+    if World_GetPlayerCount and World_GetPlayerAt then
+        for player_index = 1, World_GetPlayerCount() do
+            local player = World_GetPlayerAt(player_index)
+            local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+            if player and player_id then
+                table.insert(players, player)
+            end
+        end
+    elseif type(PLAYERS) == "table" then
+        for _, player_entry in pairs(PLAYERS) do
+            local player = AoE4RPG_RUNTIME_GetPlayerHandle
+                and AoE4RPG_RUNTIME_GetPlayerHandle(player_entry)
+                or player_entry
+            local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+            if player and player_id then
+                table.insert(players, player)
+            end
+        end
+    end
+    table.sort(players, function(left, right)
+        return AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(left)
+            < AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(right)
+    end)
+    return players
+end
+
+-- IMPORTANT: Reads a player's civilization for the global simulation scan.
+-- IMPORTANT: The entry's civilization remains the fallback for hosts that do not expose race names.
+function AoE4RPG_ENTITY_TRACKER_GetPlayerCivilization(player, fallback)
+    player = AoE4RPG_RUNTIME_GetPlayerHandle
+        and AoE4RPG_RUNTIME_GetPlayerHandle(player)
+        or player
+    local race_name = AoE4RPG_RUNTIME_GetPlayerRaceName
+        and AoE4RPG_RUNTIME_GetPlayerRaceName(player, nil)
+        or nil
+    if type(race_name) == "string" and race_name ~= "" then
+        local normalized_race_name = string.lower(race_name)
+        if AoE4RPG_ENTITY_TABLE[normalized_race_name] then
+            return normalized_race_name
+        end
+        local civilization_names = {}
+        for civilization_name in pairs(AoE4RPG_ENTITY_TABLE or {}) do
+            table.insert(civilization_names, civilization_name)
+        end
+        table.sort(civilization_names)
+        for _, civilization_name in ipairs(civilization_names) do
+            if civilization_name ~= "default"
+                and string.find(normalized_race_name, civilization_name, 1, true) then
+                return civilization_name
+            end
+        end
+    end
+    return fallback or "default"
+end
+
+function AoE4RPG_ENTITY_TRACKER_GetHeroStateKey(player_id, class_name)
+    if not player_id or not class_name then
+        return nil
+    end
+    return tostring(player_id) .. ":" .. tostring(class_name)
+end
+
+function AoE4RPG_ENTITY_TRACKER_ResolveLocalPlayer()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if tracker.local_player and tracker.local_player_id
+        and tracker.civilization ~= "default" then
+        return true
+    end
+    if not Game_GetLocalPlayer then
+        return false
+    end
+
+    local local_player = Game_GetLocalPlayer()
+    if AoE4RPG_RUNTIME_GetPlayerHandle then
+        local_player = AoE4RPG_RUNTIME_GetPlayerHandle(local_player)
+    end
+    local local_player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(local_player)
+    if not local_player_id then
+        return false
+    end
+
+    tracker.local_player = local_player
+    tracker.local_player_id = local_player_id
+    if AoE4RPG_RUNTIME_GetPlayerRaceName then
+        local race_name = AoE4RPG_RUNTIME_GetPlayerRaceName(local_player, nil)
+        if type(race_name) == "string" and race_name ~= "" then
+            local normalized_race_name = string.lower(race_name)
+            if AoE4RPG_ENTITY_TABLE[normalized_race_name] then
+                tracker.civilization = normalized_race_name
+            else
+                -- Some hosts return a prefixed race identifier.
+                -- Match a known registry key without requiring every host naming convention.
+                for civilization_name in pairs(AoE4RPG_ENTITY_TABLE) do
+                    if civilization_name ~= "default"
+                        and string.find(normalized_race_name, civilization_name, 1, true) then
+                        tracker.civilization = civilization_name
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    local configured_checks = AoE4RPG_CreateHeroClassRemainingChecks
+        and AoE4RPG_CreateHeroClassRemainingChecks(tracker.civilization)
+        or {}
+    -- IMPORTANT: Positive elite-class limit return elite-class rules and disable its hero scan.
+    -- Elite deaths reopen elite capacity only.
+    local civilization_elite_limits = AoE4RPG_ELITE_CONCURRENT_LIMITS[tracker.civilization] or {}
+    for limit_key, maximum_elites in pairs(civilization_elite_limits) do
+        local elite_class_name = type(limit_key) == "string"
+            and string.match(limit_key, "^elite_(.+)$")
+            or nil
+        if elite_class_name and type(maximum_elites) == "number" and maximum_elites > 0 then
+            configured_checks[elite_class_name] = 0
+        end
+    end
+    -- Dynamic elite rows are elite-only even when their currently available Action resource is zero.
+    -- This prevents Daimyo's `wolf` type from opening a nonexistent Duelist hero slot at match start.
+    local civilization_dynamic_elite_rules = AoE4RPG_DYNAMIC_ELITE_LIMIT_RULES
+        and AoE4RPG_DYNAMIC_ELITE_LIMIT_RULES[tracker.civilization]
+        or {}
+    for limit_key in pairs(civilization_dynamic_elite_rules) do
+        local elite_class_name = type(limit_key) == "string"
+            and string.match(limit_key, "^elite_(.+)$")
+            or nil
+        if elite_class_name then
+            configured_checks[elite_class_name] = 0
+        end
+    end
+    tracker.hero_class_configured_checks = {}
+    tracker.hero_class_remaining_checks = {}
+    for class_name, configured_check in pairs(configured_checks) do
+        tracker.hero_class_configured_checks[class_name] = configured_check
+        tracker.hero_class_remaining_checks[class_name] = configured_check
+    end
+    if AoE4RPG_CLASS_SLOTS_Initialize then
+        AoE4RPG_CLASS_SLOTS_Initialize(
+            tracker.local_player_id,
+            tracker.civilization,
+            AoE4RPG.SETTINGS and AoE4RPG.SETTINGS.max_class_slots
+                or AoE4RPG.MaxClassSlots
+                or 5,
+            tracker.local_player
+        )
+    end
+    return true
+end
+
+-- Enable checks when there's available heroes slot.
+function AoE4RPG_ENTITY_TRACKER_HasRemainingHeroChecks()
+    for _, remaining_count in pairs(AoE4RPG.ENTITY_TRACKER.hero_class_remaining_checks or {}) do
+        if remaining_count == 1 then
+            return true
+        end
+    end
+    return false
+end
+
+-- Return either 1 or 0 for each classes.
+-- Class Civs without a Blueprint return 0 and stop check.
+function AoE4RPG_ENTITY_TRACKER_GetHeroClassRemainingCheck(class_name)
+    if not class_name then
+        return 0
+    end
+    return AoE4RPG.ENTITY_TRACKER.hero_class_remaining_checks[class_name] or 0
+end
+
+-- Enable check when there is 1 available Elite slot.
+function AoE4RPG_ENTITY_TRACKER_HasRemainingEliteClassCapacity(class_name)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local class_definition = AoE4RPG.CLASS_DEFINITIONS and AoE4RPG.CLASS_DEFINITIONS[class_name]
+    if not class_definition or not class_definition.can_be_elite then
+        return false
+    end
+    local limit_key = AoE4RPG_GetEliteTrackingLimitKey
+        and AoE4RPG_GetEliteTrackingLimitKey(class_name)
+        or nil
+    if not limit_key then
+        return false
+    end
+    local maximum_elites = AoE4RPG_GetEliteConcurrentTrackingLimit
+        and AoE4RPG_GetEliteConcurrentTrackingLimit(
+            tracker.civilization,
+            class_name,
+            tracker.local_player_id,
+            tracker.tracked_elite_count_by_limit_key[limit_key] or 0
+        )
+        or 0
+    if AoE4RPG_GetDynamicEliteLimitRule
+        and AoE4RPG_GetDynamicEliteLimitRule(tracker.civilization, class_name) then
+        -- Capacity can change at any time and the Action point is consumed before GE_BuildItemComplete fires.
+        -- Keep the event-side O(1) lookup enabled.
+        return true
+    end
+    if maximum_elites <= 0 then
+        return false
+    end
+    local tracked_count = tracker.tracked_elite_count_by_limit_key[limit_key] or 0
+    return tracked_count < maximum_elites
+end
+
+-- Returns true when at least one configured elite class still has capacity.
+-- This lets the production callback stop before resolving regular blueprints.
+function AoE4RPG_ENTITY_TRACKER_HasAnyRemainingEliteCapacity()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local dynamic_rules = AoE4RPG_DYNAMIC_ELITE_LIMIT_RULES
+        and AoE4RPG_DYNAMIC_ELITE_LIMIT_RULES[tracker.civilization]
+        or nil
+    if dynamic_rules then
+        -- Dynamic resources may increase without a production event.
+        for limit_key in pairs(dynamic_rules) do
+            local class_name = type(limit_key) == "string"
+                and string.match(limit_key, "^elite_(.+)$")
+                or nil
+            local class_definition = class_name and AoE4RPG.CLASS_DEFINITIONS
+                and AoE4RPG.CLASS_DEFINITIONS[class_name]
+                or nil
+            if class_definition and class_definition.can_be_elite then
+                return true
+            end
+        end
+    end
+    local civilization_limits = AoE4RPG_ELITE_CONCURRENT_LIMITS[tracker.civilization] or {}
+    for limit_key, maximum_elites in pairs(civilization_limits) do
+        local class_name = type(limit_key) == "string"
+            and string.match(limit_key, "^elite_(.+)$")
+            or nil
+        local class_definition = class_name and AoE4RPG.CLASS_DEFINITIONS
+            and AoE4RPG.CLASS_DEFINITIONS[class_name]
+            or nil
+        if class_definition and class_definition.can_be_elite
+            and type(maximum_elites) == "number" and maximum_elites > 0 then
+            local tracked_count = tracker.tracked_elite_count_by_limit_key[limit_key] or 0
+            if tracked_count < maximum_elites then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- After checks when produced unit failed to reduce number of slot left.
+function AoE4RPG_ENTITY_TRACKER_ShouldCheckNewEntity()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if AoE4RPG_ShouldAllowMultipleForeignHeroes
+        and AoE4RPG_ShouldAllowMultipleForeignHeroes(tracker.civilization) then
+        return true
+    end
+    return AoE4RPG_ENTITY_TRACKER_HasRemainingHeroChecks()
+        or AoE4RPG_ENTITY_TRACKER_HasAnyRemainingEliteCapacity()
+end
+
+function AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(entity)
+    if not entity or not Entity_GetBlueprint then
+        return nil
+    end
+    local blueprint = Entity_GetBlueprint(entity)
+    local blueprint_name = blueprint
+    if blueprint and BP_GetName then
+        local resolved_name = BP_GetName(blueprint)
+        if type(resolved_name) == "string" and resolved_name ~= "" then
+            blueprint_name = resolved_name
+        end
+    end
+    return AoE4RPG_NormalizeBlueprintName
+        and AoE4RPG_NormalizeBlueprintName(blueprint_name)
+        or tostring(blueprint_name or "")
+end
+
+-- Stores one matching hero or elite and calculate its RPG data once.
+-- A hero class changes from one remaining check to zero after successful discovery.
+function AoE4RPG_ENTITY_TRACKER_TrackEntity(entity, owner_player)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local entity_id = AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+    if not entity or not entity_id or tracker.tracked_entity_ids[entity_id] then
+        return false
+    end
+
+    -- This tracker is strictly for player-owned, producible hero/elite units.
+    if not AoE4RPG_ENTITY_TRACKER_IsPlayerOwnedEntity(entity) then
+        return false
+    end
+
+    local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+    local owner_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(owner)
+    if not owner_id or AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(owner) then
+        return false
+    end
+    local is_local_player = owner_id == tracker.local_player_id
+    -- Resolve the race from the engine owner handle.
+    local player_civilization = AoE4RPG_ENTITY_TRACKER_GetPlayerCivilization(
+        owner,
+        tracker.civilization
+    )
+
+    local entry = AoE4RPG_GetBlueprintTrackingEntryForEntity
+        and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+        or nil
+    local entity_blueprint_name = AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(entity)
+    local is_jeanne_entity = entry
+        and entry.class_name == "ranger"
+        and entry.civilization == "french_ha_01"
+        and AoE4RPG_JEANNE_COMBAT_PATH_BY_BLUEPRINT
+        and AoE4RPG_JEANNE_COMBAT_PATH_BY_BLUEPRINT[entity_blueprint_name]
+        or false
+    -- IMPORTANT: The configured Jeanne blueprint is authoritative for her source profile.
+    -- Native owner race strings can be broader than the hero's expansion civilization.
+    if is_jeanne_entity then
+        player_civilization = "french_ha_01"
+    end
+    local is_foreign_hero = AoE4RPG_IsForeignHeroBlueprintAllowed
+        and AoE4RPG_IsForeignHeroBlueprintAllowed(player_civilization, entry)
+        or false
+    if not entry
+        or (entry.civilization ~= player_civilization
+            and entry.civilization ~= "default"
+            and not is_foreign_hero) then
+        return false
+    end
+    local growth_civilization = AoE4RPG_GetEntityGrowthCivilization
+        and AoE4RPG_GetEntityGrowthCivilization(player_civilization, entry)
+        or player_civilization
+    -- Riders are attachment-only records.
+    -- IMPORTANT: They contribute through their parent relationship when growth is applied, but never become selectable class members or consume a hero/elite tracking slot.
+    if entry.role == "attached" or entry.parent_unit_type then
+        return false
+    end
+
+    local class_name = entry.class_name
+        or (AoE4RPG_CLASS_GetClassForEntity and AoE4RPG_CLASS_GetClassForEntity(entity))
+    local class_profile = class_name and AoE4RPG_CLASS_GetValueProfile
+        and AoE4RPG_CLASS_GetValueProfile(growth_civilization, class_name)
+        or nil
+    if not class_name or not class_profile then
+        return false
+    end
+    local is_bodyguard = Entity_IsOfType
+        and Entity_IsOfType(entity, AoE4RPG_BP_BODYGUARD or "bodyguard")
+        or false
+    local is_dynamic_elite = AoE4RPG_IsEntityDynamicElite
+        and AoE4RPG_IsEntityDynamicElite(entity, player_civilization, class_name)
+        or false
+    local is_configured_elite = AoE4RPG_IsConfiguredElite
+        and AoE4RPG_IsConfiguredElite(entity, player_civilization, class_name)
+        or false
+    local resolved_role = (is_bodyguard or is_dynamic_elite or is_configured_elite
+        or entry.role == "elites")
+        and "elites"
+        or "heroes"
+
+    local player_hero_key = AoE4RPG_ENTITY_TRACKER_GetHeroStateKey(owner_id, class_name)
+    if is_foreign_hero then
+        player_hero_key = AoE4RPG_ENTITY_TRACKER_GetHeroStateKey(
+            owner_id,
+            tostring(growth_civilization) .. ":" .. tostring(class_name)
+        )
+    end
+    local player_elite_counts = tracker.tracked_elite_count_by_player_limit[owner_id]
+    if not player_elite_counts then
+        player_elite_counts = {}
+        tracker.tracked_elite_count_by_player_limit[owner_id] = player_elite_counts
+    end
+
+    local class_slot_key = AoE4RPG_CLASS_SLOTS_GetSlotKey
+        and AoE4RPG_CLASS_SLOTS_GetSlotKey(
+            player_civilization,
+            entry,
+            growth_civilization
+        )
+        or class_name
+    if not class_slot_key then
+        return false
+    end
+
+    -- IMPORTANT: Production eligibility must use the produced entity owner's state.
+    -- IMPORTANT: Never choose local versus remote rules because every peer has a different local player.
+    if resolved_role == "elites" then
+        if not is_dynamic_elite then
+        local limit_key = AoE4RPG_GetEliteTrackingLimitKey(class_name)
+        local maximum_elites = AoE4RPG_GetEliteConcurrentTrackingLimit
+            and AoE4RPG_GetEliteConcurrentTrackingLimit(
+                player_civilization,
+                class_name,
+                owner,
+                player_elite_counts[limit_key] or 0
+            )
+            or 0
+        if maximum_elites <= 0 or (player_elite_counts[limit_key] or 0) >= maximum_elites then
+            return false
+        end
+        end
+    elseif resolved_role == "heroes" then
+        -- IMPORTANT: Byzantine foreign heroes do not consume the normal one-hero-per-class discovery slot.
+        -- Their origin civilization/profile keeps them distinct.
+        if not is_foreign_hero
+            and tracker.tracked_hero_entity_by_player_class[player_hero_key] then
+            return false
+        end
+    else
+        return false
+    end
+
+    if AoE4RPG_CLASS_SLOTS_Reserve then
+        local slot_metadata = {
+            class_name = class_name,
+            civilization = growth_civilization,
+            player_civilization = player_civilization,
+            role = resolved_role,
+        }
+        local slot_reserved = AoE4RPG_CLASS_SLOTS_Reserve(
+            class_slot_key,
+            slot_metadata,
+            owner_id
+        )
+        if not slot_reserved then
+            return false
+        end
+    end
+
+    if is_local_player and resolved_role == "elites" then
+        local limit_key = AoE4RPG_GetEliteTrackingLimitKey(class_name)
+        tracker.tracked_elite_count_by_limit_key[limit_key] =
+            (tracker.tracked_elite_count_by_limit_key[limit_key] or 0) + 1
+    elseif is_local_player and resolved_role == "heroes" and not is_foreign_hero then
+        -- Slot filled.
+        -- IMPORTANT: Stop checking this local hero class until its respawn.
+        tracker.hero_class_remaining_checks[class_name] = 0
+        tracker.tracked_hero_entity_by_class[class_name] = entity_id
+    end
+    if resolved_role == "heroes" and not is_foreign_hero then
+        tracker.tracked_hero_entity_by_player_class[player_hero_key] = entity_id
+    elseif resolved_role == "elites" then
+        local limit_key = AoE4RPG_GetEliteTrackingLimitKey(class_name)
+        player_elite_counts[limit_key] = (player_elite_counts[limit_key] or 0) + 1
+    end
+
+    tracker.tracked_entity_ids[entity_id] = true
+    AoE4RPG_ENTITY_TRACKER_MarkTrackedEntityOrderDirty()
+    tracker.tracked_entity_records[entity_id] = {
+        role = resolved_role,
+        class_name = class_name,
+        elite_limit_key = resolved_role == "elites" and AoE4RPG_GetEliteTrackingLimitKey(class_name) or nil,
+        uses_dynamic_elite_limit = is_dynamic_elite,
+        civilization = entry.civilization,
+        player_civilization = player_civilization,
+        player_id = owner_id,
+        growth_civilization = growth_civilization,
+        hired_foreign_hero = is_foreign_hero,
+        class_slot_key = class_slot_key,
+        blueprint_name = AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(entity),
+    }
+    if AoE4RPG_CLASS_SLOTS_AddEntity then
+        AoE4RPG_CLASS_SLOTS_AddEntity(class_slot_key, owner_id)
+    end
+    class_profile = class_name and AoE4RPG_CLASS_RegisterEntity
+        and AoE4RPG_CLASS_RegisterEntity(entity, growth_civilization, class_name)
+        or nil
+    tracker.tracked_entity_records[entity_id].class_profile_key = class_profile and class_profile.key or nil
+
+    -- IMPORTANT: Native respawns commonly receive a new EntityID.
+    -- IMPORTANT: Reattach the same RPG record so the death penalty and accumulated progression survive respawn.
+    if resolved_role == "heroes" and not is_foreign_hero and AoE4RPG.UNIT_DATA then
+        local hero_state_key = AoE4RPG_ENTITY_TRACKER_GetHeroStateKey(owner_id, class_name)
+        local retired_unit_data = hero_state_key
+            and tracker.retired_hero_unit_data_by_player_class[hero_state_key]
+            or nil
+        -- IMPORTANT: Preserve compatibility with the old local-only key if a respawn was already pending when this version of the tracker was loaded.
+        retired_unit_data = retired_unit_data
+            or (owner_id == tracker.local_player_id and tracker.retired_hero_unit_data_by_class[class_name])
+        if retired_unit_data then
+            AoE4RPG.UNIT_DATA[entity_id] = retired_unit_data
+            if hero_state_key then
+                tracker.retired_hero_unit_data_by_player_class[hero_state_key] = nil
+            end
+            tracker.retired_hero_unit_data_by_class[class_name] = nil
+        end
+    end
+
+    if AoE4RPG_CLASS_BindUnit then
+        AoE4RPG_CLASS_BindUnit(entity)
+    end
+    local unit_data = AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity_id) or nil
+    if unit_data then
+        unit_data.entity_id = entity_id
+        unit_data.is_hero = resolved_role == "heroes"
+        unit_data.is_elite = resolved_role == "elites"
+        unit_data.class_name = class_name or unit_data.class_name
+        unit_data.owner = owner
+        unit_data.player_civilization = player_civilization
+        unit_data.civilization = player_civilization
+        unit_data.growth_civilization = growth_civilization
+        if resolved_role == "elites" then
+            AoE4RPG_ENTITY_TRACKER_InheritEliteProgress(
+                entity_id,
+                owner_id,
+                class_name,
+                unit_data
+            )
+        end
+        if class_profile and AoE4RPG_CLASS_ApplyCachedProfileToEntity then
+            -- IMPORTANT: The class registry is authoritative for base attributes, growth, derived values, and the modifiers rebuilt on this EntityID.
+            AoE4RPG_CLASS_ApplyCachedProfileToEntity(entity, unit_data, class_profile)
+            unit_data.initial_attribute_bonus_applied = true
+        end
+        if AoE4RPG_TranslateAttributesToStats then
+            AoE4RPG_TranslateAttributesToStats(unit_data)
+        end
+    end
+    if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+        AoE4RPG_BONUS_EnsureCurrentBracketOffer(entity)
+    end
+    if unit_data and AoE4RPG_CLASS_SyncEntityProgress then
+        AoE4RPG_CLASS_SyncEntityProgress(entity, unit_data)
+    end
+    if owner_id == tracker.local_player_id and resolved_role == "heroes" and not is_foreign_hero
+        and AoE4RPG_ENTITY_TRACKER_CompleteSpecialRespawnForClass then
+        AoE4RPG_ENTITY_TRACKER_CompleteSpecialRespawnForClass(class_name)
+    end
+    return true
+end
+
+-- IMPORTANT: Requests a narrow class rebind after a native bracket conversion.
+-- IMPORTANT: Normal production and startup continue to use their event-driven paths; this pass exists because a blueprint conversion may replace an EntityID without a portable SCAR spawn event.
+function AoE4RPG_ENTITY_TRACKER_RequestClassRebind(class_name)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if not class_name then
+        return false
+    end
+    tracker.class_rebind_pending[class_name] = true
+    tracker.class_rebind_attempts[class_name] = 0
+    if tracker.class_rebind_monitor_registered then
+        return true
+    end
+    if Rule_AddInterval then
+        Rule_AddInterval(AoE4RPG_ENTITY_TRACKER_MonitorClassRebind, 0.125)
+        tracker.class_rebind_monitor_registered = true
+        return true
+    end
+    return false
+end
+
+function AoE4RPG_ENTITY_TRACKER_RemoveStaleTrackedEntity(entity_id, record)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if AoE4RPG_BONUS_INDICATOR_RemoveEntity then
+        AoE4RPG_BONUS_INDICATOR_RemoveEntity(entity_id)
+    end
+    local unit_data = AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[entity_id] or nil
+    if record and record.role == "heroes" and record.class_name
+        and not record.hired_foreign_hero then
+        local hero_state_key = AoE4RPG_ENTITY_TRACKER_GetHeroStateKey(
+            record.player_id,
+            record.class_name
+        )
+        if hero_state_key then
+            tracker.retired_hero_unit_data_by_player_class[hero_state_key] = unit_data
+        end
+        if record.player_id == tracker.local_player_id then
+            tracker.retired_hero_unit_data_by_class[record.class_name] = unit_data
+        end
+        if record.player_id == tracker.local_player_id then
+            tracker.hero_class_remaining_checks[record.class_name] = 1
+            tracker.tracked_hero_entity_by_class[record.class_name] = nil
+        end
+        tracker.tracked_hero_entity_by_player_class[hero_state_key] = nil
+    elseif record and record.role == "elites"
+        and record.elite_limit_key then
+        local player_counts = tracker.tracked_elite_count_by_player_limit[record.player_id]
+        if player_counts then
+            player_counts[record.elite_limit_key] = math.max(
+                0,
+                (player_counts[record.elite_limit_key] or 0) - 1
+            )
+        end
+        if record.player_id == tracker.local_player_id then
+            local tracked_count = tracker.tracked_elite_count_by_limit_key[record.elite_limit_key] or 0
+            tracker.tracked_elite_count_by_limit_key[record.elite_limit_key] = math.max(0, tracked_count - 1)
+        end
+    end
+    if unit_data and AoE4RPG_CLASS_RemoveEntityModifiers then
+        AoE4RPG_CLASS_RemoveEntityModifiers(entity_id, unit_data)
+    end
+    tracker.tracked_entity_ids[entity_id] = nil
+    tracker.tracked_entity_records[entity_id] = nil
+    AoE4RPG_ENTITY_TRACKER_MarkTrackedEntityOrderDirty()
+    if record and AoE4RPG_CLASS_SLOTS_RemoveEntity and record.class_slot_key then
+        local retain_class_slot = record.role == "heroes"
+            and not record.hired_foreign_hero
+        AoE4RPG_CLASS_SLOTS_RemoveEntity(
+            record.class_slot_key,
+            retain_class_slot,
+            record.player_id
+        )
+    end
+    if AoE4RPG_CLASS_UnregisterEntity then
+        AoE4RPG_CLASS_UnregisterEntity(entity_id)
+    end
+end
+
+function AoE4RPG_ENTITY_TRACKER_MonitorClassRebind()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local still_pending = false
+
+    -- IMPORTANT: Native tier upgrades are synchronized simulation changes.
+    -- IMPORTANT: Rebind every tracked entity in stable EntityID order; relying on the local player's class index would make different peers rebuild different units.
+    local tracked_entity_ids = AoE4RPG_ENTITY_TRACKER_GetSortedTrackedEntityIdentifiers()
+    for _, entity_id in ipairs(tracked_entity_ids) do
+        local record = tracker.tracked_entity_records[entity_id]
+        local entity = Entity_FromID and Entity_FromID(entity_id) or nil
+        if not entity or (Entity_IsValid and not Entity_IsValid(entity_id)) then
+            AoE4RPG_ENTITY_TRACKER_RemoveStaleTrackedEntity(entity_id, record)
+        else
+            local current_blueprint_name = AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(entity)
+            if record and current_blueprint_name
+                and record.blueprint_name ~= current_blueprint_name then
+                record.blueprint_name = current_blueprint_name
+                if AoE4RPG_ApplyDeferredGoldenHordeKhanBracketUpgrades then
+                    AoE4RPG_ApplyDeferredGoldenHordeKhanBracketUpgrades(
+                        entity,
+                        AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[entity_id] or nil
+                    )
+                end
+                if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+                    AoE4RPG_BONUS_EnsureCurrentBracketOffer(entity, true)
+                end
+            end
+        end
+    end
+
+    for _, class_name in ipairs(
+        AoE4RPG_ENTITY_TRACKER_GetSortedKeys(tracker.class_rebind_pending)
+    ) do
+        local current_entity_id = tracker.tracked_hero_entity_by_class[class_name]
+        local current_entity = current_entity_id and Entity_FromID
+            and Entity_FromID(current_entity_id)
+            or nil
+        if current_entity and Entity_IsValid and not Entity_IsValid(current_entity_id) then
+            current_entity = nil
+        end
+        if not current_entity then
+            for _, entity_id in ipairs(tracked_entity_ids) do
+                local record = tracker.tracked_entity_records[entity_id]
+                if record and record.class_name == class_name then
+                    current_entity = Entity_FromID and Entity_FromID(entity_id) or nil
+                    if current_entity and (not Entity_IsValid or Entity_IsValid(entity_id)) then
+                        break
+                    end
+                    current_entity = nil
+                end
+            end
+        end
+        if current_entity then
+            local current_record = tracker.tracked_entity_records[current_entity.EntityID]
+            local current_blueprint_name = AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(current_entity)
+            if current_record and current_blueprint_name
+                and current_record.blueprint_name ~= current_blueprint_name then
+                current_record.blueprint_name = current_blueprint_name
+                if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
+                    AoE4RPG_BONUS_EnsureCurrentBracketOffer(current_entity, true)
+                end
+            end
+        end
+        -- IMPORTANT: New entities are recovered by the deterministic all-human scan above; never use this local-only fallback from a synchronized monitor.
+        if false and not current_entity and AoE4RPG_ENTITY_TRACKER_ShouldCheckNewEntity()
+            and tracker.local_player and Player_GetEntities and EGroup_CountSpawned then
+            local entities = Player_GetEntities(tracker.local_player)
+            if entities then
+                for entity_index = 1, EGroup_CountSpawned(entities) do
+                    local candidate = EGroup_GetSpawnedEntityAt
+                        and EGroup_GetSpawnedEntityAt(entities, entity_index)
+                        or EGroup_GetEntityAt and EGroup_GetEntityAt(entities, entity_index)
+                        or nil
+                    local entry = candidate and AoE4RPG_GetBlueprintTrackingEntryForEntity
+                        and AoE4RPG_GetBlueprintTrackingEntryForEntity(candidate)
+                        or nil
+                    if candidate and entry and entry.class_name == class_name
+                        and AoE4RPG_ENTITY_TRACKER_TrackEntity(candidate) then
+                        current_entity = candidate
+                        break
+                    end
+                end
+            end
+        end
+
+        if current_entity then
+            tracker.class_rebind_pending[class_name] = nil
+            tracker.class_rebind_attempts[class_name] = nil
+        else
+            tracker.class_rebind_attempts[class_name] =
+                (tracker.class_rebind_attempts[class_name] or 0) + 1
+            if tracker.class_rebind_attempts[class_name] >= 16 then
+                tracker.class_rebind_pending[class_name] = nil
+                tracker.class_rebind_attempts[class_name] = nil
+            else
+                still_pending = true
+            end
+        end
+    end
+
+    if not still_pending and tracker.class_rebind_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_ENTITY_TRACKER_MonitorClassRebind)
+        tracker.class_rebind_monitor_registered = false
+    end
+end
+
+-- Scans one synchronized player entity group.
+function AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player)
+    if AoE4RPG_RUNTIME_GetPlayerHandle then
+        player = AoE4RPG_RUNTIME_GetPlayerHandle(player)
+    end
+    if not player or not Player_GetEntities or not EGroup_CountSpawned then
+        return false
+    end
+    -- World_GetPlayerAt returns the engine Player* handle.
+    local entities = Player_GetEntities(player)
+    if not entities then
+        return false
+    end
+
+    -- IMPORTANT: Cache the cheap roster count for the compatibility monitor.
+    -- IMPORTANT: Build and spawn events still take the immediate path; the monitor only performs a full fallback scan when a player's roster has actually changed.
+    local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+    if player_id then
+        AoE4RPG.ENTITY_TRACKER.last_owned_entity_count_by_player[player_id] =
+            EGroup_CountSpawned(entities)
+    end
+
+    local entity_ids = {}
+    if EGroup_ForEach then
+        EGroup_ForEach(entities, function(group_id, index, entity)
+            local entity_id = AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+            if entity_id then
+                table.insert(entity_ids, entity_id)
+            end
+        end)
+    else
+        for entity_index = 1, EGroup_CountSpawned(entities) do
+            local entity = EGroup_GetSpawnedEntityAt
+                and EGroup_GetSpawnedEntityAt(entities, entity_index)
+                or EGroup_GetEntityAt and EGroup_GetEntityAt(entities, entity_index)
+                or nil
+            local entity_id = AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+            if entity_id then
+                table.insert(entity_ids, entity_id)
+            end
+        end
+    end
+    table.sort(entity_ids)
+    local previous_entity_id = nil
+    for _, entity_id in ipairs(entity_ids) do
+        if entity_id ~= previous_entity_id then
+            local entity = Entity_FromID and Entity_FromID(entity_id) or nil
+            if entity then
+                AoE4RPG_ENTITY_TRACKER_TrackEntity(entity, player)
+            end
+            previous_entity_id = entity_id
+        end
+    end
+    return true
+end
+
+function AoE4RPG_ENTITY_TRACKER_ScanExistingLocalPlayerEntities()
+    if not AoE4RPG_ENTITY_TRACKER_ResolveLocalPlayer() then
+        return false
+    end
+    local scanned = false
+    for _, player in ipairs(AoE4RPG_ENTITY_TRACKER_GetWorldPlayers()) do
+        if not AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(player) then
+            scanned = AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player) or scanned
+        end
+    end
+
+    -- These calls are presentation-only and retain their local-player behavior.
+    if AoE4RPG_UI_RefreshHeroProgress then
+        AoE4RPG_UI_RefreshHeroProgress()
+    end
+    if AoE4RPG_UI_UpdateSelectionState then
+        AoE4RPG_UI_UpdateSelectionState(true)
+    end
+    return scanned
+end
+
+-- Scans configured hero and elite blueprints that map-INI start conditions may omit from Player_GetEntities.
+-- IMPORTANT: TrackEntity remains the authority for owner, civilization, role, and slot validation.
+function AoE4RPG_ENTITY_TRACKER_ScanConfiguredMapEntities()
+    if not World_GetAllEntities or not EGroup_CreateUnique or not EGroup_ForEach
+        or not AoE4RPG_GetBlueprintTrackingEntryForEntity then
+        return false
+    end
+    local candidates = EGroup_CreateUnique("AoE4RPG_MapConfiguredEntityScan")
+    if not candidates then
+        return false
+    end
+    World_GetAllEntities(candidates)
+    local tracked = false
+    EGroup_ForEach(candidates, function(_, _, entity)
+        if entity then
+            local entry = AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+            if entry and (entry.role == "heroes" or entry.role == "elites") then
+                tracked = AoE4RPG_ENTITY_TRACKER_TrackEntity(entity) or tracked
+            end
+        end
+    end)
+    if EGroup_Destroy then
+        EGroup_Destroy(candidates)
+    end
+    return tracked
+end
+
+-- Performs one aggressive exact-blueprint scan for Jeanne only.
+-- IMPORTANT: This is a bounded fallback for native spawns that are omitted from a player's normal entity group.
+function AoE4RPG_ENTITY_TRACKER_ScanJeanneBlueprints()
+    if AoE4RPG.ENTITY_TRACKER.civilization ~= "french_ha_01" then
+        return false
+    end
+    if not World_GetAllEntities or not EGroup_CreateUnique or not EGroup_ForEach then
+        return false
+    end
+    local candidates = EGroup_CreateUnique("AoE4RPG_JeanneBlueprintScan")
+    if not candidates then
+        return false
+    end
+    World_GetAllEntities(candidates)
+    local tracked = false
+    EGroup_ForEach(candidates, function(_, _, entity)
+        if entity then
+            local blueprint_name = AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(entity)
+            if blueprint_name
+                and AoE4RPG_JEANNE_COMBAT_PATH_BY_BLUEPRINT
+                and AoE4RPG_JEANNE_COMBAT_PATH_BY_BLUEPRINT[blueprint_name]
+                and AoE4RPG_ENTITY_TRACKER_TrackEntity(entity) then
+                tracked = true
+            end
+        end
+    end)
+    if EGroup_Destroy then
+        EGroup_Destroy(candidates)
+    end
+    if tracked then
+        if AoE4RPG.ENTITY_TRACKER.special_respawn_pending_by_class.ranger
+            and AoE4RPG_ENTITY_TRACKER_CompleteSpecialRespawnForClass then
+            AoE4RPG_ENTITY_TRACKER_CompleteSpecialRespawnForClass("ranger")
+        end
+        if AoE4RPG_UI_RefreshHeroProgress then
+            AoE4RPG_UI_RefreshHeroProgress()
+        end
+        if AoE4RPG_UI_UpdateSelectionState then
+            AoE4RPG_UI_UpdateSelectionState(true)
+        end
+    end
+    return tracked
+end
+
+-- Performs one aggressive exact-blueprint scan for Mongol Khan.
+-- IMPORTANT: Golden Horde Khan has no respawn rule, so this is used for map-start materialization only.
+function AoE4RPG_ENTITY_TRACKER_ScanKhanBlueprints()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local khan_blueprints = AoE4RPG_KHAN_BLUEPRINTS_BY_CIVILIZATION
+        and AoE4RPG_KHAN_BLUEPRINTS_BY_CIVILIZATION[tracker.civilization]
+        or nil
+    if not khan_blueprints then
+        return false
+    end
+    if not World_GetAllEntities or not EGroup_CreateUnique or not EGroup_ForEach then
+        return false
+    end
+    local candidates = EGroup_CreateUnique("AoE4RPG_KhanBlueprintScan")
+    if not candidates then
+        return false
+    end
+    World_GetAllEntities(candidates)
+    local tracked = false
+    EGroup_ForEach(candidates, function(_, _, entity)
+        if entity then
+            local blueprint_name = AoE4RPG_ENTITY_TRACKER_GetEntityBlueprintName(entity)
+            if blueprint_name
+                and khan_blueprints[blueprint_name]
+                and AoE4RPG_ENTITY_TRACKER_TrackEntity(entity) then
+                tracked = true
+            end
+        end
+    end)
+    if EGroup_Destroy then
+        EGroup_Destroy(candidates)
+    end
+    if tracked then
+        if AoE4RPG_UI_RefreshHeroProgress then
+            AoE4RPG_UI_RefreshHeroProgress()
+        end
+        if AoE4RPG_UI_UpdateSelectionState then
+            AoE4RPG_UI_UpdateSelectionState(true)
+        end
+    end
+    return tracked
+end
+
+-- Returns the live Mongol capital Town Center position when the landmark has moved or packed.
+-- IMPORTANT: Non-Mongol civilizations use their synchronized player starting position.
+function AoE4RPG_ENTITY_TRACKER_GetStartupScanPosition(player, civilization)
+    if not player or not Player_GetStartingPosition then
+        return nil
+    end
+    local starting_position = Player_GetStartingPosition(player)
+    if civilization ~= "mongol" and civilization ~= "mongol_ha_gol" then
+        return starting_position
+    end
+
+    local town_center_entity_ids = {}
+    local seen_entity_ids = {}
+    local function add_entity(entity)
+        local entity_id = AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+        if entity_id and not seen_entity_ids[entity_id] then
+            seen_entity_ids[entity_id] = true
+            table.insert(town_center_entity_ids, entity_id)
+        end
+    end
+
+    -- The unpacked landmark is a building entity.
+    if Player_GetEntitiesFromType and EGroup_ForEach then
+        for _, town_center_type in ipairs({
+            "town_center_capital",
+            "town_center_capital_moving",
+        }) do
+            local town_center_entities = Player_GetEntitiesFromType(
+                player,
+                town_center_type
+            )
+            if town_center_entities then
+                EGroup_ForEach(town_center_entities, function(_, _, entity)
+                    add_entity(entity)
+                end)
+            end
+        end
+    end
+
+    -- The packed Mongol landmark is represented by a squad.
+    if Player_GetSquadsFromType and SGroup_ForEach and Squad_GetFirstEntity then
+        for _, town_center_type in ipairs({
+            "town_center_capital_moving",
+            "town_center_capital",
+        }) do
+            local town_center_squads = Player_GetSquadsFromType(
+                player,
+                town_center_type
+            )
+            if town_center_squads then
+                SGroup_ForEach(town_center_squads, function(_, _, squad)
+                    add_entity(Squad_GetFirstEntity(squad))
+                end)
+            end
+        end
+    end
+
+    table.sort(town_center_entity_ids)
+    for _, entity_id in ipairs(town_center_entity_ids) do
+        local entity = AoE4RPG_RUNTIME_GetLiveEntity
+            and AoE4RPG_RUNTIME_GetLiveEntity(entity_id)
+            or Entity_FromID and Entity_FromID(entity_id)
+            or nil
+        if entity and Entity_GetPosition then
+            return Entity_GetPosition(entity)
+        end
+    end
+    return starting_position
+end
+
+-- Performs one bounded map-start census around each player's own spawn origin.
+-- IMPORTANT: Exact registered hero and elite blueprints remain authoritative.
+function AoE4RPG_ENTITY_TRACKER_ScanRegisteredStartupEntities()
+    if not World_GetSquadsNearPoint or not SGroup_CreateUnique
+        or not SGroup_ForEach or not Squad_GetFirstEntity
+        or not AoE4RPG_GetBlueprintTrackingEntryForEntity then
+        return false
+    end
+
+    local tracked = false
+    for _, player in ipairs(AoE4RPG_ENTITY_TRACKER_GetWorldPlayers()) do
+        local civilization = AoE4RPG_ENTITY_TRACKER_GetPlayerCivilization(
+            player,
+            "default"
+        )
+        local scan_position = AoE4RPG_ENTITY_TRACKER_GetStartupScanPosition(
+            player,
+            civilization
+        )
+        if scan_position then
+            local candidate_squads = SGroup_CreateUnique(
+                "AoE4RPG_StartupRegisteredSquads"
+            )
+            if candidate_squads then
+                World_GetSquadsNearPoint(
+                    player,
+                    candidate_squads,
+                    scan_position,
+                    40,
+                    OT_Player
+                )
+                local candidate_entity_ids = {}
+                local seen_entity_ids = {}
+                SGroup_ForEach(candidate_squads, function(_, _, squad)
+                    local entity = Squad_GetFirstEntity(squad)
+                    local entity_id = AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+                    if entity_id and not seen_entity_ids[entity_id] then
+                        seen_entity_ids[entity_id] = true
+                        table.insert(candidate_entity_ids, entity_id)
+                    end
+                end)
+                table.sort(candidate_entity_ids)
+                for _, entity_id in ipairs(candidate_entity_ids) do
+                    local entity = AoE4RPG_RUNTIME_GetLiveEntity
+                        and AoE4RPG_RUNTIME_GetLiveEntity(entity_id)
+                        or Entity_FromID and Entity_FromID(entity_id)
+                        or nil
+                    local entry = entity
+                        and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+                        or nil
+                    if entry and (entry.role == "heroes" or entry.role == "elites") then
+                        if AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(player) then
+                            if AoE4RPG_AI_TrackEntity then
+                                tracked = AoE4RPG_AI_TrackEntity(entity, player) or tracked
+                            end
+                        else
+                            tracked = AoE4RPG_ENTITY_TRACKER_TrackEntity(
+                                entity,
+                                player
+                            ) or tracked
+                        end
+                    end
+                end
+                if SGroup_Destroy then
+                    SGroup_Destroy(candidate_squads)
+                end
+            end
+        end
+    end
+    return tracked
+end
+
+-- Runs a short retry window after a Jeanne respawn event.
+-- IMPORTANT: No interval performs a world scan; retries stop after the entity has materialized or the bounded attempts end.
+function AoE4RPG_ENTITY_TRACKER_RunJeanneScan()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    tracker.jeanne_scan_scheduled = false
+    if tracker.civilization ~= "french_ha_01" then
+        tracker.jeanne_scan_attempts_remaining = 0
+        return false
+    end
+    local tracked = AoE4RPG_ENTITY_TRACKER_ScanJeanneBlueprints()
+    tracker.jeanne_scan_attempts_remaining = math.max(
+        0,
+        (tracker.jeanne_scan_attempts_remaining or 0) - 1
+    )
+    if not tracked and tracker.jeanne_scan_attempts_remaining > 0 and Rule_AddOneShot then
+        tracker.jeanne_scan_scheduled = true
+        Rule_AddOneShot(AoE4RPG_ENTITY_TRACKER_RunJeanneScan, 0.125)
+    elseif not tracked and tracker.jeanne_scan_attempts_remaining <= 0 then
+        -- IMPORTANT: End the temporary respawn watcher after the bounded window; the roster-count recovery remains available for late materialization.
+        tracker.special_respawn_pending_by_class.ranger = nil
+        tracker.special_respawn_entity_scan_enabled_by_class.ranger = nil
+        AoE4RPG_ENTITY_TRACKER_StopSpecialRespawnMonitorIfIdle()
+    end
+    return tracked
+end
+
+-- Starts one bounded exact-blueprint scan window for Jeanne.
+function AoE4RPG_ENTITY_TRACKER_ScheduleJeanneScan()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if tracker.civilization ~= "french_ha_01" or tracker.jeanne_scan_scheduled then
+        return false
+    end
+    tracker.jeanne_scan_attempts_remaining = 8
+    if Rule_AddOneShot then
+        tracker.jeanne_scan_scheduled = true
+        Rule_AddOneShot(AoE4RPG_ENTITY_TRACKER_RunJeanneScan, 0.05)
+    else
+        tracker.jeanne_scan_attempts_remaining = 1
+        return AoE4RPG_ENTITY_TRACKER_RunJeanneScan()
+    end
+    return true
+end
+
+-- IMPORTANT: Runs the one map-start scan after native starting conditions have finished materializing their squads.
+-- IMPORTANT: This is deliberately separate from the HUD selection path: selecting a hero must not be the event that discovers it.
+function AoE4RPG_ENTITY_TRACKER_RunStartupScan()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    tracker.startup_scan_scheduled = false
+    -- IMPORTANT: This scan is a synchronized gameplay recovery pass, so it must not be skipped because the local player's class slots happen to be full.
+    local scan_result = AoE4RPG_ENTITY_TRACKER_ScanRegisteredStartupEntities()
+    tracker.startup_scan_attempts_remaining = math.max(
+        0,
+        (tracker.startup_scan_attempts_remaining or 0) - 1
+    )
+    if tracker.startup_scan_attempts_remaining > 0
+        and Rule_AddOneShot then
+        tracker.startup_scan_scheduled = true
+        Rule_AddOneShot(AoE4RPG_ENTITY_TRACKER_RunStartupScan, 0.25)
+    end
+    return scan_result
+end
+
+-- IMPORTANT: Runs one census after map-start civilization squads have materialized.
+-- Normal production and spawn events handle later heroes and elites.
+-- IMPORTANT: UI selection remains a fallback, not a prerequisite.
+function AoE4RPG_ENTITY_TRACKER_ScheduleStartupScan()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    -- IMPORTANT: Player handles may not exist when OnInit/Initialize first runs.
+    -- Schedule the callback anyway so it can resolve the player after map-INI entities materialize.
+    if tracker.startup_scan_scheduled then
+        return false
+    end
+    -- IMPORTANT: Run one deferred pass after map-INI entities materialize.
+    -- Avoid repeated player-area scans during the opening seconds.
+    tracker.startup_scan_attempts_remaining = 1
+    if Rule_AddOneShot then
+        tracker.startup_scan_scheduled = true
+        Rule_AddOneShot(AoE4RPG_ENTITY_TRACKER_RunStartupScan, 0.25)
+    else
+        tracker.startup_scan_attempts_remaining = 1
+        AoE4RPG_ENTITY_TRACKER_RunStartupScan()
+    end
+    return true
+end
+
+-- Resolves units whose production event fires before its spawnedSquad payload becomes usable.
+-- IMPORTANT: The scan is local-player-only and debounced, so ordinary production remains event-driven rather than becoming a continuous poll.
+function AoE4RPG_ENTITY_TRACKER_RecoverProducedLocalEntity()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    tracker.production_recovery_scheduled = false
+    local scan_result = false
+    scan_result = AoE4RPG_ENTITY_TRACKER_ScanExistingLocalPlayerEntities()
+    tracker.production_recovery_attempts_remaining = math.max(
+        0,
+        (tracker.production_recovery_attempts_remaining or 0) - 1
+    )
+    -- Spawn-extension units can exist before their final entity and player owner are visible.
+    if tracker.production_recovery_attempts_remaining > 0
+        and Rule_AddOneShot then
+        tracker.production_recovery_scheduled = true
+        Rule_AddOneShot(AoE4RPG_ENTITY_TRACKER_RecoverProducedLocalEntity, 0.25)
+    end
+    return scan_result
+end
+
+function AoE4RPG_ENTITY_TRACKER_ScheduleProducedEntityRecovery()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if tracker.production_recovery_scheduled
+        or not AoE4RPG_ENTITY_TRACKER_ResolveLocalPlayer() then
+        return false
+    end
+    tracker.production_recovery_scheduled = true
+    tracker.production_recovery_attempts_remaining = 4
+    if Rule_AddOneShot then
+        Rule_AddOneShot(AoE4RPG_ENTITY_TRACKER_RecoverProducedLocalEntity, 0.125)
+    else
+        tracker.production_recovery_attempts_remaining = 1
+        AoE4RPG_ENTITY_TRACKER_RecoverProducedLocalEntity()
+    end
+    return true
+end
+
+-- IMPORTANT: Some civilization-specific production systems do not expose a usable spawnedSquad in either completion event.
+-- IMPORTANT: The authoritative TrackEntity checks still reject ordinary units, so this monitor cannot pull neutral map resources into the entity tracker.
+function AoE4RPG_ENTITY_TRACKER_MonitorProducibleLocalEntities()
+    if not AoE4RPG_ENTITY_TRACKER_ResolveLocalPlayer() then
+        return false
+    end
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local scanned = false
+    for _, player in ipairs(AoE4RPG_ENTITY_TRACKER_GetWorldPlayers()) do
+        if not AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(player)
+            and Player_GetEntities and EGroup_CountSpawned then
+            local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+            local entities = Player_GetEntities(player)
+            local current_count = entities and EGroup_CountSpawned(entities) or 0
+            local previous_count = player_id
+                and tracker.last_owned_entity_count_by_player[player_id]
+                or nil
+            -- IMPORTANT: Only roster growth can introduce an undiscovered hero or elite.
+            -- Construction cancellation and ordinary deaths only lower the count, so update the cache without enumerating and sorting the full player roster.
+            if player_id and (previous_count == nil or current_count > previous_count) then
+                scanned = AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player) or scanned
+            elseif player_id and current_count < previous_count then
+                tracker.last_owned_entity_count_by_player[player_id] = current_count
+            end
+        end
+    end
+    if scanned and AoE4RPG_UI_RefreshHeroProgress then
+        AoE4RPG_UI_RefreshHeroProgress()
+    end
+    return scanned
+end
+
+-- Global GE_BuildItemComplete callback.
+function AoE4RPG_ENTITY_TRACKER_OnBuildItemComplete(context)
+    if AoE4RPG_CLASS_MarkCommanderRegenerationAuraDirty then
+        AoE4RPG_CLASS_MarkCommanderRegenerationAuraDirty()
+    end
+    if AoE4RPG_EFFECT_LIST_ApplySpawnedUnitEffects then
+        AoE4RPG_EFFECT_LIST_ApplySpawnedUnitEffects(context)
+    end
+    if AoE4RPG_ApplyTechnicianProducedUnitBonus then
+        AoE4RPG_ApplyTechnicianProducedUnitBonus(context)
+    end
+
+    if not context or not context.player
+        or not AoE4RPG_ENTITY_TRACKER_ResolveLocalPlayer() then
+        return
+    end
+
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local context_player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(context.player)
+    if not context_player_id
+        or AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(context.player) then
+        return
+    end
+    if not context.spawnedSquad or not Squad_GetFirstEntity then
+        -- Human tracking is event-driven; an unusable payload is not expanded into a roster scan.
+        return
+    end
+
+    local entity = Squad_GetFirstEntity(context.spawnedSquad)
+    local tracked = entity and AoE4RPG_ENTITY_TRACKER_TrackEntity(entity, context.player)
+    if tracked then
+        if context_player_id == tracker.local_player_id
+            and AoE4RPG_UI_RefreshHeroProgress then
+            AoE4RPG_UI_RefreshHeroProgress()
+        end
+        if context_player_id == tracker.local_player_id
+            and AoE4RPG_UI_UpdateSelectionState then
+            AoE4RPG_UI_UpdateSelectionState(true)
+        end
+    end
+end
+
+-- Gives GE_SpawnActionComplete its own globally unique rule callback name.
+function AoE4RPG_ENTITY_TRACKER_OnSpawnActionComplete(context)
+    AoE4RPG_ENTITY_TRACKER_OnBuildItemComplete(context)
+end
+
+-- Remove dead tracker.
+-- And reopen slots.
+function AoE4RPG_ENTITY_TRACKER_OnEntityKilled(context)
+    if not context then
+        return false
+    end
+    local victim = context.victim or context.entity
+    local entity_id = victim and (victim.EntityID or victim) or nil
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if AoE4RPG_CLASS_MarkCommanderRegenerationAuraDirty then
+        AoE4RPG_CLASS_MarkCommanderRegenerationAuraDirty()
+    end
+
+    -- IMPORTANT: Native-XP records use the live EntityID and must be removed before buyback replaces it.
+    if entity_id and AoE4RPG.NATIVE_EXPERIENCE_ENTITY_IDS then
+        AoE4RPG.NATIVE_EXPERIENCE_ENTITY_IDS[entity_id] = nil
+    end
+
+    local record = entity_id and tracker.tracked_entity_records[entity_id] or nil
+    if not record then
+        return false
+    end
+
+    -- IMPORTANT: Weapon modifiers are entity-scoped and must be rebuilt after a death.
+    -- IMPORTANT: Remove their known IDs while the killed entity is still addressable and force the restored record to rebuild them even if the EntityID is reused.
+    local killed_unit_data = AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[entity_id] or nil
+    if AoE4RPG_BONUS_INDICATOR_RemoveEntity then
+        AoE4RPG_BONUS_INDICATOR_RemoveEntity(entity_id)
+    end
+    if killed_unit_data then
+        if AoE4RPG_EFFECTS_StopMeleeAttackMoveHunt then
+            AoE4RPG_EFFECTS_StopMeleeAttackMoveHunt(entity_id)
+        end
+        if AoE4RPG_EFFECT_LIST_ResetSameTargetDamageStacks then
+            AoE4RPG_EFFECT_LIST_ResetSameTargetDamageStacks(entity_id, killed_unit_data)
+        end
+        if AoE4RPG_CLASS_RemoveEntityModifiers then
+            AoE4RPG_CLASS_RemoveEntityModifiers(entity_id, killed_unit_data)
+        end
+        if Modifier_Remove then
+            for _, modifier_id in ipairs(killed_unit_data.random_bonus_modifier_ids or {}) do
+                if modifier_id then
+                    Modifier_Remove(modifier_id)
+                end
+            end
+            for _, modifier_id in ipairs(killed_unit_data.critical_hit_enable_modifier_ids or {}) do
+                if modifier_id then
+                    Modifier_Remove(modifier_id)
+                end
+            end
+        end
+        killed_unit_data.random_bonus_modifier_ids = {}
+        killed_unit_data.random_bonus_force_reapply = true
+        killed_unit_data.critical_hit_enable_modifier_ids = {}
+        killed_unit_data.critical_hits_enabled = false
+        killed_unit_data.critical_hits_enabled_entity_id = nil
+        killed_unit_data.critical_hits_enabled_blueprint_name = nil
+    end
+
+    tracker.tracked_entity_ids[entity_id] = nil
+    tracker.tracked_entity_records[entity_id] = nil
+    AoE4RPG_ENTITY_TRACKER_MarkTrackedEntityOrderDirty()
+    if AoE4RPG_CLASS_SLOTS_RemoveEntity and record.class_slot_key then
+        local retain_class_slot = record.role == "heroes"
+            and not record.hired_foreign_hero
+        -- IMPORTANT: Death removes the live entity count even when its hero class reservation remains occupied for replacement or native respawn.
+        AoE4RPG_CLASS_SLOTS_RemoveEntity(
+            record.class_slot_key,
+            retain_class_slot,
+            record.player_id
+        )
+    end
+    if AoE4RPG_CLASS_UnregisterEntity then
+        AoE4RPG_CLASS_UnregisterEntity(entity_id)
+    end
+    if record.role == "heroes" and record.class_name and not record.hired_foreign_hero then
+        local retired_unit_data = AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[entity_id] or nil
+        local hero_state_key = AoE4RPG_ENTITY_TRACKER_GetHeroStateKey(
+            record.player_id,
+            record.class_name
+        )
+        if hero_state_key then
+            tracker.retired_hero_unit_data_by_player_class[hero_state_key] = retired_unit_data
+        end
+        if record.player_id == tracker.local_player_id then
+            tracker.retired_hero_unit_data_by_class[record.class_name] = retired_unit_data
+        end
+        local player_hero_key = AoE4RPG_ENTITY_TRACKER_GetHeroStateKey(
+            record.player_id,
+            record.class_name
+        )
+        tracker.tracked_hero_entity_by_player_class[player_hero_key] = nil
+        if record.player_id == tracker.local_player_id then
+            tracker.tracked_hero_entity_by_class[record.class_name] = nil
+        end
+        if record.player_id == tracker.local_player_id then
+            local elite_limit_key = AoE4RPG_GetEliteTrackingLimitKey(record.class_name)
+            local remaining_elites = tracker.tracked_elite_count_by_limit_key[elite_limit_key] or 0
+            tracker.hero_class_remaining_checks[record.class_name] = remaining_elites > 0 and 0 or 1
+            if AoE4RPG_ENTITY_TRACKER_BeginSpecialRespawnForClass then
+                AoE4RPG_ENTITY_TRACKER_BeginSpecialRespawnForClass(record.class_name)
+            end
+        end
+    elseif record.role == "elites" and record.elite_limit_key then
+        local player_counts = tracker.tracked_elite_count_by_player_limit[record.player_id]
+        if player_counts then
+            player_counts[record.elite_limit_key] = math.max(
+                0,
+                (player_counts[record.elite_limit_key] or 0) - 1
+            )
+        end
+        if record.player_id == tracker.local_player_id then
+            local tracked_count = tracker.tracked_elite_count_by_limit_key[record.elite_limit_key] or 0
+            local remaining_elites = math.max(0, tracked_count - 1)
+            tracker.tracked_elite_count_by_limit_key[record.elite_limit_key] = remaining_elites
+        end
+    end
+
+    if AoE4RPG_UI_RefreshHeroProgress then
+        AoE4RPG_UI_RefreshHeroProgress()
+    end
+    if AoE4RPG_UI_UpdateSelectionState then
+        AoE4RPG_UI_UpdateSelectionState(true)
+    end
+    return true
+end
+
+-- IMPORTANT: Returns the local civilization's native respawn rule only when it belongs to the requested class.
+-- Other civilizations and classes use production events.
+function AoE4RPG_ENTITY_TRACKER_GetSpecialRespawnRule(class_name)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local respawn_rule = AoE4RPG_SPECIAL_RESPAWN_RULES
+        and AoE4RPG_SPECIAL_RESPAWN_RULES[tracker.civilization]
+        or nil
+    if not respawn_rule or respawn_rule.class_name ~= class_name then
+        return nil
+    end
+    return respawn_rule
+end
+
+-- IMPORTANT: Resolves the configured special-respawn abilities once so the global ability event never performs repeated blueprint database lookups during gameplay.
+function AoE4RPG_ENTITY_TRACKER_CacheSpecialRespawnExecutedAbilityBlueprints()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    tracker.special_respawn_executed_ability_blueprints = {}
+    if not BP_GetAbilityBlueprint then
+        return false
+    end
+
+    for civilization, respawn_rule in pairs(AoE4RPG_SPECIAL_RESPAWN_RULES or {}) do
+        for _, ability_blueprint_name in ipairs(respawn_rule.executed_ability_blueprints or {}) do
+            local ability_blueprint = BP_GetAbilityBlueprint(ability_blueprint_name)
+            if ability_blueprint then
+                table.insert(tracker.special_respawn_executed_ability_blueprints, {
+                    ability_blueprint = ability_blueprint,
+                    civilization = civilization,
+                    class_name = respawn_rule.class_name,
+                })
+            end
+        end
+    end
+    return #tracker.special_respawn_executed_ability_blueprints > 0
+end
+
+-- IMPORTANT: Returns the special respawn entry whose cached ability blueprint matches the GE_AbilityExecuted context.
+function AoE4RPG_ENTITY_TRACKER_GetSpecialRespawnEntryForExecutedAbility(ability_blueprint)
+    if not ability_blueprint then
+        return nil
+    end
+    for _, ability_entry in ipairs(
+        AoE4RPG.ENTITY_TRACKER.special_respawn_executed_ability_blueprints or {}
+    ) do
+        if ability_blueprint == ability_entry.ability_blueprint then
+            return ability_entry
+        end
+    end
+    return nil
+end
+
+-- Converts a GE_AbilityExecuted executor into a live Entity handle.
+-- IMPORTANT: Ability events can also carry a Player wrapper table, so every native Entity API must use this resolver instead of passing context.executer directly.
+function AoE4RPG_ENTITY_TRACKER_GetAbilityExecutingEntity(executer)
+    if not executer then
+        return nil
+    end
+
+    local entity_id = nil
+    if type(executer) == "number" then
+        entity_id = executer
+    elseif type(executer) == "table" and type(executer.EntityID) == "number" then
+        entity_id = executer.EntityID
+    elseif scartype and ST_ENTITY and scartype(executer) == ST_ENTITY then
+        -- IMPORTANT: Some hosts expose an opaque Entity directly instead of the serialized { EntityID = ... } event wrapper.
+        -- IMPORTANT: It is already safe for native APIs.
+        return executer
+    else
+        return nil
+    end
+
+    if Entity_IsValid and not Entity_IsValid(entity_id) then
+        return nil
+    end
+    if Entity_FromID then
+        return Entity_FromID(entity_id)
+    end
+    -- IMPORTANT: Compatibility fallback for hosts that omit Entity_FromID but identify the original executor as a native Entity rather than a plain Lua table.
+    if scartype and ST_ENTITY and scartype(executer) == ST_ENTITY then
+        return executer
+    end
+    return nil
+end
+
+-- Resolves the player that executed an entity ability.
+-- Jeanne's buyback is owned by the Capital Town Center, so context.executer is expected to be an entity.
+-- Unknown executer types are rejected to keep the global event local.
+function AoE4RPG_ENTITY_TRACKER_GetAbilityExecutingPlayerIdentifier(context)
+    if not context then
+        return nil
+    end
+    if context.player then
+        return AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(context.player)
+    end
+    local executed_entity = AoE4RPG_ENTITY_TRACKER_GetAbilityExecutingEntity(
+        context.executer
+    )
+    if not executed_entity then
+        return nil
+    end
+    -- World-owned entities are neutral/ownerless.
+    -- Player-owner APIs are valid only when this check is false.
+    if World_OwnsEntity and World_OwnsEntity(executed_entity) then
+        return nil
+    end
+    if AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner then
+        return AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(
+            AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(executed_entity)
+        )
+    end
+    return nil
+end
+
+-- IMPORTANT: GE_AbilityExecuted callback for early native respawns such as Jeanne's buyback.
+-- It returns true only when the event belongs to the local pending hero and the buyback was recognized.
+function AoE4RPG_ENTITY_TRACKER_OnAbilityExecuted(context)
+    local executed_entity = context and context.executer or nil
+    local executed_entity_handle =
+        AoE4RPG_ENTITY_TRACKER_GetAbilityExecutingEntity(executed_entity)
+    -- IMPORTANT: Destroying an Ovoo is an executed entity ability that returns the same EntityID to world ownership.
+    -- IMPORTANT: Queue a delayed economy pass after the native conversion so its stone amount and cap can be restored for the deposit.
+    if executed_entity_handle
+        and AoE4RPG_ECONOMIC_BLUEPRINTS_IsRegisteredOvoo
+        and AoE4RPG_ECONOMIC_BLUEPRINTS_IsRegisteredOvoo(executed_entity_handle)
+        and AoE4RPG_ECONOMIC_BLUEPRINTS_QueueOvooAdjustment then
+        AoE4RPG_ECONOMIC_BLUEPRINTS_QueueOvooAdjustment(
+            executed_entity_handle,
+            AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier
+        )
+    end
+    -- Point-targeted area abilities have no projectile event to provide an effect marker.
+    if context and executed_entity_handle and context.ability
+        and AoE4RPG_EFFECTS_RegisterAreaAbilityMarker then
+        AoE4RPG_EFFECTS_RegisterAreaAbilityMarker(
+            executed_entity_handle,
+            context.ability,
+            context
+        )
+    end
+    if context and executed_entity_handle and context.ability
+        and AoE4RPG_EFFECTS_ActivateDirectAbilityEffect then
+        AoE4RPG_EFFECTS_ActivateDirectAbilityEffect(
+            executed_entity_handle,
+            context.ability,
+            context
+        )
+    end
+    if context and executed_entity_handle and context.ability
+        and AoE4RPG_CLASS_ChargeHeroAbilityHealthCost then
+        AoE4RPG_CLASS_ChargeHeroAbilityHealthCost(executed_entity_handle, context.ability)
+    end
+    if context and executed_entity_handle and context.ability
+        and Entity_GetPlayerOwner and AoE4RPG_CLASS_ApplyStrategistAbilityEffects then
+        -- Destruction/conversion abilities can execute after an Ovoo has become ownerless.
+        -- IMPORTANT: Never ask the engine for an owner in that state.
+        if not World_OwnsEntity or not World_OwnsEntity(executed_entity_handle) then
+            AoE4RPG_CLASS_ApplyStrategistAbilityEffects(
+                executed_entity_handle,
+                context.ability,
+                AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(executed_entity_handle)
+            )
+        end
+    end
+    if AoE4RPG_CONVERSION_OnAbilityExecuted then
+        AoE4RPG_CONVERSION_OnAbilityExecuted(context)
+    end
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local ability_entry = context and
+        AoE4RPG_ENTITY_TRACKER_GetSpecialRespawnEntryForExecutedAbility(context.ability)
+        or nil
+    if not ability_entry or ability_entry.civilization ~= tracker.civilization then
+        return false
+    end
+
+    local executing_player_id = AoE4RPG_ENTITY_TRACKER_GetAbilityExecutingPlayerIdentifier(context)
+    if not executing_player_id or executing_player_id ~= tracker.local_player_id then
+        return false
+    end
+
+    -- IMPORTANT: Buyback must recover Jeanne even if her initial map-start entity was missed.
+    if not tracker.special_respawn_pending_by_class[ability_entry.class_name] then
+        AoE4RPG_ENTITY_TRACKER_BeginSpecialRespawnForClass(ability_entry.class_name)
+    end
+    tracker.special_respawn_entity_scan_enabled_by_class[ability_entry.class_name] = true
+    if ability_entry.class_name == "ranger" then
+        AoE4RPG_ENTITY_TRACKER_ScheduleJeanneScan()
+    else
+        AoE4RPG_ENTITY_TRACKER_FindAndTrackSpecialRespawnClass(ability_entry.class_name)
+    end
+    return true
+end
+
+-- Scans the local player's entities for one missing special class only.
+-- IMPORTANT: This is intentionally narrower than the one-time startup scan and ignores all other missing classes and regular units after their O(1) blueprint lookup.
+function AoE4RPG_ENTITY_TRACKER_FindAndTrackSpecialRespawnClass(class_name)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if AoE4RPG_ENTITY_TRACKER_GetHeroClassRemainingCheck(class_name) ~= 1
+        or not Player_GetEntities or not EGroup_CountSpawned then
+        return false
+    end
+
+    -- Keep the engine Player* for API calls; local_player_id is comparison-only.
+    local entities = Player_GetEntities(tracker.local_player)
+    if not entities then
+        return false
+    end
+
+    for entity_index = 1, EGroup_CountSpawned(entities) do
+        local entity = nil
+        if EGroup_GetSpawnedEntityAt then
+            entity = EGroup_GetSpawnedEntityAt(entities, entity_index)
+        elseif EGroup_GetEntityAt then
+            entity = EGroup_GetEntityAt(entities, entity_index)
+        end
+        local entity_id = AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+        if entity_id and not tracker.tracked_entity_ids[entity_id] then
+            local entry = AoE4RPG_GetBlueprintTrackingEntryForEntity
+                and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
+                or nil
+            local candidate_class_name = entry and entry.class_name
+                or (AoE4RPG_CLASS_GetClassForEntity and AoE4RPG_CLASS_GetClassForEntity(entity))
+            local is_bodyguard = Entity_IsOfType
+                and Entity_IsOfType(entity, AoE4RPG_BP_BODYGUARD or "bodyguard")
+                or false
+            if candidate_class_name == class_name and not is_bodyguard
+                and AoE4RPG_ENTITY_TRACKER_TrackEntity(entity) then
+                if AoE4RPG_UI_RefreshHeroProgress then
+                    AoE4RPG_UI_RefreshHeroProgress()
+                end
+                if AoE4RPG_UI_UpdateSelectionState then
+                    AoE4RPG_UI_UpdateSelectionState(true)
+                end
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- IMPORTANT: Stops the temporary respawn monitor after every pending special class has been rediscovered.
+-- Production and selection event handlers remain active.
+function AoE4RPG_ENTITY_TRACKER_StopSpecialRespawnMonitorIfIdle()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    for _, is_pending in pairs(tracker.special_respawn_pending_by_class) do
+        if is_pending then
+            return false
+        end
+    end
+    if tracker.special_respawn_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_ENTITY_TRACKER_MonitorSpecialRespawns)
+    end
+    tracker.special_respawn_monitor_registered = false
+    return true
+end
+
+-- IMPORTANT: Clears one class after either its native timer respawn, Jeanne buyback, or a production event has supplied its new entity.
+function AoE4RPG_ENTITY_TRACKER_CompleteSpecialRespawnForClass(class_name)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if not tracker.special_respawn_pending_by_class[class_name] then
+        return false
+    end
+    tracker.special_respawn_pending_by_class[class_name] = nil
+    tracker.special_respawn_entity_scan_enabled_by_class[class_name] = nil
+    if class_name == "ranger" then
+        tracker.jeanne_scan_attempts_remaining = 0
+        tracker.jeanne_scan_scheduled = false
+    end
+    AoE4RPG_ENTITY_TRACKER_StopSpecialRespawnMonitorIfIdle()
+    return true
+end
+
+-- Temporary interval callback.
+-- IMPORTANT: Jeanne and Khan read only their normalized respawn progress until it reaches one.
+-- IMPORTANT: A recognized Jeanne buyback event can enable her entity scan earlier.
+-- Scanning stops once the new hero is found.
+function AoE4RPG_ENTITY_TRACKER_MonitorSpecialRespawns()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    for class_name, is_pending in pairs(tracker.special_respawn_pending_by_class) do
+        if is_pending then
+            local respawn_rule = AoE4RPG_ENTITY_TRACKER_GetSpecialRespawnRule(class_name)
+            if respawn_rule then
+                local scan_enabled = tracker.special_respawn_entity_scan_enabled_by_class[class_name]
+                if not scan_enabled and respawn_rule.scan_mode == "progress_then_scan"
+                    and tracker.local_player
+                    and Player_GetStateModelFloat and respawn_rule.progress_state_model then
+                    local respawn_progress = Player_GetStateModelFloat(
+                        tracker.local_player,
+                        respawn_rule.progress_state_model
+                    ) or 0
+                    if respawn_progress >= (respawn_rule.progress_threshold or 1.0) then
+                        tracker.special_respawn_entity_scan_enabled_by_class[class_name] = true
+                        scan_enabled = true
+                    end
+                end
+                if scan_enabled then
+                    if class_name == "ranger" then
+                        AoE4RPG_ENTITY_TRACKER_ScheduleJeanneScan()
+                    else
+                        AoE4RPG_ENTITY_TRACKER_FindAndTrackSpecialRespawnClass(class_name)
+                    end
+                end
+            end
+        end
+    end
+    AoE4RPG_ENTITY_TRACKER_StopSpecialRespawnMonitorIfIdle()
+end
+
+-- Activates the appropriate temporary monitor after a tracked unique hero dies.
+-- Jeanne and Khan initially monitor only their respective progress states.
+function AoE4RPG_ENTITY_TRACKER_BeginSpecialRespawnForClass(class_name)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    local respawn_rule = AoE4RPG_ENTITY_TRACKER_GetSpecialRespawnRule(class_name)
+    if not respawn_rule then
+        return false
+    end
+
+    tracker.special_respawn_pending_by_class[class_name] = true
+    tracker.special_respawn_entity_scan_enabled_by_class[class_name] =
+        respawn_rule.scan_mode == "immediate"
+    if not tracker.special_respawn_monitor_registered then
+        if Rule_AddInterval then
+            Rule_AddInterval(AoE4RPG_ENTITY_TRACKER_MonitorSpecialRespawns, 0.25)
+            tracker.special_respawn_monitor_registered = true
+        elseif Rule_Add then
+            Rule_Add(AoE4RPG_ENTITY_TRACKER_MonitorSpecialRespawns)
+            tracker.special_respawn_monitor_registered = true
+        end
+    end
+    return tracker.special_respawn_monitor_registered
+end
+
+-- Constant-time tracked-ID membership check used by the selection UI.
+function AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity_id)
+    return entity_id ~= nil
+        and (AoE4RPG.ENTITY_TRACKER.tracked_entity_ids[entity_id] == true
+            or (AoE4RPG_AI_IsTrackedEntityIdentifier
+                and AoE4RPG_AI_IsTrackedEntityIdentifier(entity_id)))
+end
+
+-- IMPORTANT: Checks whether a selected local hero/elite is already tracked.
+-- Selection is local-only and must never create synchronized simulation state.
+function AoE4RPG_ENTITY_TRACKER_TryTrackSelectedLocalEntity(entity)
+    if entity == nil or not AoE4RPG_ENTITY_TRACKER_ResolveLocalPlayer() then
+        return false
+    end
+    if type(entity) == "number" then
+        if Entity_IsValid and not Entity_IsValid(entity) then
+            return false
+        end
+        entity = Entity_FromID and Entity_FromID(entity) or nil
+    end
+    local entity_id = AoE4RPG_ENTITY_TRACKER_GetEntityIdentifier(entity)
+    if entity == nil or not entity_id then
+        return false
+    end
+
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    -- Check the exact local owner before blueprint/civilization resolution.
+    -- IMPORTANT: Allied/enemy hero selection must remain read-only in multiplayer.
+    if not AoE4RPG_ENTITY_TRACKER_IsOwnedByLocalPlayer(entity) then
+        return false
+    end
+    if tracker.tracked_entity_ids[entity_id] then
+        return true
+    end
+    if not AoE4RPG_GetRegisteredHeroEntryForEntity
+        or not AoE4RPG_GetRegisteredHeroEntryForEntity(entity) then
+        return false
+    end
+    return tracker.tracked_entity_ids[entity_id] == true
+end
+
+-- Only track heroes/elites; invalid IDs are ignored until they die.
+function AoE4RPG_ENTITY_TRACKER_ForEachTrackedEntity(callback)
+    if type(callback) ~= "function" then
+        return
+    end
+    -- IMPORTANT: Stable EntityID order keeps monitor-side modifier replacement and any synchronized offer generation identical across multiplayer peers.
+    local entity_ids = AoE4RPG_ENTITY_TRACKER_GetSortedTrackedEntityIdentifiers()
+    for _, entity_id in ipairs(entity_ids) do
+        local entity = Entity_FromID and Entity_FromID(entity_id) or nil
+        if entity and (not Entity_IsValid or Entity_IsValid(entity_id)) then
+            callback(entity, entity_id, AoE4RPG.ENTITY_TRACKER.tracked_entity_records[entity_id])
+        end
+    end
+    if AoE4RPG_AI_ForEachTrackedEntity then
+        AoE4RPG_AI_ForEachTrackedEntity(callback)
+    end
+end
+
+-- Registers the production event once.
+-- IMPORTANT: One time scan apply to OnPlay state.
+function AoE4RPG_ENTITY_TRACKER_Initialize()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if tracker.initialized then
+        return true
+    end
+    tracker.initialized = true
+    AoE4RPG_RebuildBlueprintTrackingLookup()
+    AoE4RPG_ENTITY_TRACKER_ResolveLocalPlayer()
+    AoE4RPG_ENTITY_TRACKER_CacheSpecialRespawnExecutedAbilityBlueprints()
+    if Rule_AddGlobalEvent then
+        Rule_AddGlobalEvent(AoE4RPG_ENTITY_TRACKER_OnBuildItemComplete, GE_BuildItemComplete)
+        tracker.build_event_registered = true
+        if GE_SpawnActionComplete then
+            Rule_AddGlobalEvent(
+                AoE4RPG_ENTITY_TRACKER_OnSpawnActionComplete,
+                GE_SpawnActionComplete
+            )
+            tracker.spawn_event_registered = true
+        end
+        if GE_AbilityExecuted then
+            Rule_AddGlobalEvent(AoE4RPG_ENTITY_TRACKER_OnAbilityExecuted, GE_AbilityExecuted)
+            tracker.ability_event_registered = true
+        end
+    end
+    -- IMPORTANT: Starting civilization heroes do not fire a production event.
+    -- Run the bounded map-start scan once after OnPlay has materialized those entities.
+    AoE4RPG_ENTITY_TRACKER_ScheduleStartupScan()
+    return true
+end
+
+-- Remove module when game ended.
+function AoE4RPG_ENTITY_TRACKER_Shutdown()
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    if tracker.build_event_registered and Rule_RemoveGlobalEvent then
+        Rule_RemoveGlobalEvent(AoE4RPG_ENTITY_TRACKER_OnBuildItemComplete)
+    end
+    if tracker.spawn_event_registered and Rule_RemoveGlobalEvent then
+        Rule_RemoveGlobalEvent(AoE4RPG_ENTITY_TRACKER_OnSpawnActionComplete)
+    end
+    if tracker.ability_event_registered and Rule_RemoveGlobalEvent then
+        Rule_RemoveGlobalEvent(AoE4RPG_ENTITY_TRACKER_OnAbilityExecuted)
+    end
+    if tracker.special_respawn_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_ENTITY_TRACKER_MonitorSpecialRespawns)
+    end
+    if tracker.class_rebind_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_ENTITY_TRACKER_MonitorClassRebind)
+    end
+    if tracker.producible_entity_monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_ENTITY_TRACKER_MonitorProducibleLocalEntities)
+    end
+    tracker.build_event_registered = false
+    tracker.spawn_event_registered = false
+    tracker.ability_event_registered = false
+    tracker.special_respawn_monitor_registered = false
+    tracker.class_rebind_monitor_registered = false
+    tracker.producible_entity_monitor_registered = false
+    tracker.jeanne_scan_scheduled = false
+    tracker.jeanne_scan_attempts_remaining = 0
+    tracker.production_recovery_scheduled = false
+    tracker.production_recovery_attempts_remaining = 0
+    tracker.startup_scan_scheduled = false
+    tracker.startup_scan_attempts_remaining = 0
+    tracker.last_owned_entity_count_by_player = {}
+    tracker.sorted_tracked_entity_ids = {}
+    tracker.tracked_entity_ids_dirty = true
+    tracker.class_rebind_pending = {}
+    tracker.class_rebind_attempts = {}
+    tracker.special_respawn_pending_by_class = {}
+    tracker.special_respawn_entity_scan_enabled_by_class = {}
+    if AoE4RPG_CLASS_SLOTS_Shutdown then
+        AoE4RPG_CLASS_SLOTS_Shutdown()
+    end
+end

@@ -74,10 +74,26 @@ function AoE4RPG_GetUnitData(entity_id)
             is_elite = false,
             critical_hits_enabled = false,
             applied_bracket_upgrades = {},
+            -- Incremented whenever player-visible RPG values change. The hero
+            -- UI compares this small counter instead of rebuilding every tick.
+            ui_revision = 0,
         }
     end
 
     return AoE4RPG.UNIT_DATA[entity_id]
+end
+
+-- Marks one RPG record as changed for the local hero-panel monitor.
+-- Call this after changing experience, level, attributes, or displayed bonuses.
+-- @param unit_data Mutable record returned by AoE4RPG_GetUnitData.
+-- @return The new monotonically increasing UI revision number.
+function AoE4RPG_MarkUnitDataChanged(unit_data)
+    if not unit_data then
+        return 0
+    end
+
+    unit_data.ui_revision = (unit_data.ui_revision or 0) + 1
+    return unit_data.ui_revision
 end
 
 -- This enables native critical-hit handling for one registered RPG unit.
@@ -278,17 +294,20 @@ function AoE4RPG_ApplyDeathPenalty(entity, unit_data)
     if is_hero then
         local xp_loss = math.min(unit_data.exp, math.max(0, math.floor((unit_data.level + 1) * 25)))
         unit_data.exp = math.max(0, unit_data.exp - xp_loss)
+        AoE4RPG_MarkUnitDataChanged(unit_data)
         return
     end
 
     if is_elite then
         unit_data.level = math.max(0, unit_data.level - 1)
         unit_data.exp = 0
+        AoE4RPG_MarkUnitDataChanged(unit_data)
         return
     end
 
     local xp_loss = math.min(unit_data.exp, math.max(0, math.floor(unit_data.exp * 0.25)))
     unit_data.exp = math.max(0, unit_data.exp - xp_loss)
+    AoE4RPG_MarkUnitDataChanged(unit_data)
 end
 
 -- Returns the level bracket step for the current level. Brackets are defined as:
@@ -463,6 +482,7 @@ function AoE4RPG_LevelUp(context)
         attacker_exp = attacker_exp * AoE4RPG_CLASS_GetExpMultiplier(attacker, attacker_data, "attack")
     end
     attacker_data.exp = attacker_data.exp + attacker_exp
+    AoE4RPG_MarkUnitDataChanged(attacker_data)
 
     local attacker_leveled_up, attacker_level_gain = AoE4RPG_CheckAndApplyLevelUp(attacker, attacker_owner, attacker_data, true)
 
@@ -475,6 +495,7 @@ function AoE4RPG_LevelUp(context)
         end
 
         victim_data.exp = victim_data.exp + victim_exp
+        AoE4RPG_MarkUnitDataChanged(victim_data)
         AoE4RPG_CheckAndApplyLevelUp(victim, victim_owner, victim_data, false)
     end
 end
@@ -542,7 +563,10 @@ function AoE4RPG_CheckAndApplyLevelUp(entity, owner, unit_data, grant_bonus)
 
     local max_level = AoE4RPG_GetEffectiveLevelLimit(entity)
     if unit_data.level >= max_level then
-        unit_data.exp = 0
+        if unit_data.exp ~= 0 then
+            unit_data.exp = 0
+            AoE4RPG_MarkUnitDataChanged(unit_data)
+        end
         return false, unit_data.level
     end
 
@@ -591,11 +615,17 @@ function AoE4RPG_CheckAndApplyLevelUp(entity, owner, unit_data, grant_bonus)
             AoE4RPG_PlayLevelUpSound(owner, reached_new_bracket)
         end
 
+        -- Class growth and every displayed reward for this level are complete;
+        -- publish one revision so a selected unit refreshes on the next tick.
+        AoE4RPG_MarkUnitDataChanged(unit_data)
         leveled = true
     end
 
     if unit_data.level >= max_level then
-        unit_data.exp = 0
+        if unit_data.exp ~= 0 then
+            unit_data.exp = 0
+            AoE4RPG_MarkUnitDataChanged(unit_data)
+        end
     end
 
     return leveled, unit_data.level

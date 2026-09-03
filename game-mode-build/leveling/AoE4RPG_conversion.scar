@@ -1,0 +1,638 @@
+-- ================= AoE4RPG Conversion ===============
+-- AoE4RPG Conversion - Conversion Experience tracks conversion events and awards RPG experience.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_core.scar and AoE4RPG_entity_tracker.scar.
+-- ================= AoE4RPG Conversion ===============
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+AoE4RPG.CONVERSION = AoE4RPG.CONVERSION or {
+    initialized = false,
+    monitor_registered = false,
+    pending_casts = {},
+    elapsed_time = 0,
+    idle_monitor_ticks = 0,
+    previous_owner_by_entity_id = {},
+    ability_blueprints = {},
+    ability_blueprint_names = {
+        [192685] = "monk_conversion",
+        [1073743416] = "monk_conversion_shogun",
+        [1073743417] = "monk_conversion_shogun2",
+        [1073743418] = "monk_conversion_shogun3",
+        [1073744781] = "monk_conversion_shogun4",
+        [1073744782] = "monk_conversion_shogun5",
+        [2035316] = "monk_conversion_faith_abb",
+        [1073742658] = "leader_conversion_faith_lowcd",
+    },
+    ability_ranges = {
+        -- monk_conversion.xml: range=24.
+        -- Shogun variants inherit this ability.
+        [192685] = 24,
+        [1073743416] = 24,
+        [1073743417] = 24,
+        [1073743418] = 24,
+        [1073744781] = 24,
+        [1073744782] = 24,
+        -- Reference boon conversion aliases used by the Sengoku.
+        [2158008] = 24,
+        [2158009] = 24,
+        -- monk_conversion_faith_abb.xml: primary ability range= 28.
+        [2035316] = 28,
+        -- Campaign leader conversion inherits the standard conversion range.
+        [1073742658] = 24,
+    },
+    pre_completion_snapshot_seconds = 3.875,
+    snapshot_separation_seconds = 0.25,
+    conversion_window_seconds = 4.25,
+}
+AoE4RPG.CONVERSION.pending_casts = AoE4RPG.CONVERSION.pending_casts or {}
+AoE4RPG.CONVERSION.previous_owner_by_entity_id =
+    AoE4RPG.CONVERSION.previous_owner_by_entity_id or {}
+AoE4RPG.CONVERSION.pre_completion_snapshot_seconds =
+    AoE4RPG.CONVERSION.pre_completion_snapshot_seconds or 3.875
+AoE4RPG.CONVERSION.snapshot_separation_seconds =
+    AoE4RPG.CONVERSION.snapshot_separation_seconds or 0.25
+AoE4RPG.CONVERSION.conversion_window_seconds =
+    AoE4RPG.CONVERSION.conversion_window_seconds or 4.25
+
+-- Ability pbgids and ranges are sourced from the installed Tuning Pack.
+-- Change the values along with the ability XML if its range is modified.
+function AoE4RPG_CONVERSION_Initialize()
+    local conversion = AoE4RPG.CONVERSION
+    if conversion.initialized then
+        return true
+    end
+    conversion.initialized = true
+    return true
+end
+
+function AoE4RPG_CONVERSION_GetAbilityPbgid(ability)
+    local conversion = AoE4RPG.CONVERSION
+    local ability_type = type(ability)
+    if ability_type == "number" then
+        if conversion.ability_ranges[ability] then
+            return ability
+        end
+        return nil
+    end
+    local property_bag_group_id = nil
+    if ability_type == "table" or ability_type == "userdata" then
+        property_bag_group_id = ability.PropertyBagGroupID
+    end
+    if property_bag_group_id and conversion.ability_ranges[property_bag_group_id] then
+        conversion.ability_blueprints[ability] = property_bag_group_id
+        return property_bag_group_id
+    end
+    if ability and conversion.ability_blueprints[ability] then
+        return conversion.ability_blueprints[ability]
+    end
+    return nil
+end
+
+function AoE4RPG_CONVERSION_GetAbilityRange(ability_pbgid)
+    return AoE4RPG.CONVERSION.ability_ranges[ability_pbgid]
+end
+
+-- IMPORTANT: Resolves either an EntityID or an entity handle to the numeric ID used by the tracker.
+function AoE4RPG_CONVERSION_GetEntityID(entity)
+    if AoE4RPG_RUNTIME_GetEntityIdentifier then
+        return AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+    end
+    if type(entity) == "number" then
+        return entity
+    end
+    if not entity then
+        return nil
+    end
+    return entity.EntityID or (Entity_GetID and Entity_GetID(entity)) or nil
+end
+
+-- IMPORTANT: Rehydrates one stored entity ID and rejects IDs that the engine has already invalidated.
+function AoE4RPG_CONVERSION_GetLiveEntity(entity_id)
+    if AoE4RPG_RUNTIME_GetLiveEntity then
+        return AoE4RPG_RUNTIME_GetLiveEntity(entity_id)
+    end
+    if not entity_id or not Entity_FromID then
+        return nil
+    end
+    local entity = Entity_FromID(entity_id)
+    if not entity or (Entity_IsValid and not Entity_IsValid(entity_id)) then
+        return nil
+    end
+    return entity
+end
+
+-- Returns a player owner only for player-owned entities.
+function AoE4RPG_CONVERSION_GetPlayerOwner(entity)
+    if not entity or not Entity_GetPlayerOwner then
+        return nil
+    end
+    if World_OwnsEntity and World_OwnsEntity(entity) then
+        return nil
+    end
+    if AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner then
+        return AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+    end
+    return Entity_GetPlayerOwner(entity)
+end
+
+-- Converts a numeric ability PBGID into the blueprint handle required by Entity_HasAbility and Squad_HasAbility.
+-- The conversion event may expose either representation depending on the event source.
+function AoE4RPG_CONVERSION_GetAbilityBlueprint(ability_pbgid)
+    if type(ability_pbgid) == "number" then
+        local ability_name = AoE4RPG.CONVERSION.ability_blueprint_names[ability_pbgid]
+        if ability_name and AoE4RPG_GetTuningAbilityBlueprint then
+            return AoE4RPG_GetTuningAbilityBlueprint(ability_name)
+        end
+        return nil
+    end
+    return ability_pbgid
+end
+
+-- Checks both places where an AoE4 ability may be attached.
+-- Static squad abilities are common for hero skills, while dynamically added abilities are entity-scoped.
+-- IMPORTANT: This check is used only by the stored-ID fallback.
+function AoE4RPG_CONVERSION_EntityHasAbility(entity, ability)
+    if not entity or not ability then
+        return false
+    end
+    if Entity_HasAbility and Entity_HasAbility(entity, ability) then
+        return true
+    end
+    if Entity_GetSquad and Squad_HasAbility then
+        local squad = Entity_GetSquad(entity)
+        if squad and Squad_HasAbility(squad, ability) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Returns true only while the unit carries one relic.
+-- IMPORTANT: The tuned conversion ability is locked behind Relic_Count = 1.
+function AoE4RPG_CONVERSION_IsCarryingRelic(entity)
+    if not entity or not Entity_GetStateModelFloat then
+        return false
+    end
+    return Entity_GetStateModelFloat(entity, "Relic_Count") == 1
+end
+
+-- Only a tracked RPG hero or elite carrying one relic can earn conversion XP.
+-- IMPORTANT: Native monk tags must not reject registered classes such as Strategist.
+function AoE4RPG_CONVERSION_IsEligibleCaster(entity)
+    local entity_id = AoE4RPG_CONVERSION_GetEntityID(entity)
+    if not entity_id
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+        or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity_id) then
+        return false
+    end
+    entity = AoE4RPG_CONVERSION_GetLiveEntity(entity_id) or entity
+    local record = AoE4RPG.ENTITY_TRACKER
+        and AoE4RPG.ENTITY_TRACKER.tracked_entity_records[entity_id]
+        or nil
+    if not record and AoE4RPG_AI_GetTrackedRecord then
+        record = AoE4RPG_AI_GetTrackedRecord(entity_id)
+    end
+    if not record or (record.role ~= "heroes" and record.role ~= "elites") then
+        return false
+    end
+    if not AoE4RPG_CONVERSION_IsCarryingRelic(entity) then
+        return false
+    end
+    return true
+end
+
+-- Gets the normalized player identifier associated with an ability event.
+-- A player field is preferred because some ability executors are buildings or other non-hero entities.
+function AoE4RPG_CONVERSION_GetContextPlayerIdentifier(context)
+    if context and context.player and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+        return AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(context.player)
+    end
+    local executor_id = context and AoE4RPG_CONVERSION_GetEntityID(context.executer) or nil
+    if executor_id
+        and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+        local executor = AoE4RPG_CONVERSION_GetLiveEntity(executor_id)
+        if executor then
+            local executor_owner = AoE4RPG_CONVERSION_GetPlayerOwner(executor)
+            if executor_owner then
+                return AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(
+                    executor_owner
+                )
+            end
+        end
+    end
+    return nil
+end
+
+-- Searches the entity IDs already registered for every hero/elite class.
+-- IMPORTANT: The ability must be present on the entity or its squad and the owner must match the event player.
+function AoE4RPG_CONVERSION_FindStoredCaster(context, ability_pbgid, ability)
+    local tracker = AoE4RPG.ENTITY_TRACKER
+    ability = ability or AoE4RPG_CONVERSION_GetAbilityBlueprint(ability_pbgid)
+    local expected_owner = AoE4RPG_CONVERSION_GetContextPlayerIdentifier(context)
+    if not tracker or not ability or expected_owner == nil then
+        return nil, nil
+    end
+
+    local candidates = {}
+    local seen_entity_ids = {}
+    local function inspect(entity_id)
+        if not entity_id or seen_entity_ids[entity_id] then
+            return
+        end
+        seen_entity_ids[entity_id] = true
+        local record = tracker.tracked_entity_records[entity_id]
+        if not record or (record.role ~= "heroes" and record.role ~= "elites") then
+            return
+        end
+        local entity = AoE4RPG_CONVERSION_GetLiveEntity(entity_id)
+        if not entity or not AoE4RPG_CONVERSION_EntityHasAbility(entity, ability)
+            or not AoE4RPG_CONVERSION_IsEligibleCaster(entity) then
+            return
+        end
+        local owner = AoE4RPG_CONVERSION_GetPlayerOwner(entity)
+        local owner_identifier = owner and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+            and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(owner)
+            or owner
+        if owner_identifier == expected_owner then
+            table.insert(candidates, { entity = entity, owner = owner })
+        end
+    end
+
+    for _, entity_id in pairs(tracker.tracked_hero_entity_by_class or {}) do
+        inspect(entity_id)
+    end
+    for entity_id in pairs(tracker.tracked_entity_ids or {}) do
+        inspect(entity_id)
+    end
+
+    if #candidates == 1 then
+        return candidates[1].entity, candidates[1].owner
+    end
+    return nil, nil
+end
+
+-- Uses the exact event executor first.
+-- IMPORTANT: If the event exposes a building, player, or another non-tracked executor, the stored class EntityID registry is consulted as a deterministic single-candidate fallback.
+function AoE4RPG_CONVERSION_ResolveCaster(context, ability_pbgid)
+    if not context then
+        return nil, nil
+    end
+    local executor_id = AoE4RPG_CONVERSION_GetEntityID(context.executer)
+    local executor = executor_id and AoE4RPG_CONVERSION_GetLiveEntity(executor_id)
+        or nil
+    if executor and AoE4RPG_CONVERSION_IsEligibleCaster(executor) then
+        local owner = AoE4RPG_CONVERSION_GetPlayerOwner(executor)
+        return executor, owner
+    end
+    return AoE4RPG_CONVERSION_FindStoredCaster(
+        context,
+        ability_pbgid,
+        context.ability
+    )
+end
+
+-- Rehydrates the caster from the ID captured at ability execution time.
+function AoE4RPG_CONVERSION_GetCasterEntity(cast)
+    if not cast then
+        return nil
+    end
+    local caster_id = cast.caster_entity_id
+        or AoE4RPG_CONVERSION_GetEntityID(cast.caster)
+    local caster = caster_id and AoE4RPG_CONVERSION_GetLiveEntity(caster_id) or nil
+    if caster then
+        cast.caster_entity_id = caster_id
+        cast.caster = caster
+    end
+    return caster
+end
+
+function AoE4RPG_CONVERSION_GetElapsedTime()
+    if World_GetGameTime then
+        return World_GetGameTime()
+    end
+    return AoE4RPG.CONVERSION.elapsed_time
+end
+
+function AoE4RPG_CONVERSION_GetDistance(first_entity, second_entity)
+    if not Entity_GetPosition or not Util_GetDistance then
+        return nil
+    end
+    return Util_GetDistance(Entity_GetPosition(first_entity), Entity_GetPosition(second_entity))
+end
+
+function AoE4RPG_CONVERSION_GetExperienceValue(entity)
+    if not Entity_GetHealthMax then
+        return 0
+    end
+    return math.max(0, Entity_GetHealthMax(entity) * 0.5)
+end
+
+function AoE4RPG_CONVERSION_GrantExperience(cast, entity)
+    if not cast or not entity or not AoE4RPG_AddExperience then
+        return false
+    end
+    local caster = AoE4RPG_CONVERSION_GetCasterEntity(cast)
+    local caster_id = caster and AoE4RPG_CONVERSION_GetEntityID(caster) or nil
+    if not caster or not caster_id then
+        return false
+    end
+    local entity_id = AoE4RPG_CONVERSION_GetEntityID(entity)
+    if not entity_id or cast.awarded_entity_ids[entity_id] then
+        return false
+    end
+    local amount = AoE4RPG_CONVERSION_GetExperienceValue(entity)
+    if amount <= 0 then
+        return false
+    end
+    local caster_data = AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[caster_id]
+    if not caster_data then
+        return false
+    end
+    if AoE4RPG_CLASS_GetExpMultiplier then
+        amount = amount * AoE4RPG_CLASS_GetExpMultiplier(
+            caster,
+            caster_data,
+            "conversion"
+        )
+    end
+    AoE4RPG_AddExperience(caster_data, amount, caster_id)
+    if AoE4RPG_CheckAndApplyLevelUp then
+        local caster_owner = AoE4RPG_CONVERSION_GetPlayerOwner(caster)
+            or caster_data.owner
+        AoE4RPG_CheckAndApplyLevelUp(
+            caster,
+            caster_owner,
+            caster_data,
+            true
+        )
+    end
+    cast.awarded_entity_ids[entity_id] = true
+    return true
+end
+
+-- Records a conversion cast after confirming both the ability and its caster.
+function AoE4RPG_CONVERSION_OnAbilityExecuted(context)
+    if not context or not (context.ability or context.ability_pbgid) then
+        return false
+    end
+    local ability_pbgid = AoE4RPG_CONVERSION_GetAbilityPbgid(
+        context.ability_pbgid or context.ability
+    )
+    if not ability_pbgid then
+        return false
+    end
+    local caster, caster_owner = AoE4RPG_CONVERSION_ResolveCaster(context, ability_pbgid)
+    if not caster or not AoE4RPG_CONVERSION_IsEligibleCaster(caster) then
+        return false
+    end
+    if not caster_owner then
+        return false
+    end
+    local caster_entity_id = AoE4RPG_CONVERSION_GetEntityID(caster)
+    if not caster_entity_id then
+        return false
+    end
+    local target_entity = context.target_entity or context.target_entity_id or context.target
+    local target_entity_id = AoE4RPG_CONVERSION_GetEntityID(target_entity)
+    local target_owner = target_entity_id
+        and AoE4RPG_CONVERSION_GetLiveEntity(target_entity_id)
+        and AoE4RPG_CONVERSION_GetPlayerOwner(
+            AoE4RPG_CONVERSION_GetLiveEntity(target_entity_id)
+        )
+        or nil
+    if target_owner and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+        target_owner = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(target_owner)
+    end
+    if not Rule_AddOneShot then
+        return false
+    end
+    local cast = {
+        caster = caster,
+        caster_entity_id = caster_entity_id,
+        caster_owner = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+            and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(caster_owner)
+            or caster_owner,
+        range = AoE4RPG_CONVERSION_GetAbilityRange(ability_pbgid),
+        target_entity_id = target_entity_id,
+        target_owner = target_owner,
+        target_was_enemy = target_owner ~= nil and target_owner ~= (
+            AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+                and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(caster_owner)
+                or caster_owner
+        ),
+        started_at = AoE4RPG_CONVERSION_GetElapsedTime(),
+        awarded_entity_ids = {},
+        candidate_owner_by_entity_id = {},
+        candidate_entity_ids = {},
+        active = true,
+    }
+    table.insert(AoE4RPG.CONVERSION.pending_casts, cast)
+    -- IMPORTANT: Native conversion resolves after four seconds.
+    -- Take one bounded enemy snapshot 0.125 seconds before completion.
+    Rule_AddOneShot(
+        AoE4RPG_CONVERSION_CaptureNearbyCandidates,
+        AoE4RPG.CONVERSION.pre_completion_snapshot_seconds,
+        { cast = cast }
+    )
+    return true
+end
+
+-- Resolves an event-supplied target without scanning unrelated world entities.
+-- IMPORTANT: The target must change to the caster owner before XP is awarded.
+function AoE4RPG_CONVERSION_CheckEventTarget(cast)
+    if not cast or not cast.target_entity_id then
+        return false
+    end
+    local target = AoE4RPG_CONVERSION_GetLiveEntity(cast.target_entity_id)
+    if not target then
+        return false
+    end
+    local current_owner = AoE4RPG_CONVERSION_GetPlayerOwner(target)
+    if not current_owner then
+        return false
+    end
+    if AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+        current_owner = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(current_owner)
+    end
+    if cast.target_owner == nil then
+        cast.target_owner = current_owner
+        return false
+    end
+    -- IMPORTANT: Fast conversions can finish before the first monitor tick.
+    -- The targeted event already identifies the unit, so ownership by the caster is completion.
+    if current_owner == cast.caster_owner and cast.target_was_enemy then
+        cast.target_owner = current_owner
+        return AoE4RPG_CONVERSION_GrantExperience(cast, target)
+    end
+    if current_owner == cast.target_owner or current_owner ~= cast.caster_owner then
+        cast.target_owner = current_owner
+        return false
+    end
+    return AoE4RPG_CONVERSION_GrantExperience(cast, target)
+end
+
+function AoE4RPG_CONVERSION_IsPending(cast)
+    if not cast or cast.active == false then
+        return false
+    end
+    local current_time = AoE4RPG_CONVERSION_GetElapsedTime() or 0
+    return current_time - cast.started_at <= AoE4RPG.CONVERSION.conversion_window_seconds
+end
+
+-- Normalizes Rule_AddOneShot callback data across SCAR hosts.
+function AoE4RPG_CONVERSION_GetScheduledCast(rule_id, context)
+    if type(rule_id) == "table" and context == nil then
+        context = rule_id
+    end
+    return type(context) == "table" and context.cast or nil
+end
+
+-- Captures only enemy squad roots inside the executed conversion's radius.
+-- IMPORTANT: This runs once at 3.875 seconds instead of polling throughout the cast.
+function AoE4RPG_CONVERSION_CaptureNearbyCandidates(rule_id, context)
+    local cast = AoE4RPG_CONVERSION_GetScheduledCast(rule_id, context)
+    if not AoE4RPG_CONVERSION_IsPending(cast) then
+        return false
+    end
+
+    if cast.target_entity_id then
+        local target = AoE4RPG_CONVERSION_GetLiveEntity(cast.target_entity_id)
+        local target_owner = target and AoE4RPG_CONVERSION_GetPlayerOwner(target) or nil
+        if target_owner and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+            target_owner = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(target_owner)
+        end
+        if target_owner ~= nil then
+            cast.candidate_owner_by_entity_id[cast.target_entity_id] = target_owner
+            cast.candidate_entity_ids = { cast.target_entity_id }
+        end
+    else
+        local caster = AoE4RPG_CONVERSION_GetCasterEntity(cast)
+        local caster_owner = AoE4RPG_RUNTIME_GetPlayerHandle
+            and AoE4RPG_RUNTIME_GetPlayerHandle(cast.caster_owner)
+            or cast.caster_owner
+        if caster and caster_owner and Entity_GetPosition
+            and World_GetSquadsNearPoint and SGroup_CreateUnique
+            and SGroup_ForEach and Squad_GetFirstEntity then
+            local nearby_enemy_squads = SGroup_CreateUnique(
+                "AoE4RPG_ConversionNearbyEnemies"
+            )
+            if nearby_enemy_squads then
+                World_GetSquadsNearPoint(
+                    caster_owner,
+                    nearby_enemy_squads,
+                    Entity_GetPosition(caster),
+                    cast.range,
+                    OT_Enemy
+                )
+                local seen_entity_ids = {}
+                SGroup_ForEach(nearby_enemy_squads, function(_, _, squad)
+                    local entity = Squad_GetFirstEntity(squad)
+                    local entity_id = AoE4RPG_CONVERSION_GetEntityID(entity)
+                    if entity_id and not seen_entity_ids[entity_id] then
+                        local owner = AoE4RPG_CONVERSION_GetPlayerOwner(entity)
+                        if owner and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+                            owner = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(owner)
+                        end
+                        if owner ~= nil and owner ~= cast.caster_owner then
+                            seen_entity_ids[entity_id] = true
+                            cast.candidate_owner_by_entity_id[entity_id] = owner
+                            table.insert(cast.candidate_entity_ids, entity_id)
+                        end
+                    end
+                end)
+                table.sort(cast.candidate_entity_ids)
+                if SGroup_Destroy then
+                    SGroup_Destroy(nearby_enemy_squads)
+                end
+            end
+        end
+    end
+
+    Rule_AddOneShot(
+        AoE4RPG_CONVERSION_CheckNearbyCandidates,
+        AoE4RPG.CONVERSION.snapshot_separation_seconds,
+        { cast = cast }
+    )
+    return true
+end
+
+-- Awards XP for candidates whose synchronized owner changed to the caster.
+-- IMPORTANT: This runs once at 4.125 seconds after the ability event.
+function AoE4RPG_CONVERSION_CheckNearbyCandidates(rule_id, context)
+    local cast = AoE4RPG_CONVERSION_GetScheduledCast(rule_id, context)
+    if not cast or cast.active == false then
+        return false
+    end
+    local awarded = false
+    for _, entity_id in ipairs(cast.candidate_entity_ids or {}) do
+        local entity = AoE4RPG_CONVERSION_GetLiveEntity(entity_id)
+        local current_owner = entity and AoE4RPG_CONVERSION_GetPlayerOwner(entity) or nil
+        if current_owner and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+            current_owner = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(current_owner)
+        end
+        local previous_owner = cast.candidate_owner_by_entity_id[entity_id]
+        if entity and previous_owner ~= nil
+            and previous_owner ~= cast.caster_owner
+            and current_owner == cast.caster_owner then
+            awarded = AoE4RPG_CONVERSION_GrantExperience(cast, entity) or awarded
+        end
+    end
+    cast.active = false
+    for index = #AoE4RPG.CONVERSION.pending_casts, 1, -1 do
+        if AoE4RPG.CONVERSION.pending_casts[index] == cast then
+            table.remove(AoE4RPG.CONVERSION.pending_casts, index)
+            break
+        end
+    end
+    return awarded
+end
+
+-- Population-cap conversion deaths arrive through GE_EntityKilled.
+-- IMPORTANT: Their owner remains hostile, so the same pending cast/range test awards the kill equivalent instead of waiting for an owner transition that never occurs.
+function AoE4RPG_CONVERSION_OnEntityKilled(context)
+    local victim = context and (context.victim or context.entity)
+    -- IMPORTANT: A normal combat death has a killer.
+    if not victim or context.killer then
+        return false
+    end
+    local victim_owner = context.victimOwner
+        or AoE4RPG_CONVERSION_GetPlayerOwner(victim)
+    if victim_owner == nil then
+        return false
+    end
+    if AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier then
+        victim_owner = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(victim_owner)
+    end
+    local awarded = false
+    for _, cast in ipairs(AoE4RPG.CONVERSION.pending_casts) do
+        local caster = AoE4RPG_CONVERSION_GetCasterEntity(cast)
+        if AoE4RPG_CONVERSION_IsPending(cast)
+            and victim_owner ~= cast.caster_owner
+            and caster
+            and AoE4RPG_CONVERSION_GetDistance(caster, victim) <= cast.range then
+            awarded = AoE4RPG_CONVERSION_GrantExperience(cast, victim) or awarded
+        end
+    end
+    return awarded
+end
+
+function AoE4RPG_CONVERSION_StartMonitor()
+    return false
+end
+
+function AoE4RPG_CONVERSION_StopMonitor(preserve_elapsed_time)
+    local conversion = AoE4RPG.CONVERSION
+    conversion.monitor_registered = false
+    if not preserve_elapsed_time then
+        conversion.elapsed_time = 0
+    end
+    conversion.idle_monitor_ticks = 0
+    for _, cast in ipairs(conversion.pending_casts or {}) do
+        cast.active = false
+    end
+    conversion.pending_casts = {}
+    conversion.previous_owner_by_entity_id = {}
+end

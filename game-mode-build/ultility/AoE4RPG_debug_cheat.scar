@@ -1,0 +1,95 @@
+-- ================= AoE4RPG Debug Cheat ===============
+-- AoE4RPG Debug Cheat - Development Cheat provides the IDDQD test command for tracked units.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_core.scar, AoE4RPG_entity_tracker.scar, and native cheat APIs.
+-- CURRENTY NOT WORKING!!!
+-- ================= AoE4RPG Debug Cheat ===============
+
+function AoE4RPG_DebugCheat_IDDQD(player_id, data)
+    if not Misc_GetSelectedSquads or not SGroup_CreateIfNotFound
+        or not SGroup_Clear or not SGroup_Count or not SGroup_ForEach then
+        return
+    end
+
+    local selected = SGroup_CreateIfNotFound("AoE4RPG_IDDQD_Selected")
+    SGroup_Clear(selected)
+    Misc_GetSelectedSquads(selected, false)
+    if SGroup_Count(selected) ~= 1 then
+        return
+    end
+
+    -- This callback checks the first unit in the selected squad and gives it one level of XP.
+    -- ADJUST: change the damage_dealt assignment below to grant a different amount.
+    local function grant_required_exp(group_id, index, squad_id)
+        local entity = Squad_GetFirstEntity and Squad_GetFirstEntity(squad_id)
+        if not entity then
+            return
+        end
+
+        local entity_id
+        if type(entity) == "number" then
+            entity_id = entity
+            entity = Entity_FromID and Entity_FromID(entity) or nil
+        else
+            entity_id = entity.EntityID or (Entity_GetID and Entity_GetID(entity))
+        end
+        if not entity or not entity_id or not AoE4RPG_GetUnitData then
+            return
+        end
+
+        if not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier
+            or not AoE4RPG_ENTITY_TRACKER_IsTrackedEntityIdentifier(entity_id) then
+            return
+        end
+
+        local unit_data = AoE4RPG_GetUnitData(entity_id)
+        local tracked_record = AoE4RPG.ENTITY_TRACKER
+            and AoE4RPG.ENTITY_TRACKER.tracked_entity_records[entity_id]
+            or nil
+        local is_hero = tracked_record and tracked_record.role == "heroes" or false
+        local is_elite = tracked_record and tracked_record.role == "elites" or false
+        if not is_hero and not is_elite then
+            return
+        end
+
+        -- IMPORTANT: Jeanne is driven exclusively by the game's native experience state.
+        -- IMPORTANT: IDDQD must not create a parallel RPG level on top of that progression.
+        if AoE4RPG_SynchronizeNativeExperience then
+            local uses_native_experience = AoE4RPG_SynchronizeNativeExperience(
+                entity,
+                player_id,
+                unit_data
+            )
+            if uses_native_experience then
+                return
+            end
+        end
+
+        local max_level = AoE4RPG_GetEffectiveLevelLimit(entity, unit_data)
+        if (unit_data.level or 0) >= max_level then
+            return
+        end
+
+        unit_data.damage_dealt = AoE4RPG_ExperienceRequired(unit_data.level or 0)
+        AoE4RPG_CheckAndApplyLevelUp(entity, unit_data.owner or player_id, unit_data, true)
+    end
+
+    SGroup_ForEach(selected, grant_required_exp)
+end
+
+-- IMPORTANT: Register IDDQD in the native chat-cheat dispatch table.
+function AoE4RPG_DebugCheat_Init()
+    if not cheats and Cheat_Init then
+        Cheat_Init()
+    end
+
+    if not cheats then
+        return
+    end
+
+    cheats["IDDQD"] = AoE4RPG_DebugCheat_IDDQD -- Code here.
+end
+
+if Scar_AddInit then
+    Scar_AddInit(AoE4RPG_DebugCheat_Init)
+end

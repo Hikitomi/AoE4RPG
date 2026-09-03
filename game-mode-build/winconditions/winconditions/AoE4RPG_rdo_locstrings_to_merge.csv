@@ -1,0 +1,71 @@
+ID,Pipeline,PipelineStage,Notes,TranslationNotes,Tags,Text
+1900,,,,,,Leveling
+1901,,,,,,Resources
+1902,,,,,,Food
+1903,,,,,,Wood
+1904,,,,,,Gold
+1905,,,,,,Stone
+1906,,,,,,Build Speed
+1907,,,,,,Train Speed
+1908,,,,,,Build Speed
+1909,,,,,,Train Speed
+1910,,,,,,XP Multiplier
+1911,,,,,,1 Class
+1912,,,,,,2 Classes
+1913,,,,,,3 Classes
+1914,,,,,,4 Classes
+1915,,,,,,5 Classes
+1930,,,,,,0.1x
+1931,,,,,,0.25x
+1932,,,,,,0.5x
+1933,,,,,,0.75x
+1934,,,,,,1x
+1935,,,,,,1.25x
+1936,,,,,,1.5x
+1937,,,,,,2x
+1938,,,,,,3x
+1939,,,,,,5x
+1940,,,,,,10x
+1941,,,,,,20x
+1942,,,,,,Victory Conditions
+1943,,,,,,Conquest
+1944,,,,,,Annihilation
+1945,,,,,,Regicide
+1946,,,,,,AI Settings
+1947,,,,,,Max Population
+1948,,,,,,Max Population
+1949,,,,,,Player Settings
+1950,,,,,,25
+1951,,,,,,50
+1952,,,,,,75
+1953,,,,,,100
+1954,,,,,,150
+1955,,,,,,200
+1956,,,,,,250
+1957,,,,,,300
+1958,,,,,,350
+1959,,,,,,400
+1960,,,,,,Unlimited Levels
+1961,,,,,,Maximum Classes
+1962,,,,,,Gather Rate
+1963,,,,,,15x
+1964,,,,,,50x
+1965,,,,,,100x
+1966,,,,,,1.75x
+1967,,,,,,2.5x
+1968,,,,,,4x
+1969,,,,,,7.5x
+1970,,,,,,25x
+1971,,,,,,King Level Interval
+1972,,,,,,1 Minute
+1973,,,,,,2 Minutes
+1974,,,,,,3 Minutes
+1975,,,,,,5 Minutes
+1976,,,,,,10 Minutes
+1977,,,,,,15 Minutes
+1978,,,,,,Human XP Multiplier
+1979,,,,,,AI XP Multiplier
+2032,,,,,,Wall Health Multiplier
+2033,,,,,,Multiplier applied to the maximum health of stone walls, palisade walls, gates, and palisade defenses.
+2034,,,,,,AI Keeps XP on Death
+2035,,,,,,AI heroes and elites retain their accumulated RPG experience when they die.

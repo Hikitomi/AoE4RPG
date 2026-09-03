@@ -1,0 +1,2110 @@
+-- ================= AoE4RPG Effects ===============
+-- AoE4RPG Effects Effect - Framework dispatches markers, passive effects, and timed combat effects.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_ability_list_compact.scar, AoE4RPG_effects_list.scar, and AoE4RPG_core.scar.
+-- ================= AoE4RPG Effects ===============
+
+if not AoE4RPG then
+    AoE4RPG = {}
+end
+
+-- IMPORTANT: `markers` contains active projectile/entity registrations keyed by entity ID. `passives` contains event callbacks grouped by owning entity ID. `monitor_registered` prevents duplicate interval rules during reinitialization.
+AoE4RPG.EFFECTS = AoE4RPG.EFFECTS or {
+    markers = {},
+    passives = {},
+    melee_attack_move_hunts = {},
+    monitor_registered = false,
+}
+AoE4RPG.EFFECTS.melee_attack_move_hunts = AoE4RPG.EFFECTS.melee_attack_move_hunts or {}
+
+-- Returns the current game clock used for marker expiration and tick scheduling.
+function AoE4RPG_EFFECTS_GetTime()
+    if AoE4RPG_RUNTIME_GetTime then
+        return AoE4RPG_RUNTIME_GetTime()
+    end
+    if Game_GetTime then
+        return Game_GetTime()
+    end
+    if World_GetGameTime then
+        return World_GetGameTime()
+    end
+    return 0
+end
+
+-- ==================== Compact Effect Values ==============
+-- Compact rows may use `values = { ... }` instead of repeated named fields.
+-- Each effect defines its positional schema below.
+-- Common values are placed at the front of each row; effect-specific switches and nested data are placed later.
+-- Keeps routine setup short while leaving uncommon options visible at the end of the row.
+-- ==================== Compact Effect Values ==============
+AoE4RPG_EFFECT_VALUE_FIELDS = {
+    -- [1] amount, [2] radius, [3] duration, [4] growth, [5] target filter.
+    damage = { "amount", "radius", "duration", "effect_growth", "affects" },
+    heal = { "amount", "radius", "duration", "effect_growth", "affects" },
+
+    -- [1] amount, [2] duration, [3] growth.
+    damage_buff = { "amount", "duration", "effect_growth" },
+    attack_speed_buff = { "amount", "duration", "effect_growth" },
+
+    damage_on_attacked = {
+        "amount", "radius", "duration", "effect_growth", "affects",
+        "activation_cooldown", "apply_effect", "animation_action", "apply_effect_data",
+    },
+
+    -- [1] amount, [2] duration, [3] growth.
+    attack_ignore_armor = { "amount", "duration", "effect_growth" },
+    projectile_attack_ignore_armor = { "amount", "duration", "effect_growth" },
+
+    -- [1] armor removed per trigger, [2] damage-type channel.
+    -- IMPORTANT: The damage type selects exactly one native armor modifier.
+    armor_shred = { "amount", "damage_type" },
+
+    -- [1] amount, [2] growth, [3] attribute name, [4] stable effect ID.
+    attribute_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+    agility_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+    endurance_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+    vitality_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+
+    -- [1] amount, [2] growth, [3] ability-value source, such as damage/health.
+    ability_damage_multiplier = { "amount", "effect_growth", "source" },
+    ability_health_multiplier = { "amount", "effect_growth", "source" },
+    ability_value_multiplier = { "amount", "effect_growth", "source" },
+
+    missing_health_trigger = {
+        "threshold", "minimum_threshold", "threshold_reduction_per_level",
+        "threshold_refresh_interval", "health_ratio_mode", "apply_effect",
+        "apply_effect_data",
+    },
+
+    -- [1] required attacks, [2] effect level, [3] nested effect, [4] stable effect ID, [5] nested effect data.
+    track_attack_counts = {
+        "required_attacks", "effect_level", "apply_effect", "effect_id",
+        "apply_effect_data",
+    },
+
+    same_target_damage_stack = {
+        "amount", "effect_growth", "required_attacks", "max_stacks",
+        "reset_on_target_change", "hardpoint", "effect_id",
+    },
+
+    -- [1] delay, [2] effect level, [3] growth, [4] nested effect, [5] nested effect data.
+    timed_effect = {
+        "effect_delay", "effect_level", "effect_growth", "apply_effect",
+        "apply_effect_data",
+    },
+
+    -- [1] target scope, [2] effect level, [3] ordered nested effect rows.
+    spawned_unit_effects = { "target_scope", "effect_level", "apply_effects" },
+    trained_unit_effects = { "target_scope", "effect_level", "apply_effects" },
+
+    -- [1] weapon slot, [2] hardpoint.
+    weapon_slot = { "weapon_slot", "hardpoint" },
+
+    melee_attack_move_hunt = {
+        "duration", "hunt_search_radius", "hunt_retarget_interval",
+        "allow_buildings", "attack_move_queued", "attack_move_cover_radius",
+        "melee_only",
+    },
+}
+
+-- Expands compact values without removing named fields.
+-- IMPORTANT: Named fields remain accepted for engine-generated nested data, but Ability_List rows should use the compact values format as the source of truth.
+function AoE4RPG_EFFECTS_ExpandCompactValues(data)
+    if type(data) ~= "table" then
+        return data
+    end
+    local expanded = {}
+    for key, value in pairs(data) do
+        expanded[key] = value
+    end
+
+    local function expand_row(row, values)
+        if type(row) ~= "table" or type(values) ~= "table"
+            or type(values[1]) == "table" then
+            return row
+        end
+        local result = {}
+        for key, value in pairs(row) do
+            result[key] = value
+        end
+        local effect_name = result.effect_name or result.effect
+        local fields = AoE4RPG_EFFECT_VALUE_FIELDS[effect_name] or {}
+        for index, field_name in ipairs(fields) do
+            if result[field_name] == nil and values[index] ~= nil then
+                result[field_name] = values[index]
+            end
+        end
+        return result
+    end
+
+    if type(expanded.values) == "table" and type(expanded.values[1]) ~= "table" then
+        expanded = expand_row(expanded, expanded.values)
+    end
+
+    if type(expanded.effects) == "table" then
+        local compact_rows = expanded.effect_values
+        if type(compact_rows) ~= "table" or type(compact_rows[1]) ~= "table" then
+            compact_rows = type(expanded.values) == "table"
+                and type(expanded.values[1]) == "table"
+                and expanded.values
+                or nil
+        end
+        local effect_rows = {}
+        for index, source_row in ipairs(expanded.effects) do
+            local row = type(source_row) == "table"
+                and source_row
+                or { effect_name = source_row }
+            if compact_rows and type(compact_rows[index]) == "table" then
+                row = expand_row(row, compact_rows[index])
+            elseif type(row.values) == "table" then
+                row = expand_row(row, row.values)
+            end
+            effect_rows[index] = row
+        end
+        expanded.effects = effect_rows
+        if not expanded.effect_name and effect_rows[1] then
+            for key, value in pairs(effect_rows[1]) do
+                if expanded[key] == nil and key ~= "values" then
+                    expanded[key] = value
+                end
+            end
+        end
+    end
+    return expanded
+end
+
+-- Converts an entity handle into the stable numeric key used by marker and passive tables.
+-- IMPORTANT: Entity IDs are preferred; the field fallback supports hosts that expose the ID directly on the entity object.
+function AoE4RPG_EFFECTS_GetEntityID(entity)
+    if AoE4RPG_RUNTIME_GetEntityIdentifier then
+        return AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
+    end
+    if not entity then
+        return nil
+    end
+    -- IMPORTANT: Entity_Create returns an EntityID directly.
+    -- Preserve numeric IDs instead of passing them through Entity_GetID a second time.
+    if type(entity) == "number" then
+        return entity
+    end
+    if type(entity) == "table" and type(entity.EntityID) == "number" then
+        return entity.EntityID
+    end
+    if (not scartype or not ST_ENTITY or scartype(entity) == ST_ENTITY)
+        and Entity_GetID then
+        return Entity_GetID(entity)
+    end
+    return nil
+end
+
+-- Performs the minimum validity check before calling engine functions on an entity.
+-- This protects the interval monitor from stale projectile/target handles.
+function AoE4RPG_EFFECTS_IsValidEntity(entity)
+    local entity_identifier = AoE4RPG_EFFECTS_GetEntityID(entity)
+    return entity_identifier ~= nil
+        and (not Entity_IsValid or Entity_IsValid(entity_identifier))
+end
+
+-- Returns the distance between two entities, or nil when position/distance APIs are unavailable.
+-- Callers treat nil as an inability to satisfy a radius test.
+function AoE4RPG_EFFECTS_GetDistance(first_entity, second_entity)
+    if not Entity_GetPosition or not Util_GetDistance or not first_entity or not second_entity then
+        return nil
+    end
+    return Util_GetDistance(Entity_GetPosition(first_entity), Entity_GetPosition(second_entity))
+end
+
+-- Set effect_data.affects to "allies", "enemies", or "both".
+-- IMPORTANT: When the host does not expose a diplomacy helper, ownership equality is used as the safe fallback for ally/enemy classification.
+function AoE4RPG_EFFECTS_AffectsTarget(owner, target, affects)
+    affects = affects or "enemies"
+    if affects == "both" then
+        return true
+    end
+    if not owner or not target or not Entity_GetPlayerOwner then
+        return false
+    end
+    local owner_player = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(owner)
+        or nil
+    local target_player = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(target)
+        or nil
+    if not owner_player or not target_player then
+        return false
+    end
+    local is_ally = owner_player == target_player
+    if Player_IsAllied then
+        is_ally = Player_IsAllied(owner_player, target_player)
+    end
+    return (affects == "allies" and is_ally)
+        or (affects == "enemies" and not is_ally)
+end
+
+function AoE4RPG_EFFECTS_IsInHeading(owner, target, effect)
+    if not owner or not target or not Entity_GetHeading or not Entity_GetPosition then return false end
+    local heading, origin, position = Entity_GetHeading(owner), Entity_GetPosition(owner), Entity_GetPosition(target)
+    local dx, dz = (position.x or 0) - (origin.x or 0), (position.z or 0) - (origin.z or 0)
+    local length = math.sqrt(dx * dx + dz * dz)
+    if length <= 0 then return true end
+    local hx, hz = heading.x or 0, heading.z or 0
+    local heading_length = math.sqrt(hx * hx + hz * hz)
+    if heading_length <= 0 then return false end
+    local dot = (hx * dx + hz * dz) / (heading_length * length)
+    dot = math.max(-1, math.min(1, dot))
+    if math.deg(math.acos(dot)) > (tonumber(effect.heading_angle) or 45) then return false end
+    local cross = (hx * dz - hz * dx) * (tonumber(effect.heading_side_sign) or 1)
+    local side = effect.heading_side or "both"
+    return side == "both" or (side == "left" and cross >= 0) or (side == "right" and cross <= 0)
+end
+
+-- Enumerates all players' entities in the configured radius around a marker.
+-- The marker may be an owner, projectile, or temporary area entity.
+function AoE4RPG_EFFECTS_IterateAroundMarker(marker, effect, callback)
+    if not marker or not callback or not Player_GetEntitiesInArea or not Entity_GetPosition then return end
+    local position, radius = Entity_GetPosition(marker), tonumber(effect.radius or effect.area) or 99999
+    if not position then return end
+    for _, player in pairs(PLAYERS or {}) do
+        local player_handle = AoE4RPG_RUNTIME_GetPlayerHandle
+            and AoE4RPG_RUNTIME_GetPlayerHandle(player)
+            or (player and (player.id or player))
+        if player_handle then
+            local entities = Player_GetEntitiesInArea(player_handle, position, radius)
+            if entities and EGroup_ForEach then EGroup_ForEach(entities, callback) end
+        end
+    end
+end
+
+-- Enumerates all players' entities in the configured radius around an owner.
+-- Kept as a compatibility wrapper for existing owner-dispatched abilities.
+function AoE4RPG_EFFECTS_IterateAroundOwner(owner, effect, callback)
+    AoE4RPG_EFFECTS_IterateAroundMarker(owner, effect, callback)
+end
+
+-- Resolves a runtime ability target into a world position.
+-- IMPORTANT: Ground-position abilities normally expose a Position in context.target; entity targets are also accepted as a compatibility fallback by reading their position.
+function AoE4RPG_EFFECTS_GetPositionValue(value)
+    if not value then return nil end
+    if type(value) == "number" and Entity_FromID then
+        value = Entity_FromID(value)
+    end
+    if not value then return nil end
+    if value.x ~= nil and value.z ~= nil then
+        return value
+    end
+    if Entity_GetPosition and AoE4RPG_EFFECTS_IsValidEntity(value) then
+        return Entity_GetPosition(value)
+    end
+    return nil
+end
+
+-- Reads the target position supplied by GE_AbilityExecuted.
+function AoE4RPG_EFFECTS_GetAbilityTargetPosition(context)
+    if not context then return nil end
+    return AoE4RPG_EFFECTS_GetPositionValue(
+        context.target_position or context.target_pos or context.target
+    )
+end
+
+-- Resolves an entity target carried by GE_AbilityExecuted.
+-- IMPORTANT: Native events may serialize the target as an EntityID or { EntityID = ... } table, so never pass either representation directly to an Entity API.
+function AoE4RPG_EFFECTS_GetAbilityTargetEntity(context)
+    if not context then return nil end
+    local target = context.target_entity or context.target_entity_id or context.target
+    if not target then return nil end
+    if type(target) == "table" and type(target.EntityID) == "number" then
+        target = target.EntityID
+    end
+    if type(target) == "number" then
+        if Entity_IsValid and not Entity_IsValid(target) then return nil end
+        return Entity_FromID and Entity_FromID(target) or nil
+    end
+    if scartype and ST_ENTITY and scartype(target) == ST_ENTITY then
+        return target
+    end
+    return nil
+end
+
+-- Creates an optional visible area marker at the live marker entity position.
+-- IMPORTANT: Gameplay radius/area remains authoritative; circle_scale converts it to the splat diameter used by the visual decal.
+function AoE4RPG_EFFECTS_CreateEffectCircle(marker, effect)
+    if not effect or effect.effect_circle ~= true or not Splat_Create
+        or not marker or not Entity_GetPosition then
+        return nil
+    end
+    local position = Entity_GetPosition(marker)
+    local radius = tonumber(effect.area or effect.radius) or 0
+    if not position or radius <= 0 then return nil end
+    local scale = tonumber(effect.circle_scale) or 2.27
+    return Splat_Create(
+        effect.circle_splat or "fx\\fx_ring_splat01\\fx_ring_splat01",
+        position, radius * scale, radius * scale,
+        tonumber(effect.circle_rotation) or 0,
+        tonumber(effect.circle_red) or 0, tonumber(effect.circle_green) or 0,
+        tonumber(effect.circle_blue) or 180, tonumber(effect.circle_alpha) or 150,
+        effect.circle_mirror_x == true, effect.circle_mirror_z == true
+    )
+end
+
+function AoE4RPG_EFFECTS_RegisterOwnerDispatch(owner, effect_data)
+    if not AoE4RPG_EFFECTS_IsValidEntity(owner) or not effect_data then return false end
+    if effect_data.effect_name == "damage_on_attacked"
+        or effect_data.effect_name == "track_attack_counts" then
+        return AoE4RPG_EFFECT_LIST_Apply(
+            effect_data.effect_name, owner, owner, effect_data
+        )
+    end
+    local now = AoE4RPG_EFFECTS_GetTime()
+    local marker_data = { marker = owner, owner = owner, effect = effect_data, created_at = now, expires_at = effect_data.duration and now + effect_data.duration or nil, next_tick = now, hit_targets = {} }
+    marker_data.circle_handle = AoE4RPG_EFFECTS_CreateEffectCircle(owner, effect_data)
+    marker_data.effect.target_iterator = function(callback)
+        AoE4RPG_EFFECTS_IterateAroundOwner(owner, effect_data, function(target)
+            if effect_data.marker_type ~= "owner_heading" or AoE4RPG_EFFECTS_IsInHeading(owner, target, effect_data) then callback(target) end
+        end)
+    end
+    local key = "owner:" .. tostring(AoE4RPG_EFFECTS_GetEntityID(owner)) .. ":" .. tostring(now)
+    AoE4RPG.EFFECTS.markers[key] = marker_data
+    return true
+end
+
+-- ============================= Effect Sights ==============================
+-- IMPORTANT: When enabled, the marker blueprint is expected to have a native sight radius of 1, so one multiplicative modifier makes its sight radius equal to area_sight_radius or the ability radius.
+-- IMPORTANT: The modifier is attached to the temporary entity and is automatically discarded when that entity is destroyed.
+-- ============================= Effect Sights ==============================
+
+function AoE4RPG_EFFECTS_ConfigureAreaMarkerSight(marker, effect_data)
+    if not marker or not effect_data then return false end
+    local marker_id = AoE4RPG_EFFECTS_GetEntityID(marker)
+    if not marker_id then return false end
+    local marker_entity = AoE4RPG_RUNTIME_GetLiveEntity
+        and AoE4RPG_RUNTIME_GetLiveEntity(marker_id)
+        or (Entity_FromID and Entity_FromID(marker_id))
+    if not marker_entity then return false end
+
+    local sight_enabled = effect_data.area_sight == true
+    local sight_extension = effect_data.area_sight_extension or "sight_ext"
+    if Entity_SetExtEnabled then
+        Entity_SetExtEnabled(marker_id, sight_extension, sight_enabled)
+    end
+    if not sight_enabled then return true end
+
+    local desired_radius = tonumber(
+        effect_data.area_sight_radius or effect_data.radius or effect_data.area
+    )
+    if not desired_radius or desired_radius <= 0 then return false end
+    if not Modifier_Create or not Modifier_ApplyToEntity then return true end
+
+    -- IMPORTANT: Native marker sight radius is normalized to 1 in unit_marker.xml: 1 * desired radius produces the skill's configured sight radius.
+    local modifier = Modifier_Create(
+        MAT_Entity,
+        "sight_radius_modifier",
+        MUT_Multiplication,
+        false,
+        desired_radius,
+        ""
+    )
+    if not modifier then return false end
+    Modifier_ApplyToEntity(modifier, marker_entity, 0)
+    return true
+end
+
+-- ============================= Placeholder Marker ===============================
+-- Creates a temporary `unit_marker` entity at a point-targeted ability's selected position.
+-- ============================= Placeholder Marker ===============================
+
+function AoE4RPG_EFFECTS_RegisterAreaDispatch(owner, target_position, effect_data)
+    if not AoE4RPG_EFFECTS_IsValidEntity(owner) or not target_position
+        or not effect_data or not BP_GetEntityBlueprint or not Entity_Create then
+        return false
+    end
+
+    local marker_blueprint_name = effect_data.area_marker_blueprint
+        or effect_data.marker_blueprint
+        or "unit_marker"
+    if not marker_blueprint_name then return false end
+
+    local marker_blueprint = BP_GetEntityBlueprint(marker_blueprint_name)
+    local player = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(owner)
+        or nil
+    if not marker_blueprint or not player then return false end
+
+    local marker = Entity_Create(marker_blueprint, player, target_position, true)
+    if not marker then return false end
+
+    local spawned = false
+    if Entity_SpawnDoNotAddPathfindingAndCollision then
+        Entity_SpawnDoNotAddPathfindingAndCollision(marker)
+        spawned = true
+    elseif Entity_Spawn then
+        Entity_Spawn(marker)
+        spawned = true
+    end
+    if not spawned then
+        if Entity_Destroy then Entity_Destroy(marker) end
+        return false
+    end
+
+    local marker_id = AoE4RPG_EFFECTS_GetEntityID(marker)
+    if not marker_id then
+        if Entity_Destroy then Entity_Destroy(marker) end
+        return false
+    end
+
+    -- IMPORTANT: The marker blueprint contains sight_ext with a native radius of 1.
+    -- Configure it before registering the marker so sight matches this cast.
+    if not AoE4RPG_EFFECTS_ConfigureAreaMarkerSight(marker, effect_data)
+        and effect_data.area_sight == true then
+        if Entity_Destroy then Entity_Destroy(marker_id) end
+        return false
+    end
+
+    local now = AoE4RPG_EFFECTS_GetTime()
+    local marker_duration = tonumber(effect_data.area_marker_duration)
+    if marker_duration == nil then marker_duration = tonumber(effect_data.duration) end
+    if not marker_duration or marker_duration <= 0 then marker_duration = 0.25 end
+
+    local marker_data = {
+        marker = marker,
+        owner = owner,
+        effect = effect_data,
+        target_position = target_position,
+        created_at = now,
+        expires_at = now + marker_duration,
+        next_tick = now,
+        hit_targets = {},
+        destroy_on_remove = true,
+    }
+    marker_data.effect.target_iterator = function(callback)
+        AoE4RPG_EFFECTS_IterateAroundMarker(marker, effect_data, callback)
+    end
+    marker_data.circle_handle = AoE4RPG_EFFECTS_CreateEffectCircle(marker, effect_data)
+    AoE4RPG.EFFECTS.markers[marker_id] = marker_data
+    return true
+end
+
+-- Registers a projectile/entity as a live effect marker.
+-- Registers a live marker and snapshots its timing/targeting configuration.
+function AoE4RPG_EFFECTS_RegisterMarker(marker, owner, effect_data)
+    local marker_id = AoE4RPG_EFFECTS_GetEntityID(marker)
+    if not marker_id or not effect_data then
+        return false
+    end
+    local now = AoE4RPG_EFFECTS_GetTime()
+    AoE4RPG.EFFECTS.markers[marker_id] = {
+        marker = marker,
+        owner = owner,
+        effect = effect_data,
+        created_at = now,
+        expires_at = effect_data.duration and now + effect_data.duration or nil,
+        next_tick = now,
+        hit_targets = {},
+    }
+    AoE4RPG.EFFECTS.markers[marker_id].circle_handle =
+        AoE4RPG_EFFECTS_CreateEffectCircle(marker, effect_data)
+    if effect_data.effect_name == "weapon_slot" and owner then
+        AoE4RPG_EFFECT_LIST_Apply("weapon_slot", owner, owner, effect_data)
+    end
+    return true
+end
+
+-- Prepares the copied ability-list effect data shared by every marker mode.
+function AoE4RPG_EFFECTS_PrepareAbilityEffectData(ability, owner)
+    if not AoE4RPG_ABILITY_LIST_GetEffectData then return nil end
+    local effect_data = AoE4RPG_ABILITY_LIST_GetEffectData(ability, owner)
+    if not effect_data then return nil end
+    effect_data = AoE4RPG_EFFECTS_ExpandCompactValues(effect_data)
+    if effect_data.skill_type == "unique"
+        and AoE4RPG_EFFECT_LIST_ApplyUniqueSkillCooldown then
+        AoE4RPG_EFFECT_LIST_ApplyUniqueSkillCooldown(owner, ability, effect_data)
+    end
+    if effect_data.amount == nil and effect_data.damage == nil
+        and AoE4RPG_EFFECT_LIST_ApplyNoValueSkillCooldown then
+        AoE4RPG_EFFECT_LIST_ApplyNoValueSkillCooldown(owner, ability, effect_data)
+    end
+    if effect_data.effect_name == "missing_health_trigger"
+        and effect_data.health_ratio_mode == "threshold_effect_scaling" then
+        effect_data.tick_interval = effect_data.threshold_refresh_interval or 0.25
+    end
+    return effect_data
+end
+
+-- Registers an area marker from a GE_AbilityExecuted context.
+-- IMPORTANT: This is the public bridge for abilities whose native XML targets a world position and does not fire a projectile that can be used as a marker.
+function AoE4RPG_EFFECTS_RegisterAreaAbilityMarker(owner, ability, context)
+    local effect_data = AoE4RPG_EFFECTS_PrepareAbilityEffectData(ability, owner)
+    if not effect_data or (effect_data.marker_type or effect_data.marker_dispatch) ~= "area" then
+        return false
+    end
+    local target_position = AoE4RPG_EFFECTS_GetAbilityTargetPosition(context)
+    return AoE4RPG_EFFECTS_RegisterAreaDispatch(owner, target_position, effect_data)
+end
+
+-- Convenience wrapper for ability-list entries.
+-- IMPORTANT: It copies the complete row (including effect_name, radius, timing, and target filters) before registering the marker, so later changes to the list do not mutate active casts.
+function AoE4RPG_EFFECTS_RegisterAbilityMarker(marker, owner, ability, target_position)
+    local effect_data = AoE4RPG_EFFECTS_PrepareAbilityEffectData(ability, owner)
+    if not effect_data then return false end
+    if effect_data.effect_name == "damage_on_attacked"
+        or effect_data.effect_name == "track_attack_counts" then
+        return AoE4RPG_EFFECT_LIST_Apply(
+            effect_data.effect_name, owner, owner, effect_data
+        )
+    end
+    local marker_type = effect_data.marker_type or effect_data.marker_dispatch
+    if marker_type == "owner" then
+        return AoE4RPG_EFFECTS_RegisterOwnerDispatch(owner, effect_data)
+    elseif marker_type == "owner_heading" then
+        effect_data.marker_type = "owner_heading"
+        return AoE4RPG_EFFECTS_RegisterOwnerDispatch(owner, effect_data)
+    elseif marker_type == "projectiles" then
+        effect_data.marker_type = "projectile"
+    elseif marker_type == "area" then
+        return AoE4RPG_EFFECTS_RegisterAreaDispatch(owner, target_position, effect_data)
+    end
+    return AoE4RPG_EFFECTS_RegisterMarker(marker, owner, effect_data)
+end
+
+-- Removes a marker from the active registry.
+-- IMPORTANT: Temporary area markers created by this module are destroyed here; owner and projectile entities remain owned by their native ability systems.
+function AoE4RPG_EFFECTS_RemoveMarker(marker_id)
+    local marker_data = AoE4RPG.EFFECTS.markers[marker_id]
+    if marker_data and marker_data.circle_handle and Splat_Destroy then
+        pcall(function() Splat_Destroy(marker_data.circle_handle) end)
+    end
+    if marker_data and marker_data.destroy_on_remove and Entity_Destroy
+        and AoE4RPG_EFFECTS_IsValidEntity(marker_data.marker) then
+        Entity_Destroy(marker_id)
+    end
+    AoE4RPG.EFFECTS.markers[marker_id] = nil
+end
+
+-- Standard damage adapter used by the reusable effect list.
+-- Keeping this adapter here lets marker code remain independent of the concrete damage API.
+function AoE4RPG_EFFECTS_ApplyDamage(owner, target, amount)
+    if AoE4RPG_EFFECTS_ApplyDamageToEntity then
+        return AoE4RPG_EFFECTS_ApplyDamageToEntity(owner, target, amount)
+    end
+    -- ScarDoc exposes Entity_SetHealth but no portable direct-damage function.
+    -- IMPORTANT: This fallback applies direct health damage without armor calculation.
+    if not target or not Entity_GetHealth or not Entity_GetHealthMax or not Entity_SetHealth then
+        return false
+    end
+    local maximum_health = Entity_GetHealthMax(target)
+    local current_health = Entity_GetHealth(target)
+    local damage = math.max(0, tonumber(amount) or 0)
+    if not maximum_health or maximum_health <= 0 or not current_health or damage <= 0 then
+        return false
+    end
+    Entity_SetHealth(target, math.max(0, (current_health - damage) / maximum_health))
+    return true
+end
+
+-- Selects a weapon slot when the host exposes a setter.
+-- If that is not available, falls back to selecting the requested hardpoint, then hardpoint 01.
+function AoE4RPG_EFFECTS_SelectWeaponSlot(entity, effect)
+    if not entity or not effect then
+        return false
+    end
+    local slot = effect.weapon_slot or 1
+    local hardpoint = effect.hardpoint or ("hardpoint_0" .. tostring(slot))
+    if Entity_SetWeaponSlot then
+        Entity_SetWeaponSlot(entity, slot)
+        return true
+    end
+    if Entity_SetActiveWeaponSlot then
+        Entity_SetActiveWeaponSlot(entity, slot)
+        return true
+    end
+    if Entity_SetWeaponHardpoint then
+        Entity_SetWeaponHardpoint(entity, hardpoint)
+        return true
+    end
+    if Entity_SetActiveHardpoint then
+        Entity_SetActiveHardpoint(entity, hardpoint)
+        return true
+    end
+    if effect.fallback_hardpoint and Entity_SetWeaponHardpoint then
+        Entity_SetWeaponHardpoint(entity, "hardpoint_01")
+        return true
+    end
+    return false
+end
+
+-- Copies a delayed-effect row before it is placed in the one-shot queue.
+-- This prevents a later edit to Ability_List from changing an already-fired skill.
+function AoE4RPG_EFFECTS_CopyTable(value)
+    if AoE4RPG_RUNTIME_CopyTable then
+        return AoE4RPG_RUNTIME_CopyTable(value)
+    end
+    if type(value) ~= "table" then
+        return value
+    end
+    local copy = {}
+    for key, child in pairs(value) do
+        copy[key] = AoE4RPG_EFFECTS_CopyTable(child)
+    end
+    return copy
+end
+
+
+-- Applies one delayed effect after Rule_AddOneShot returns its timer callback.
+function AoE4RPG_EFFECTS_ApplyDelayedEffect(context)
+    if not context or not context.owner or not context.target
+        or not context.effect_name or not AoE4RPG_EFFECT_LIST_Apply then
+        return false
+    end
+    if not AoE4RPG_EFFECTS_IsValidEntity(context.owner)
+        or not AoE4RPG_EFFECTS_IsValidEntity(context.target) then
+        return false
+    end
+    return AoE4RPG_EFFECT_LIST_Apply(
+        context.effect_name,
+        context.owner,
+        context.target,
+        context.effect,
+        context.marker_data
+    )
+end
+
+
+-- Schedules one additional effect for the same target that received the primary effect.
+-- The delay is measured in seconds.
+function AoE4RPG_EFFECTS_QueueDelayedEffect(owner, target, delayed_effect, marker_data, parent_effect, row_index)
+    if not owner or not target or type(delayed_effect) ~= "table" then
+        return false
+    end
+
+    local effect_name = delayed_effect.effect_name
+        or delayed_effect.effect
+        or delayed_effect.apply_effect
+    if not effect_name or effect_name == "" then
+        return false
+    end
+
+    local target_id = AoE4RPG_EFFECTS_GetEntityID(target)
+    local once_key = target_id and (tostring(target_id) .. ":" .. tostring(row_index or 1)) or nil
+    if delayed_effect.once == true and marker_data and once_key then
+        marker_data.delayed_effects_queued = marker_data.delayed_effects_queued or {}
+        if marker_data.delayed_effects_queued[once_key] then
+            return true
+        end
+    end
+
+    local effect = AoE4RPG_EFFECTS_CopyTable(delayed_effect)
+    effect.effect_name = effect_name
+    effect.effect_level = math.max(
+        1,
+        tonumber(effect.effect_level)
+            or tonumber(parent_effect and parent_effect.effect_level)
+            or 1
+    )
+    if effect.effect_growth == nil and parent_effect then
+        effect.effect_growth = parent_effect.effect_growth
+    end
+
+    -- Capture time-dependent scaling when the primary effect hits.
+    -- The later callback applies this snapshot and does not recalculate a stale marker.
+    local fade_multiplier = AoE4RPG_EFFECTS_GetFadeMultiplier
+        and AoE4RPG_EFFECTS_GetFadeMultiplier(effect_name, marker_data, effect)
+        or 1
+    if fade_multiplier ~= 1 then
+        if effect.amount ~= nil then effect.amount = effect.amount * fade_multiplier end
+        if effect.damage ~= nil then effect.damage = effect.damage * fade_multiplier end
+    end
+
+    local delay = tonumber(delayed_effect.delay or delayed_effect.effect_delay) or 0
+    delay = math.max(0, delay)
+    local context = {
+        owner = owner,
+        target = target,
+        effect_name = effect_name,
+        effect = effect,
+        marker_data = marker_data,
+    }
+
+    local applied = false
+    if delay > 0 then
+        if not Rule_AddOneShot then
+            return false
+        end
+        Rule_AddOneShot(AoE4RPG_EFFECTS_ApplyDelayedEffect, delay, context)
+        applied = true
+    else
+        applied = AoE4RPG_EFFECTS_ApplyDelayedEffect(context)
+    end
+
+    if applied and delayed_effect.once == true and marker_data and once_key then
+        marker_data.delayed_effects_queued[once_key] = true
+    end
+    return applied
+end
+
+function AoE4RPG_EFFECTS_QueueDelayedEffects(owner, target, effect, marker_data)
+    if not effect then
+        return false
+    end
+    local rows = effect.delayed_effects or effect.additional_effects
+    if type(rows) ~= "table" then
+        return false
+    end
+    if rows.effect_name or rows.effect or rows.apply_effect then
+        rows = { rows }
+    end
+
+    local queued = false
+    for row_index, delayed_effect in ipairs(rows) do
+        if type(delayed_effect) == "table"
+            and AoE4RPG_EFFECTS_QueueDelayedEffect(
+                owner,
+                target,
+                delayed_effect,
+                marker_data,
+                effect,
+                row_index
+            ) then
+            queued = true
+        end
+    end
+    return queued
+end
+-- Applies one marker effect to one candidate target after all guard checks.
+-- IMPORTANT: A target must pass ownership filtering, optional radius filtering, and the one_hit rule.
+function AoE4RPG_EFFECTS_ApplyTargetEffect(marker_data, target)
+    local effect = marker_data.effect or {}
+    if AoE4RPG_EFFECTS_ExpandCompactValues then
+        effect = AoE4RPG_EFFECTS_ExpandCompactValues(effect)
+    end
+    local owner = marker_data.owner
+    local target_id = AoE4RPG_EFFECTS_GetEntityID(target)
+    if not target_id then
+        return false
+    end
+    if not AoE4RPG_EFFECTS_AffectsTarget(owner, target, effect.affects) then
+        return false
+    end
+
+    local distance = AoE4RPG_EFFECTS_GetDistance(marker_data.marker, target)
+    local effect_radius = tonumber(effect.radius or effect.area)
+    if effect_radius and (not distance or distance > effect_radius) then
+        return false
+    end
+    if effect.one_hit and marker_data.hit_targets[target_id] then
+        return false
+    end
+
+    local effect_name = effect.effect_name or effect.effect or "damage"
+    local fade_multiplier = AoE4RPG_EFFECTS_GetFadeMultiplier(effect_name, marker_data, effect)
+    local effective_effect = effect
+    if fade_multiplier ~= 1 and (effect.amount ~= nil or effect.damage ~= nil) then
+        effective_effect = {}
+        for key, value in pairs(effect) do effective_effect[key] = value end
+        if effective_effect.amount ~= nil then effective_effect.amount = effective_effect.amount * fade_multiplier end
+        if effective_effect.damage ~= nil then effective_effect.damage = effective_effect.damage * fade_multiplier end
+    end
+    AoE4RPG_EFFECT_LIST_Apply(effect_name, owner, target, effective_effect, marker_data)
+    AoE4RPG_EFFECTS_QueueDelayedEffects(owner, target, effective_effect, marker_data)
+    marker_data.hit_targets[target_id] = true
+    return true
+end
+
+-- ==================== Melee Attack-Move Hunt ====================
+-- Finds the nearest living enemy inside the configured search radius.
+-- ==================== Melee Attack-Move Hunt ====================
+
+function AoE4RPG_EFFECTS_FindNearestMeleeHuntTarget(owner, effect)
+    if not owner or not effect or not EGroup_CreateIfNotFound or not EGroup_Clear
+        or not EGroup_ForEach or not Entity_GetPosition then
+        return nil
+    end
+
+    local owner_id = AoE4RPG_EFFECTS_GetEntityID(owner)
+    local owner_position = Entity_GetPosition(owner)
+    local owner_player = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(owner)
+        or (Entity_GetPlayerOwner and Entity_GetPlayerOwner(owner))
+    local owner_player_handle = AoE4RPG_RUNTIME_GetPlayerHandle
+        and AoE4RPG_RUNTIME_GetPlayerHandle(owner_player)
+        or owner_player
+    local search_radius = tonumber(effect.hunt_search_radius or effect.search_radius)
+    if not search_radius or search_radius <= 0 then
+        search_radius = tonumber(effect.radius) or 25.0
+    end
+    if search_radius <= 0 then
+        search_radius = 25.0
+    end
+    if not owner_id or not owner_position or not owner_player_handle
+        or search_radius <= 0 then
+        return nil
+    end
+
+    local candidates = EGroup_CreateIfNotFound("AoE4RPG_MeleeHuntCandidates")
+
+    local nearest_entity = nil
+    local nearest_distance = nil
+    local nearest_entity_id = nil
+    local function inspect_candidate(candidate)
+        local candidate_id = candidate and AoE4RPG_EFFECTS_GetEntityID(candidate)
+        if not candidate or not candidate_id or candidate_id == owner_id
+            or (World_OwnsEntity and World_OwnsEntity(candidate))
+            or not AoE4RPG_EFFECTS_IsValidEntity(candidate_id)
+            or (Entity_IsAlive and not Entity_IsAlive(candidate_id))
+            or (not effect.allow_buildings and Entity_IsBuilding
+                and Entity_IsBuilding(candidate))
+            or not Entity_GetPlayerOwner then
+            return
+        end
+
+        local candidate_owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+            and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(candidate)
+            or nil
+        if not candidate_owner
+            or not AoE4RPG_EFFECTS_AffectsTarget(owner, candidate, effect.affects) then
+            return
+        end
+
+        local candidate_position = Entity_GetPosition(candidate)
+        local distance = candidate_position
+            and Util_GetDistance and Util_GetDistance(owner_position, candidate_position)
+            or nil
+        if distance and distance <= search_radius
+            and (nearest_distance == nil
+                or distance < nearest_distance
+                or (distance == nearest_distance and candidate_id < nearest_entity_id)) then
+            nearest_entity = candidate
+            nearest_distance = distance
+            nearest_entity_id = candidate_id
+        end
+    end
+
+    if World_GetEntitiesNearPoint and OT_Enemy then
+        EGroup_Clear(candidates)
+        World_GetEntitiesNearPoint(
+            owner_player_handle,
+            candidates,
+            owner_position,
+            search_radius,
+            OT_Enemy
+        )
+        EGroup_ForEach(candidates, function(_, _, candidate)
+            inspect_candidate(candidate)
+        end)
+    elseif World_GetAllEntities then
+        -- Compatibility fallback for hosts without the bounded player query.
+        EGroup_Clear(candidates)
+        World_GetAllEntities(candidates)
+        EGroup_ForEach(candidates, function(_, _, candidate)
+            inspect_candidate(candidate)
+        end)
+    end
+    return nearest_entity
+end
+
+function AoE4RPG_EFFECTS_CommandMeleeHunt(owner, target, effect, owner_id)
+    if not owner or not target or not effect or not Entity_GetPosition then
+        return false
+    end
+
+    local target_id = AoE4RPG_EFFECTS_GetEntityID(target)
+    local target_position = Entity_GetPosition(target)
+    if not target_id or not target_position then
+        return false
+    end
+
+    local squad = Entity_GetSquad and Entity_GetSquad(owner) or nil
+    local command_group = nil
+    if squad and SGroup_CreateIfNotFound and SGroup_Clear and SGroup_Add then
+        command_group = SGroup_CreateIfNotFound(
+            "AoE4RPG_MeleeHuntCommand_" .. tostring(owner_id)
+        )
+        SGroup_Clear(command_group)
+        SGroup_Add(command_group, squad)
+        if Cmd_AttackMove then
+            Cmd_AttackMove(
+                command_group,
+                target_position,
+                effect.attack_move_queued == true,
+                nil,
+                tonumber(effect.attack_move_cover_radius) or 0,
+                false,
+                false
+            )
+        end
+    end
+
+    local teleport_position = target_position
+    if squad and Squad_TryFindClosestFreePosition then
+        teleport_position = Squad_TryFindClosestFreePosition(squad, target_position)
+            or target_position
+    elseif Entity_CalculatePassableSpawnPosition then
+        teleport_position = Entity_CalculatePassableSpawnPosition(owner, target_position)
+            or target_position
+    end
+
+    if squad and Squad_WarpToPos then
+        Squad_WarpToPos(squad, teleport_position)
+    elseif Entity_WarpToPos then
+        Entity_WarpToPos(owner, teleport_position)
+    else
+        return false
+    end
+
+    if command_group and EGroup_CreateIfNotFound and EGroup_Clear and EGroup_Add
+        and Cmd_Attack then
+        local target_group = EGroup_CreateIfNotFound(
+            "AoE4RPG_MeleeHuntTarget_" .. tostring(owner_id)
+        )
+        EGroup_Clear(target_group)
+        EGroup_Add(target_group, target_id)
+        Cmd_Attack(command_group, target_group, false)
+    end
+    return true
+end
+
+-- Removes one active hunt by owner ID.
+-- IMPORTANT: Death cleanup calls this so no stale target or command-group state survives an owner entity being destroyed.
+function AoE4RPG_EFFECTS_StopMeleeAttackMoveHunt(owner_or_id)
+    local owner_id = AoE4RPG_EFFECTS_GetEntityID(owner_or_id) or owner_or_id
+    if not owner_id then return false end
+    local hunts = AoE4RPG.EFFECTS.melee_attack_move_hunts or {}
+    if not hunts[owner_id] then return false end
+    hunts[owner_id] = nil
+    return true
+end
+
+-- Chooses the next target, sends the owner to it, and stores only stable IDs in the monitored session.
+-- This lets a respawned or removed entity fail safely without retaining a stale engine handle.
+function AoE4RPG_EFFECTS_AdvanceMeleeAttackMoveHunt(hunt)
+    if not hunt then return false end
+    local owner = hunt.owner
+    if hunt.owner_id and Entity_FromID then
+        owner = Entity_FromID(hunt.owner_id)
+    end
+    if not owner or not AoE4RPG_EFFECTS_IsValidEntity(owner) then
+        return false
+    end
+
+    local target = AoE4RPG_EFFECTS_FindNearestMeleeHuntTarget(owner, hunt.effect)
+    if not target then
+        hunt.target_id = nil
+        hunt.next_check = AoE4RPG_EFFECTS_GetTime()
+            + (tonumber(hunt.effect.hunt_retarget_interval) or 0.125)
+        return true
+    end
+
+    local target_id = AoE4RPG_EFFECTS_GetEntityID(target)
+    if not target_id or not AoE4RPG_EFFECTS_CommandMeleeHunt(
+        owner, target, hunt.effect, hunt.owner_id
+    ) then
+        return false
+    end
+    hunt.target_id = target_id
+    hunt.next_check = AoE4RPG_EFFECTS_GetTime()
+        + (tonumber(hunt.effect.hunt_retarget_interval) or 0.125)
+    return true
+end
+
+-- Starts a timed hunt directly from GE_AbilityExecuted.
+function AoE4RPG_EFFECT_LIST_ApplyMeleeAttackMoveHunt(owner, target, data)
+    if not owner or not data then return false end
+    local owner_id = AoE4RPG_EFFECTS_GetEntityID(owner)
+    local duration = tonumber(data.duration or data.hunt_duration) or 5.0
+    if not owner_id or duration <= 0 then return false end
+
+    AoE4RPG.EFFECTS.melee_attack_move_hunts[owner_id] = {
+        owner = owner,
+        owner_id = owner_id,
+        effect = AoE4RPG_EFFECTS_CopyTable(data),
+        expires_at = AoE4RPG_EFFECTS_GetTime() + duration,
+        target_id = nil,
+        next_check = AoE4RPG_EFFECTS_GetTime(),
+    }
+    return AoE4RPG_EFFECTS_AdvanceMeleeAttackMoveHunt(
+        AoE4RPG.EFFECTS.melee_attack_move_hunts[owner_id]
+    )
+end
+
+-- Activates effects that are command sequences rather than marker dispatches.
+function AoE4RPG_EFFECTS_ActivateDirectAbilityEffect(owner, ability, context)
+    if not owner or not ability then return false end
+    local effect_data = AoE4RPG_EFFECTS_PrepareAbilityEffectData(ability, owner)
+    if not effect_data then
+        return false
+    end
+    if effect_data.effect_name == "damage_on_attacked"
+        or effect_data.effect_name == "track_attack_counts" then
+        return AoE4RPG_EFFECT_LIST_Apply(
+            effect_data.effect_name, owner, owner, effect_data, context
+        )
+    end
+if effect_data.effect_name == "heal" then
+        local target = AoE4RPG_EFFECTS_GetAbilityTargetEntity(context)
+        if not target or not AoE4RPG_EFFECTS_IsValidEntity(target) then
+            return false
+        end
+        -- IMPORTANT: This is an additive RPG heal. Native monk healing remains owned by the XML ability.
+        return AoE4RPG_EFFECT_LIST_Apply("heal", owner, target, effect_data, context)
+    end
+    if effect_data.effect_name ~= "melee_attack_move_hunt" then
+        return false
+    end
+    if effect_data.melee_only == true and Entity_IsOfType
+        and not Entity_IsOfType(owner, "melee") then
+        return false
+    end
+    return AoE4RPG_EFFECT_LIST_Apply(
+        effect_data.effect_name, owner, nil, effect_data, context
+    )
+end
+
+-- Monitors only the target/deadline of each hunt.
+-- IMPORTANT: Target discovery is not repeated while a target is alive, so the world scan occurs only once per target and again when that target dies or no target was initially available.
+function AoE4RPG_EFFECTS_MonitorMeleeAttackMoveHunts()
+    local now = AoE4RPG_EFFECTS_GetTime()
+    local hunts = AoE4RPG.EFFECTS.melee_attack_move_hunts or {}
+    for owner_id, hunt in pairs(hunts) do
+        local owner = hunt.owner_id and Entity_FromID and Entity_FromID(hunt.owner_id)
+            or hunt.owner
+        local owner_alive = owner and AoE4RPG_EFFECTS_IsValidEntity(owner)
+            and (not Entity_IsAlive or Entity_IsAlive(hunt.owner_id))
+        if not owner_alive or now >= hunt.expires_at then
+            hunts[owner_id] = nil
+        elseif now >= (hunt.next_check or 0) then
+            local target_alive = hunt.target_id
+                and AoE4RPG_EFFECTS_IsValidEntity(hunt.target_id)
+                and (not Entity_IsAlive or Entity_IsAlive(hunt.target_id))
+            if not target_alive then
+                AoE4RPG_EFFECTS_AdvanceMeleeAttackMoveHunt(hunt)
+            else
+                hunt.next_check = now
+                    + (tonumber(hunt.effect.hunt_retarget_interval) or 0.125)
+            end
+        end
+    end
+end
+
+-- Caller supplies the target iterator because the available EGroup APIs vary by host.
+-- IMPORTANT: The iterator must invoke callback(entity) for possible targets.
+-- Performs one scheduled update for a marker.
+-- The caller supplies target discovery because EGroup enumeration signatures differ between game/mod hosts.
+function AoE4RPG_EFFECTS_UpdateMarker(marker_data, target_iterator)
+    if not marker_data or not AoE4RPG_EFFECTS_IsValidEntity(marker_data.marker) then
+        return false
+    end
+    local now = AoE4RPG_EFFECTS_GetTime()
+    if marker_data.expires_at and now >= marker_data.expires_at then
+        return false
+    end
+    local effect = marker_data.effect or {}
+    if now < (marker_data.next_tick or 0) then
+        return true
+    end
+    marker_data.next_tick = now + (effect.tick_interval or 1.0)
+    if target_iterator then
+        target_iterator(function(target)
+            if AoE4RPG_EFFECTS_IsValidEntity(target) then
+                AoE4RPG_EFFECTS_ApplyTargetEffect(marker_data, target)
+            end
+        end)
+    end
+    return true
+end
+
+-- Advances every active marker.
+function AoE4RPG_EFFECTS_MonitorMarkers()
+    for marker_id, marker_data in pairs(AoE4RPG.EFFECTS.markers) do
+        local alive = AoE4RPG_EFFECTS_UpdateMarker(marker_data, marker_data.effect.target_iterator)
+        if not alive then
+            AoE4RPG_EFFECTS_RemoveMarker(marker_id)
+        end
+    end
+    AoE4RPG_EFFECTS_MonitorMeleeAttackMoveHunts()
+end
+
+-- IMPORTANT: Stores an event-driven passive by owner entity ID.
+function AoE4RPG_EFFECTS_RegisterPassive(entity, passive_name, passive_data)
+    local entity_id = AoE4RPG_EFFECTS_GetEntityID(entity)
+    if not entity_id or not passive_name or not passive_data then
+        return false
+    end
+    AoE4RPG.EFFECTS.passives[entity_id] = AoE4RPG.EFFECTS.passives[entity_id] or {}
+    AoE4RPG.EFFECTS.passives[entity_id][passive_name] = passive_data
+    return true
+end
+
+-- Removes one named passive without affecting other passives on the same entity.
+function AoE4RPG_EFFECTS_RemovePassive(entity, passive_name)
+    local entity_id = AoE4RPG_EFFECTS_GetEntityID(entity)
+    if AoE4RPG.EFFECTS.passives[entity_id] then
+        AoE4RPG.EFFECTS.passives[entity_id][passive_name] = nil
+    end
+end
+
+-- Removes every event-driven passive owned by an entity.
+-- IMPORTANT: Death cleanup uses this before the tracker releases the EntityID, preventing stale reactive effects from being assigned to a replacement entity that reuses the same ID.
+function AoE4RPG_EFFECTS_RemoveAllPassives(entity)
+    local entity_id = AoE4RPG_EFFECTS_GetEntityID(entity)
+    if entity_id and AoE4RPG.EFFECTS.passives then
+        AoE4RPG.EFFECTS.passives[entity_id] = nil
+        return true
+    end
+    return false
+end
+
+-- Dispatches an event to every matching passive.
+-- IMPORTANT: The callback receives the owning entity ID, event context, and its own passive data record.
+function AoE4RPG_EFFECTS_TriggerPassives(event_name, context)
+    for entity_id, passive_list in pairs(AoE4RPG.EFFECTS.passives) do
+        for _, passive in pairs(passive_list) do
+            if passive.trigger == event_name and passive.on_trigger then
+                passive.on_trigger(entity_id, context, passive)
+            end
+        end
+    end
+end
+
+
+-- ==================== Effect Fade Calculation ==============
+-- ==================== Effect Fade Calculation ==============
+
+function AoE4RPG_EFFECTS_GetFadeMultiplier(effect_name, marker_data, effect)
+    local row = AoE4RPG_EFFECT_GetDescriptionRow and AoE4RPG_EFFECT_GetDescriptionRow(effect_name) or nil
+    local fade = effect and effect.fade or row and row.fade or nil
+    if not fade or fade.enabled ~= true then return 1 end
+    local created_at = marker_data and marker_data.created_at or AoE4RPG_EFFECTS_GetTime()
+    local elapsed = math.max(0, AoE4RPG_EFFECTS_GetTime() - created_at)
+    local start_time = tonumber(fade.start_time) or 0
+    local full_time = tonumber(fade.full_time) or tonumber(effect and effect.duration) or start_time
+    local start_multiplier = tonumber(fade.start_multiplier) or 0
+    if elapsed <= start_time then return start_multiplier end
+    if full_time <= start_time or elapsed >= full_time then return 1 end
+    local progress = (elapsed - start_time) / (full_time - start_time)
+    return start_multiplier + (1 - start_multiplier) * math.max(0, math.min(1, progress))
+end
+
+-- ==================== Effect Description Formatting ==============
+-- ==================== Effect Description Formatting ==============
+
+function AoE4RPG_EFFECT_GetDescriptionRow(effect_name)
+    for _, row in ipairs(AoE4RPG.EFFECT_DESCRIPTIONS or {}) do
+        if row.effect_name == effect_name then return row end
+    end
+    return nil
+end
+
+function AoE4RPG_EFFECT_GetDisplayName(effect_name)
+    local row = AoE4RPG_EFFECT_GetDescriptionRow(effect_name)
+    return row and (row.display_name or row.effect_name) or effect_name
+end
+
+function AoE4RPG_EFFECT_FormatDescription(effect_name, data)
+    local row = AoE4RPG_EFFECT_GetDescriptionRow(effect_name)
+    if not row or not row.description then return nil end
+    local description = row.description
+    local value_text = "N/A"
+    if data and (data.amount ~= nil or data.damage ~= nil)
+        and AoE4RPG_EFFECT_LIST_GetScaledAmount then
+        value_text = string.format("%g", AoE4RPG_EFFECT_LIST_GetScaledAmount(data))
+    end
+    description = string.gsub(description, "<effect_value>", value_text)
+    description = string.gsub(description, "<effect_level>", tostring(data and data.effect_level or 1))
+    description = string.gsub(description, "<display_name>", tostring(row.display_name or effect_name))
+    return description
+end
+
+-- ==================== Ability Description Formatting ==============
+-- Builds player-facing ability text from the ability row and its nested effects.
+-- ==================== Ability Description Formatting ==============
+
+function AoE4RPG_EFFECT_FormatAbilityDescription(ability, fallback_data)
+    if not ability or not ability.ability_description then return nil end
+    if AoE4RPG_EFFECTS_ExpandCompactValues then
+        ability = AoE4RPG_EFFECTS_ExpandCompactValues(ability)
+        fallback_data = AoE4RPG_EFFECTS_ExpandCompactValues(fallback_data or {})
+    end
+    local description = ability.ability_description
+    local effect_rows = {}
+    if type(ability.effects) == "table" and #ability.effects > 0 then
+        for _, source_row in ipairs(ability.effects) do
+            local row = {}
+            for key, value in pairs(source_row) do row[key] = value end
+            row.effect_growth = row.effect_growth or ability.effect_growth
+            row.radius = row.radius or row.area
+            table.insert(effect_rows, row)
+        end
+    elseif ability.apply_effect or ability.effect_name then
+        local row = {}
+        for key, value in pairs(ability.apply_effect_data or {}) do row[key] = value end
+        row.effect_name = row.effect_name or ability.apply_effect or ability.effect_name
+        row.amount = row.amount ~= nil and row.amount or ability.amount
+        row.damage = row.damage ~= nil and row.damage or ability.damage
+        row.duration = row.duration ~= nil and row.duration or ability.duration
+        row.radius = row.radius ~= nil and row.radius or ability.radius or ability.area
+        row.effect_growth = row.effect_growth or ability.effect_growth
+        table.insert(effect_rows, row)
+    else
+        table.insert(effect_rows, fallback_data or ability)
+    end
+
+    local delayed_rows = ability.delayed_effects or ability.additional_effects
+    if type(delayed_rows) == "table" then
+        if delayed_rows.effect_name or delayed_rows.effect or delayed_rows.apply_effect then
+            delayed_rows = { delayed_rows }
+        end
+        for _, source_row in ipairs(delayed_rows) do
+            if type(source_row) == "table" then
+                local row = {}
+                for key, value in pairs(source_row) do row[key] = value end
+                row.effect_level = row.effect_level or ability.effect_level
+                row.effect_growth = row.effect_growth or ability.effect_growth
+                row.radius = row.radius or row.area
+                table.insert(effect_rows, row)
+            end
+        end
+    end
+
+    local function format_value(row)
+        if not row or (row.amount == nil and row.damage == nil) then return "N/A" end
+        return string.format("%g", AoE4RPG_EFFECT_LIST_GetScaledAmount(row))
+    end
+    local function format_field(row, field)
+        return row and row[field] ~= nil and tostring(row[field]) or "N/A"
+    end
+    local function replace(token, value)
+        description = string.gsub(description, token, function() return tostring(value) end)
+    end
+
+    local first = effect_rows[1] or fallback_data or ability
+    replace("<effect_value>", format_value(first))
+    replace("<effect_duration>", format_field(first, "duration"))
+    replace("<effect_radius>", format_field(first, "radius"))
+    replace("<effect_delay>", format_field(first, "delay") ~= "N/A"
+        and format_field(first, "delay") or format_field(first, "effect_delay"))
+    replace("<effect_name>", AoE4RPG_EFFECT_GetDisplayName(first.effect_name or "effect"))
+    for index, row in ipairs(effect_rows) do
+        replace("<effect_" .. tostring(index) .. "_value>", format_value(row))
+        replace("<effect_" .. tostring(index) .. "_duration>", format_field(row, "duration"))
+        replace("<effect_" .. tostring(index) .. "_radius>", format_field(row, "radius"))
+        replace("<effect_" .. tostring(index) .. "_delay>", format_field(row, "delay") ~= "N/A"
+            and format_field(row, "delay") or format_field(row, "effect_delay"))
+        replace("<effect_" .. tostring(index) .. "_name>", AoE4RPG_EFFECT_GetDisplayName(row.effect_name or "effect"))
+    end
+    return description
+end
+
+-- ==================== Effect Implementations ==============
+-- ==================== Effect Implementations ==============
+-- Returns an effect amount scaled by the selected skill's effect level.
+
+function AoE4RPG_EFFECT_LIST_GetScaledAmount(data)
+    local amount = tonumber(data and (data.amount or data.damage)) or 0
+    local level = math.max(1, tonumber(data and data.effect_level) or 1)
+    local growth = tonumber(data and data.effect_growth) or 0.50
+    return amount * (1 + (level - 1) * growth)
+end
+
+-- No-value skills use their level for cooldown instead of amount scaling.
+-- Each additional skill level reduces the ability recharge by another 10%.
+function AoE4RPG_EFFECT_LIST_ApplyNoValueSkillCooldown(owner, ability, data)
+    if not owner or not ability or not Modify_AbilityRechargeTime then
+        return false
+    end
+    local level = math.max(1, tonumber(data and data.effect_level) or 1)
+    local desired_reduction = math.min(0.95, level * 0.10)
+    local skill_key = data and (data.ability_name or data.ability or data.ability_pbgid)
+        or tostring(ability)
+    local unit_data = owner.EntityID and AoE4RPG_GetUnitData
+        and AoE4RPG_GetUnitData(owner.EntityID)
+        or nil
+    if not unit_data then return false end
+    unit_data.skill_cooldown_reductions = unit_data.skill_cooldown_reductions or {}
+    local previous_reduction = unit_data.skill_cooldown_reductions[skill_key] or 0
+    if desired_reduction <= previous_reduction then
+        return true
+    end
+    local delta_factor = (1 - desired_reduction) / math.max(0.01, 1 - previous_reduction)
+    Modify_AbilityRechargeTime(owner, ability, delta_factor, MUT_Multiplication)
+    unit_data.skill_cooldown_reductions[skill_key] = desired_reduction
+    return true
+end
+
+-- Unique skills reduce cooldown by 10% per current hero bracket.
+function AoE4RPG_EFFECT_LIST_ApplyUniqueSkillCooldown(owner, ability, data)
+    if not owner or not ability or not Modify_AbilityRechargeTime then
+        return false
+    end
+    local skill_key = data and (data.ability_name or data.ability or data.ability_pbgid)
+        or tostring(ability)
+    local unit_data = owner.EntityID and AoE4RPG_GetUnitData
+        and AoE4RPG_GetUnitData(owner.EntityID)
+        or nil
+    if not unit_data then return false end
+    unit_data.skill_cooldown_reductions = unit_data.skill_cooldown_reductions or {}
+    local previous_reduction = unit_data.skill_cooldown_reductions[skill_key] or 0
+    local level = math.max(1, tonumber(data and data.effect_level) or 1)
+    local desired_reduction = math.min(0.95, level * 0.10)
+    if desired_reduction <= previous_reduction then
+        return true
+    end
+    local delta_factor = (1 - desired_reduction) / math.max(0.01, 1 - previous_reduction)
+    Modify_AbilityRechargeTime(owner, ability, delta_factor, MUT_Multiplication)
+    unit_data.skill_cooldown_reductions[skill_key] = desired_reduction
+    return true
+end
+
+-- Damage effect.
+function AoE4RPG_EFFECT_LIST_ApplyDamage(owner, target, data)
+    if AoE4RPG_EFFECTS_ApplyDamage then
+        return AoE4RPG_EFFECTS_ApplyDamage(
+            owner,
+            target,
+            AoE4RPG_EFFECT_LIST_GetScaledAmount(data)
+        )
+    end
+    return false
+end
+
+-- Registers a reusable retaliation passive.
+-- The effect is configured in the Ability List, but it is executed only when the registered owner is damaged.
+function AoE4RPG_EFFECT_LIST_ApplyDamageOnAttacked(owner, target, data)
+    if not owner or not data or not AoE4RPG_EFFECTS_RegisterPassive then
+        return false
+    end
+    local passive_name = data.effect_id or data.ability_name or "damage_on_attacked"
+    local passive_data = AoE4RPG_EFFECTS_CopyTable(data)
+    passive_data.trigger = "damage_received"
+    passive_data.on_trigger = AoE4RPG_EFFECT_LIST_OnOwnerDamaged
+    return AoE4RPG_EFFECTS_RegisterPassive(owner, passive_name, passive_data)
+end
+
+-- Applies the configured retaliation pulse to every eligible unit around the damaged owner.
+-- The owner is always excluded; `affects` defaults to enemies.
+function AoE4RPG_EFFECT_LIST_OnOwnerDamaged(entity_id, context, passive_data)
+    if not entity_id or not context or not passive_data
+        or not AoE4RPG_EFFECTS_GetEntityID or not AoE4RPG_EFFECTS_IterateAroundOwner
+        or not AoE4RPG_EFFECT_LIST_Apply then
+        return false
+    end
+    if context.isRepairing or tonumber(context.damage) == nil
+        or tonumber(context.damage) <= 0 then
+        return false
+    end
+
+    local victim_id = AoE4RPG_EFFECTS_GetEntityID(context.victim or context.entity)
+    if victim_id ~= entity_id then
+        return false
+    end
+    local owner = Entity_FromID and Entity_FromID(entity_id) or context.victim
+    if not owner or (AoE4RPG_EFFECTS_IsValidEntity and not AoE4RPG_EFFECTS_IsValidEntity(owner)) then
+        return false
+    end
+
+    local owner_id = AoE4RPG_EFFECTS_GetEntityID(owner)
+    local effect = passive_data
+    local current_time = AoE4RPG_EFFECTS_GetTime()
+    local activation_cooldown = math.max(0,
+        tonumber(effect.activation_cooldown or effect.reactive_cooldown or effect.cooldown) or 0)
+    if activation_cooldown > 0
+        and passive_data.next_activation_time
+        and current_time < passive_data.next_activation_time then
+        return false
+    end
+    if activation_cooldown > 0 then
+        passive_data.next_activation_time = current_time + activation_cooldown
+    end
+
+    local animation_action = effect.animation_action or effect.attack_animation
+    if animation_action and animation_action ~= "" then
+        if Entity_SetAnimatorAction then
+            Entity_SetAnimatorAction(owner, animation_action)
+        elseif Entity_GetSquad and Squad_SetAnimatorAction then
+            local squad = Entity_GetSquad(owner)
+            if squad then Squad_SetAnimatorAction(squad, animation_action) end
+        end
+    end
+
+    local effect_name = effect.apply_effect or effect.reactive_effect or "damage"
+    local applied = false
+    AoE4RPG_EFFECTS_IterateAroundOwner(owner, effect, function(target)
+        local target_id = AoE4RPG_EFFECTS_GetEntityID(target)
+        if not target_id or target_id == owner_id
+            or (Entity_IsBuilding and Entity_IsBuilding(target))
+            or (Entity_IsOfType and Entity_IsOfType(target, "building"))
+            or not AoE4RPG_EFFECTS_AffectsTarget(owner, target, effect.affects) then
+            return
+        end
+        local nested_effect = AoE4RPG_EFFECTS_CopyTable(effect)
+        nested_effect.effect_name = effect_name
+        nested_effect.effect = nil
+        nested_effect.apply_effect = nil
+        nested_effect.reactive_effect = nil
+        if AoE4RPG_EFFECT_LIST_Apply(effect_name, owner, target, nested_effect) then
+            applied = true
+        end
+    end)
+    return applied
+end
+
+-- Healing effects.
+function AoE4RPG_EFFECT_LIST_Heal(owner, target, data)
+    if Entity_GetHealth and Entity_SetHealth and Entity_GetHealthMax then
+        local maximum = Entity_GetHealthMax(target)
+        if maximum and maximum > 0 then
+            local previous_health = Entity_GetHealth(target) or 0
+            local requested_amount = math.max(0, AoE4RPG_EFFECT_LIST_GetScaledAmount(data))
+            local restored_health = math.max(
+                0,
+                math.min(maximum, previous_health + requested_amount) - previous_health
+            )
+            Entity_SetHealth(target, math.min(1, (previous_health + restored_health) / maximum))
+            if restored_health > 0 and owner and AoE4RPG_AwardHealingExperience then
+                AoE4RPG_AwardHealingExperience(owner, restored_health, target)
+            end
+            -- IMPORTANT: Keep the self-healing observer from counting this known effect a second time.
+            if target and target.EntityID and AoE4RPG_GetExistingUnitData then
+                local target_data = AoE4RPG_GetExistingUnitData(target.EntityID)
+                if target_data then
+                    target_data.healing_observed_health = Entity_GetHealth(target)
+                    target_data.healing_observed_max_health = maximum
+                end
+            end
+            return true
+        end
+    end
+    return false
+end
+
+-- =============================== Weapons Related ================================
+-- Every effect directly affecting Weapons performances.
+-- Apply Damage isn't a weapon related effect.
+-- IMPORTANT: So never put it here.
+-- =============================== Weapons Related ================================
+
+-- Weapon Swap Effect.
+-- Not properly implemented yet.
+function AoE4RPG_EFFECT_LIST_WeaponSlot(owner, target, data)
+    local entity = target or owner
+    local slot = data.weapon_slot or 1
+    local hardpoint = data.hardpoint or ("hardpoint_0" .. tostring(slot))
+    if Entity_SetWeaponSlot then Entity_SetWeaponSlot(entity, slot); return true end
+    if Entity_SetActiveWeaponSlot then Entity_SetActiveWeaponSlot(entity, slot); return true end
+    if Entity_SetWeaponHardpoint then Entity_SetWeaponHardpoint(entity, hardpoint); return true end
+    if Entity_SetActiveHardpoint then Entity_SetActiveHardpoint(entity, hardpoint); return true end
+    return false
+end
+
+-- Ignore Armor Scripts.
+-- Applies direct health damage instead of weapon damage.
+function AoE4RPG_EFFECT_LIST_AttackIgnoreArmor(owner, target, data)
+    return AoE4RPG_EFFECT_LIST_ApplyDamageBuff(owner, target, data)
+end
+
+function AoE4RPG_EFFECT_LIST_ApplyDamageBuff(owner, target, data)
+    if not owner or not Modifier_Create or not Modifier_ApplyToEntity then return false end
+    local amount = AoE4RPG_EFFECT_LIST_GetScaledAmount(data)
+    local modifier = Modifier_Create(MAT_Weapon, "damage_weapon_modifier", MUT_MultiplicationAddition, false, amount, "")
+    return Modifier_ApplyToEntity(modifier, owner, 0) ~= nil
+end
+
+function AoE4RPG_EFFECT_LIST_ApplyAttackSpeedBuff(owner, target, data)
+    if not owner or not Modifier_Create or not Modifier_ApplyToEntity then return false end
+    local factor = math.max(0.01, 1 - AoE4RPG_EFFECT_LIST_GetScaledAmount(data))
+    local applied = false
+    for _, modifier_name in ipairs({ "reload_weapon_modifier", "cooldown_weapon_modifier", "weapon_wind_up_modifier", "weapon_wind_down_modifier" }) do
+        local modifier = Modifier_Create(MAT_Weapon, modifier_name, MUT_Multiplication, false, factor, "")
+        applied = Modifier_ApplyToEntity(modifier, owner, 0) ~= nil or applied
+    end
+    return applied
+end
+
+-- Normalizes the damage channel used by an armor-shred effect.
+function AoE4RPG_EFFECT_LIST_NormalizeDamageType(value)
+    if type(value) ~= "string" then return nil end
+    local normalized = string.lower(value)
+    normalized = string.gsub(normalized, "[%s%-]+", "_")
+    if normalized == "fire" or normalized == "fire_damage" then
+        return "fire"
+    elseif normalized == "melee" or normalized == "melee_damage" then
+        return "melee"
+    elseif normalized == "ranged" or normalized == "ranged_damage"
+        or normalized == "piercing" or normalized == "piercing_damage" then
+        return "ranged"
+    elseif normalized == "siege" or normalized == "siege_damage"
+        or normalized == "true_damage" or normalized == "truedamage"
+        or normalized == "truedamage_damage" then
+        return "true_damage"
+    end
+    return nil
+end
+
+-- Resolves one damage channel for armor shred.
+-- IMPORTANT: Melee, ranged, and siege retain a compatibility fallback based on the attacker's combat type when the event supplies no type field.
+function AoE4RPG_EFFECT_LIST_GetDamageTypeForArmorShred(owner, data, marker_data)
+    local explicit_type = data and (data.damage_type or data.damageType)
+    local damage_type = AoE4RPG_EFFECT_LIST_NormalizeDamageType(explicit_type)
+    if damage_type then return damage_type end
+
+    local event_type = marker_data and (
+        marker_data.damage_type or marker_data.damageType
+        or marker_data.weapon_damage_type or marker_data.weaponDamageType
+        or marker_data.attack_type or marker_data.attackType
+    )
+    damage_type = AoE4RPG_EFFECT_LIST_NormalizeDamageType(event_type)
+    if damage_type then return damage_type end
+
+    if owner and Entity_IsOfType then
+        if Entity_IsOfType(owner, "siege") then return "true_damage" end
+        if AoE4RPG_EntityMatchesCombatType
+            and AoE4RPG_EntityMatchesCombatType(owner, "melee") then
+            return "melee"
+        end
+        if AoE4RPG_EntityMatchesCombatType
+            and AoE4RPG_EntityMatchesCombatType(owner, "ranged") then
+            return "ranged"
+        end
+        if Entity_IsOfType(owner, "melee") then return "melee" end
+        if Entity_IsOfType(owner, "ranged") then return "ranged" end
+    end
+    return nil
+end
+
+-- IMPORTANT: Removes a fixed amount from exactly one native armor channel.
+function AoE4RPG_EFFECT_LIST_ApplyArmorShred(owner, target, data, marker_data)
+    if not target or not Modifier_Create or not Modifier_ApplyToSquad
+        or not Entity_GetSquad then
+        return false
+    end
+    if AoE4RPG_EFFECTS_IsValidEntity
+        and not AoE4RPG_EFFECTS_IsValidEntity(target) then
+        return false
+    end
+
+    local damage_type = AoE4RPG_EFFECT_LIST_GetDamageTypeForArmorShred(
+        owner, data, marker_data
+    )
+    local modifier_names = AoE4RPG_RESISTANCE_MODIFIER_NAMES or {
+        fire = "armor_scalar_for_fire_damage",
+        melee = "armor_scalar_for_melee_damage",
+        ranged = "armor_scalar_for_ranged_damage",
+        true_damage = "armor_scalar_for_truedamage_damage",
+    }
+    local modifier_name = damage_type and modifier_names[damage_type] or nil
+    if not modifier_name then return false end
+
+    local amount = math.max(0, tonumber(data and (data.amount or data.armor_amount)) or 1)
+    if amount <= 0 then return false end
+    local modifier = Modifier_Create(
+        MAT_Entity, modifier_name, MUT_Addition, false, -amount, ""
+    )
+    if not modifier then return false end
+    local target_squad = Entity_GetSquad(target)
+    if not target_squad then return false end
+    -- IMPORTANT: Ordinary targets may not expose entity modifier_ext.
+    return Modifier_ApplyToSquad(modifier, target_squad, 0) ~= nil
+end
+
+function AoE4RPG_EFFECT_LIST_ApplyAttributeMultiplier(owner, target, data)
+    if not owner or not data or not AoE4RPG_GetUnitData then return false end
+    local unit_data = AoE4RPG_GetUnitData(owner.EntityID)
+    local attribute_name = data.attribute or data.attribute_name or ({ agility_multiplier = "agility", endurance_multiplier = "endurance", vitality_multiplier = "vitality" })[data.effect_name]
+    if not unit_data or not attribute_name then return false end
+    unit_data.effect_attribute_multipliers = unit_data.effect_attribute_multipliers or {}
+    local key = data.effect_id or data.ability_name or attribute_name
+    unit_data.effect_attribute_multipliers[attribute_name] = unit_data.effect_attribute_multipliers[attribute_name] or {}
+    unit_data.effect_attribute_multipliers[attribute_name][key] = AoE4RPG_EFFECT_LIST_GetScaledAmount(data)
+    local total = 0
+    for _, value in pairs(unit_data.effect_attribute_multipliers[attribute_name]) do total = total + value end
+    if AoE4RPG_SetAttributePassive then AoE4RPG_SetAttributePassive(unit_data, attribute_name, total) end
+    if AoE4RPG_TranslateAttributesToStats then AoE4RPG_TranslateAttributesToStats(unit_data) end
+    return true
+end
+
+function AoE4RPG_EFFECT_LIST_ApplyAbilityValueMultiplier(owner, target, data)
+    if not owner or not data or not AoE4RPG_GetUnitData then return false end
+    local unit_data = AoE4RPG_GetUnitData(owner.EntityID)
+    if not unit_data then return false end
+    local source = data.source or data.ability_value_source or ({ ability_damage_multiplier = "damage", ability_health_multiplier = "health" })[data.effect_name]
+    local value = source == "health" and Entity_GetHealthMax and Entity_GetHealthMax(owner) or source == "damage" and (unit_data.attack_damage or unit_data.damage_dealt or 0) or 0
+    unit_data.ability_value_multipliers = unit_data.ability_value_multipliers or {}
+    unit_data.ability_value_multipliers[source] = value * AoE4RPG_EFFECT_LIST_GetScaledAmount(data)
+    return true
+end
+
+function AoE4RPG_EFFECT_LIST_ApplyMissingHealthTrigger(owner, target, data, marker_data)
+    if not owner or not Entity_GetHealth or not Entity_GetHealthMax then return false end
+    local maximum = Entity_GetHealthMax(owner)
+    if not maximum or maximum <= 0 then return false end
+    local level = math.max(1, tonumber(data.effect_level) or 1)
+    local threshold = math.max(data.minimum_threshold or 0, (data.threshold or 0.80) - (level - 1) * (data.threshold_reduction_per_level or 0.15))
+    local missing_ratio = 1 - math.max(0, Entity_GetHealth(owner) or 0) / maximum
+    local health_ratio_mode = data.health_ratio_mode or "threshold"
+    if health_ratio_mode ~= "threshold_effect_scaling" and health_ratio_mode ~= "threshold" then
+        return false
+    end
+    if health_ratio_mode == "threshold" and missing_ratio < threshold then return false end
+    local threshold_effect_scaling = 1
+    if health_ratio_mode == "threshold_effect_scaling" then
+        threshold_effect_scaling = math.min(1, math.max(0, missing_ratio / math.max(0.01, threshold)))
+    end
+    local nested = {}
+    for key, value in pairs(data.apply_effect_data or {}) do nested[key] = value end
+    nested.effect_name = data.apply_effect
+    nested.effect_level = level
+    if health_ratio_mode == "threshold_effect_scaling" then
+        if threshold_effect_scaling <= 0 then return false end
+        if nested.amount ~= nil then nested.amount = nested.amount * threshold_effect_scaling end
+        if nested.damage ~= nil then nested.damage = nested.damage * threshold_effect_scaling end
+    end
+    return AoE4RPG_EFFECT_LIST_Apply(data.apply_effect, owner, target or owner, nested, marker_data)
+end
+
+function AoE4RPG_EFFECT_LIST_TrackAttackCounts(owner, target, data)
+    if not owner or not AoE4RPG_GetUnitData then return false end
+    local unit_data = AoE4RPG_GetUnitData(owner.EntityID)
+    unit_data.effect_attack_trackers = unit_data.effect_attack_trackers or {}
+    local key = data.effect_id or data.ability_name or tostring(data.apply_effect)
+    local level = math.max(1, tonumber(data.effect_level) or 1)
+    local base_required_attacks = tonumber(data.required_attacks)
+    if not base_required_attacks then
+        base_required_attacks = data.apply_effect == "armor_shred" and 3 or 1
+    end
+    unit_data.effect_attack_trackers[key] = {
+        count = 0,
+        required = math.max(1, base_required_attacks - (level - 1)),
+        data = data,
+    }
+    return true
+end
+
+-- IMPORTANT: Removes the temporary weapon modifier maintained by one same-target stack.
+function AoE4RPG_EFFECT_LIST_RemoveSameTargetDamageStackModifier(tracker)
+    if tracker and tracker.modifier_id and Modifier_Remove then
+        Modifier_Remove(tracker.modifier_id)
+    end
+    if tracker then
+        tracker.modifier_id = nil
+    end
+end
+
+-- IMPORTANT: Rebuilds the additive weapon bonus after a same-target stack changes. `amount` is the damage gained per stack; `hardpoint` optionally limits the modifier to one weapon hardpoint.
+-- Without a hardpoint, every weapon is buffed.
+function AoE4RPG_EFFECT_LIST_ApplySameTargetDamageStackModifier(owner, tracker)
+    if not owner or not tracker then return false end
+    AoE4RPG_EFFECT_LIST_RemoveSameTargetDamageStackModifier(tracker)
+    if (tracker.stacks or 0) <= 0 then return true end
+    if not Modifier_Create or not Modifier_ApplyToEntity then return false end
+
+    local per_stack = AoE4RPG_EFFECT_LIST_GetScaledAmount(tracker.data)
+    local total_bonus = per_stack * math.max(0, tracker.stacks or 0)
+    total_bonus = AoE4RPG_RoundToStep and AoE4RPG_RoundToStep(total_bonus, 0.25)
+        or math.floor(total_bonus * 4 + 0.5) / 4
+    if total_bonus == 0 then return true end
+
+    local hardpoint = tracker.data.hardpoint or ""
+    local modifier = Modifier_Create(
+        MAT_Weapon,
+        "damage_weapon_modifier",
+        MUT_Addition,
+        false,
+        total_bonus,
+        hardpoint
+    )
+    local modifier_id = Modifier_ApplyToEntity(modifier, owner, 0)
+    if modifier_id then
+        tracker.modifier_id = modifier_id
+        return true
+    end
+    return false
+end
+
+-- Registers a persistent same-target damage stack for the owner.
+-- IMPORTANT: Re-registering the same effect updates its configuration while preserving current stacks, which allows a level-up or modifier reapply to refresh its damage cleanly.
+function AoE4RPG_EFFECT_LIST_ApplySameTargetDamageStack(owner, target, data)
+    if not owner or not data or not AoE4RPG_GetUnitData then return false end
+    local unit_data = AoE4RPG_GetUnitData(owner.EntityID)
+    if not unit_data then return false end
+
+    unit_data.same_target_damage_stack_trackers = unit_data.same_target_damage_stack_trackers or {}
+    local key = data.effect_id or data.ability_name or "same_target_damage_stack"
+    local tracker = unit_data.same_target_damage_stack_trackers[key]
+    local is_new = tracker == nil
+    if not tracker then
+        tracker = { target_id = nil, attack_count = 0, stacks = 0, modifier_id = nil }
+        unit_data.same_target_damage_stack_trackers[key] = tracker
+    end
+
+    local attacks_per_stack = math.max(1, tonumber(data.required_attacks or data.attacks_per_stack) or 1)
+    local max_stacks = math.max(1, tonumber(data.max_stacks) or 5)
+    local reset_on_target_change = data.reset_on_target_change ~= false
+    local old_data = tracker.data
+    local configuration_changed = is_new
+        or not old_data
+        or AoE4RPG_EFFECT_LIST_GetScaledAmount(old_data) ~= AoE4RPG_EFFECT_LIST_GetScaledAmount(data)
+        or tracker.attacks_per_stack ~= attacks_per_stack
+        or tracker.max_stacks ~= max_stacks
+        or tracker.reset_on_target_change ~= reset_on_target_change
+        or (old_data.hardpoint or "") ~= (data.hardpoint or "")
+
+    tracker.data = AoE4RPG_EFFECT_LIST_CopyTable(data)
+    tracker.attacks_per_stack = attacks_per_stack
+    tracker.max_stacks = max_stacks
+    tracker.reset_on_target_change = reset_on_target_change
+    tracker.stacks = math.min(tracker.stacks or 0, tracker.max_stacks)
+    if configuration_changed then
+        AoE4RPG_EFFECT_LIST_ApplySameTargetDamageStackModifier(owner, tracker)
+    end
+    return true
+end
+
+-- Adds one same-target attack count.
+function AoE4RPG_EFFECT_LIST_RecordSameTargetDamageStack(owner, context)
+    if not owner or not context or not AoE4RPG_GetUnitData then return false end
+    local unit_data = AoE4RPG_GetUnitData(owner.EntityID)
+    if not unit_data then return false end
+
+    local victim = context.victim or context.target
+    local victim_id = nil
+    if type(victim) == "number" then
+        victim_id = victim
+    elseif victim then
+        victim_id = victim.EntityID or (Entity_GetID and Entity_GetID(victim))
+    end
+    if not victim_id then return false end
+    if tonumber(context.damage) and tonumber(context.damage) <= 0 then return false end
+
+    for _, tracker in pairs(unit_data.same_target_damage_stack_trackers or {}) do
+        if tracker.reset_on_target_change ~= false and tracker.target_id ~= victim_id then
+            AoE4RPG_EFFECT_LIST_RemoveSameTargetDamageStackModifier(tracker)
+            tracker.target_id = victim_id
+            tracker.attack_count = 0
+            tracker.stacks = 0
+        elseif not tracker.target_id then
+            tracker.target_id = victim_id
+        end
+
+        tracker.attack_count = (tracker.attack_count or 0) + 1
+        local attacks_per_stack = math.max(1, tracker.attacks_per_stack or 1)
+        local old_stacks = tracker.stacks or 0
+        while tracker.attack_count >= attacks_per_stack and tracker.stacks < tracker.max_stacks do
+            tracker.attack_count = tracker.attack_count - attacks_per_stack
+            tracker.stacks = tracker.stacks + 1
+        end
+        if tracker.stacks >= tracker.max_stacks then
+            tracker.attack_count = 0
+        end
+        if tracker.stacks ~= old_stacks then
+            AoE4RPG_EFFECT_LIST_ApplySameTargetDamageStackModifier(owner, tracker)
+            if AoE4RPG_MarkUnitDataChanged then
+                AoE4RPG_MarkUnitDataChanged(unit_data)
+            end
+        end
+    end
+    return true
+end
+
+-- IMPORTANT: Clears combat-state stacks when the owner dies so a replacement entity does not inherit a target, hit count, or stale entity-scoped weapon modifier.
+function AoE4RPG_EFFECT_LIST_ResetSameTargetDamageStacks(entity_id, unit_data)
+    if not unit_data then return false end
+    for _, tracker in pairs(unit_data.same_target_damage_stack_trackers or {}) do
+        AoE4RPG_EFFECT_LIST_RemoveSameTargetDamageStackModifier(tracker)
+        tracker.target_id = nil
+        tracker.attack_count = 0
+        tracker.stacks = 0
+    end
+    return true
+end
+
+function AoE4RPG_EFFECT_LIST_ApplyTimedEffect(owner, target, data, marker_data)
+    local nested = {}
+    for key, value in pairs(data.apply_effect_data or {}) do nested[key] = value end
+    nested.effect_name = data.apply_effect
+    nested.effect_level = math.max(1, tonumber(data.effect_level) or 1)
+    nested.effect_delay = data.effect_delay or data.delay
+
+    -- A timed_effect row can use one top-level timer for a single chained effect.
+    -- The delayed_effects list remains the multi-effect option.
+    if tonumber(nested.effect_delay) and tonumber(nested.effect_delay) > 0 then
+        return AoE4RPG_EFFECTS_QueueDelayedEffect(
+            owner,
+            target or owner,
+            nested,
+            marker_data,
+            data,
+            1
+        )
+    end
+    return AoE4RPG_EFFECT_LIST_Apply(data.apply_effect, owner, target or owner, nested, marker_data)
+end
+
+
+-- IMPORTANT: Recursively copies effect configuration so later edits to Ability_List do not mutate a persistent trained/spawned-unit rule already registered in the current match.
+function AoE4RPG_EFFECT_LIST_CopyTable(value)
+    return AoE4RPG_EFFECTS_CopyTable(value)
+end
+
+-- Registers one or more effects for future entities produced by the owner's player.
+-- IMPORTANT: The rule is player-scoped so it survives the source hero's death and applies to later trained or spawned squads.
+function AoE4RPG_EFFECT_LIST_RegisterSpawnedUnitEffects(owner, target, data)
+    if not owner or not data or not Entity_GetPlayerOwner then
+        return false
+    end
+    local player = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(owner)
+        or nil
+    if not player then
+        return false
+    end
+    local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+        and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(player)
+        or (type(player) == "table" and (player.PlayerID or player.id))
+    if not player_id then
+        return false
+    end
+
+    AoE4RPG.EFFECTS.spawned_unit_effects = AoE4RPG.EFFECTS.spawned_unit_effects or {}
+    AoE4RPG.EFFECTS.spawned_unit_effects[player_id] =
+        AoE4RPG.EFFECTS.spawned_unit_effects[player_id] or {}
+    local rule = AoE4RPG_EFFECT_LIST_CopyTable(data)
+    rule.target_scope = rule.target_scope or rule.scope or "trained_unit"
+    if rule.target_scope ~= "trained_unit" and rule.target_scope ~= "built_building"
+        and rule.target_scope ~= "building_trained_unit" then
+        return false
+    end
+    rule.applied_entity_ids = {}
+    table.insert(AoE4RPG.EFFECTS.spawned_unit_effects[player_id], rule)
+    return true
+end
+
+-- The first spawned entity is the documented portable entity handle for a SquadID and receives each effect.
+
+-- Applies one persistent rule to one entity exactly once.
+function AoE4RPG_EFFECT_LIST_ApplySpawnedRuleToEntity(rule, entity)
+    if not rule or not entity then
+        return false
+    end
+    local entity_id = entity.EntityID or (Entity_GetID and Entity_GetID(entity))
+    if not entity_id then
+        return false
+    end
+    rule.applied_entity_ids = rule.applied_entity_ids or {}
+    if rule.applied_entity_ids[entity_id] then
+        return false
+    end
+
+    local effect_rows = rule.apply_effects or rule.effects
+    if not effect_rows and (rule.apply_effect or rule.effect_name) then
+        effect_rows = { rule }
+    end
+    local applied = false
+    for _, row in ipairs(effect_rows or {}) do
+        local nested = type(row) == "table"
+            and AoE4RPG_EFFECT_LIST_CopyTable(row)
+            or { effect_name = row }
+        local effect_name = nested.effect_name or nested.effect
+        if effect_name then
+            nested.effect_level = nested.effect_level or rule.effect_level
+            if AoE4RPG_EFFECT_LIST_Apply(effect_name, entity, entity, nested) then
+                applied = true
+            end
+        end
+    end
+    rule.applied_entity_ids[entity_id] = true
+    return applied
+end
+
+-- Resolves a producer building only when the host exposes one in the build event.
+-- This prevents a building-specific rule from leaking to all units.
+function AoE4RPG_EFFECT_LIST_GetProducerEntity(context)
+    if not context then
+        return nil
+    end
+    for _, key in ipairs({ "producer", "productionBuilding", "production_building", "builder" }) do
+        local value = context[key]
+        local entity = type(value) == "number" and Entity_FromID
+            and Entity_FromID(value)
+            or value
+        if entity and (not Entity_IsBuilding or Entity_IsBuilding(entity)) then
+            return entity
+        end
+    end
+    return nil
+end
+
+-- Applies future trained-unit rules and building-trained-unit rules.
+-- A building-trained-unit rule requires the build event to identify its producer.
+function AoE4RPG_EFFECT_LIST_ApplySpawnedUnitEffects(context)
+    if not context or not context.player
+        or not (context.spawnedSquad or context.squad)
+        or not Squad_GetFirstEntity then
+        return false
+    end
+    local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+        and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(context.player)
+        or (type(context.player) == "table" and (context.player.PlayerID or context.player.id))
+    local rules = player_id and AoE4RPG.EFFECTS.spawned_unit_effects
+        and AoE4RPG.EFFECTS.spawned_unit_effects[player_id]
+        or nil
+    if not rules then
+        return false
+    end
+
+    local spawned_squad = context.spawnedSquad or context.squad
+    local entity = Squad_GetFirstEntity(spawned_squad)
+    if not entity then
+        return false
+    end
+
+    local producer = AoE4RPG_EFFECT_LIST_GetProducerEntity(context)
+    local producer_id = producer and (producer.EntityID or (Entity_GetID and Entity_GetID(producer))) or nil
+    local applied = false
+    for _, rule in ipairs(rules) do
+        local scope = rule.target_scope or rule.scope or "trained_unit"
+        if scope == "trained_unit"
+            or (scope == "building_trained_unit"
+                and producer_id
+                and rule.producer_building_ids
+                and rule.producer_building_ids[producer_id]) then
+            applied = AoE4RPG_EFFECT_LIST_ApplySpawnedRuleToEntity(rule, entity) or applied
+        end
+    end
+    return applied
+end
+
+-- Applies building-only and building-plus-trained-unit rules at construction completion.
+-- Building-plus-trained-unit rules remember the completed producer.
+function AoE4RPG_EFFECT_LIST_OnConstructionComplete(context)
+    if not context or not context.player or not context.entity then
+        return false
+    end
+    local player_id = AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+        and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(context.player)
+        or (type(context.player) == "table" and (context.player.PlayerID or context.player.id))
+    local rules = player_id and AoE4RPG.EFFECTS.spawned_unit_effects
+        and AoE4RPG.EFFECTS.spawned_unit_effects[player_id]
+        or nil
+    if not rules then
+        return false
+    end
+
+    local building = context.entity
+    if Entity_IsBuilding and not Entity_IsBuilding(building) then
+        return false
+    end
+    local building_id = building.EntityID or (Entity_GetID and Entity_GetID(building))
+    local applied = false
+    for _, rule in ipairs(rules) do
+        local scope = rule.target_scope or rule.scope or "trained_unit"
+        if scope == "built_building" or scope == "building_trained_unit" then
+            applied = AoE4RPG_EFFECT_LIST_ApplySpawnedRuleToEntity(rule, building) or applied
+            if scope == "building_trained_unit" and building_id then
+                rule.producer_building_ids = rule.producer_building_ids or {}
+                rule.producer_building_ids[building_id] = true
+            end
+        end
+    end
+    return applied
+end
+function AoE4RPG_EFFECT_LIST_RecordAttack(owner, context)
+    if not owner or not AoE4RPG_GetUnitData then return false end
+    local unit_data = AoE4RPG_GetUnitData(owner.EntityID)
+    for _, tracker in pairs(unit_data.effect_attack_trackers or {}) do
+        tracker.count = (tracker.count or 0) + 1
+        if tracker.count >= tracker.required then
+            local nested = {}
+            for key, value in pairs(tracker.data.apply_effect_data or {}) do nested[key] = value end
+            nested.effect_name = tracker.data.apply_effect
+            nested.effect_level = math.max(1, tonumber(tracker.data.effect_level) or 1)
+            -- Attack-count effects normally target their owner.
+            -- IMPORTANT: Armor shred is the intentional exception: it must debuff the victim whose positive GE_DamageReceived event completed the counter.
+            local nested_target = owner
+            if tracker.data.apply_effect == "armor_shred" then
+                nested_target = context and (context.victim or context.target) or nil
+            end
+            if nested_target then
+                AoE4RPG_EFFECT_LIST_Apply(
+                    tracker.data.apply_effect,
+                    owner,
+                    nested_target,
+                    nested,
+                    context
+                )
+            end
+            tracker.count = 0
+        end
+    end
+    AoE4RPG_EFFECT_LIST_RecordSameTargetDamageStack(owner, context)
+    return true
+end
+
+function AoE4RPG_EFFECT_LIST_Apply(effect_name, owner, target, data, marker_data)
+    data = AoE4RPG_EFFECTS_ExpandCompactValues(data or {})
+    local effect = AoE4RPG.EFFECT_LIST[effect_name]
+    if type(effect) == "function" then return effect(owner, target, data or {}, marker_data) end
+    return false
+end
+AoE4RPG.EFFECT_LIST.damage = AoE4RPG_EFFECT_LIST_ApplyDamage
+AoE4RPG.EFFECT_LIST.attack_ignore_armor = AoE4RPG_EFFECT_LIST_ApplyDamageBuff
+AoE4RPG.EFFECT_LIST.damage_buff = AoE4RPG_EFFECT_LIST_ApplyDamageBuff
+AoE4RPG.EFFECT_LIST.damage_on_attacked = AoE4RPG_EFFECT_LIST_ApplyDamageOnAttacked
+AoE4RPG.EFFECT_LIST.attack_speed_buff = AoE4RPG_EFFECT_LIST_ApplyAttackSpeedBuff
+AoE4RPG.EFFECT_LIST.armor_shred = AoE4RPG_EFFECT_LIST_ApplyArmorShred
+AoE4RPG.EFFECT_LIST.attribute_multiplier = AoE4RPG_EFFECT_LIST_ApplyAttributeMultiplier
+AoE4RPG.EFFECT_LIST.agility_multiplier = AoE4RPG_EFFECT_LIST_ApplyAttributeMultiplier
+AoE4RPG.EFFECT_LIST.endurance_multiplier = AoE4RPG_EFFECT_LIST_ApplyAttributeMultiplier
+AoE4RPG.EFFECT_LIST.vitality_multiplier = AoE4RPG_EFFECT_LIST_ApplyAttributeMultiplier
+AoE4RPG.EFFECT_LIST.ability_damage_multiplier = AoE4RPG_EFFECT_LIST_ApplyAbilityValueMultiplier
+AoE4RPG.EFFECT_LIST.ability_health_multiplier = AoE4RPG_EFFECT_LIST_ApplyAbilityValueMultiplier
+AoE4RPG.EFFECT_LIST.ability_value_multiplier = AoE4RPG_EFFECT_LIST_ApplyAbilityValueMultiplier
+AoE4RPG.EFFECT_LIST.missing_health_trigger = AoE4RPG_EFFECT_LIST_ApplyMissingHealthTrigger
+AoE4RPG.EFFECT_LIST.track_attack_counts = AoE4RPG_EFFECT_LIST_TrackAttackCounts
+AoE4RPG.EFFECT_LIST.same_target_damage_stack = AoE4RPG_EFFECT_LIST_ApplySameTargetDamageStack
+AoE4RPG.EFFECT_LIST.timed_effect = AoE4RPG_EFFECT_LIST_ApplyTimedEffect
+AoE4RPG.EFFECT_LIST.spawned_unit_effects = AoE4RPG_EFFECT_LIST_RegisterSpawnedUnitEffects
+AoE4RPG.EFFECT_LIST.trained_unit_effects = AoE4RPG_EFFECT_LIST_RegisterSpawnedUnitEffects
+AoE4RPG.EFFECT_LIST.projectile_attack_ignore_armor = AoE4RPG_EFFECT_LIST_AttackIgnoreArmor
+AoE4RPG.EFFECT_LIST.heal = AoE4RPG_EFFECT_LIST_Heal
+AoE4RPG.EFFECT_LIST.weapon_slot = AoE4RPG_EFFECT_LIST_WeaponSlot
+AoE4RPG.EFFECT_LIST.melee_attack_move_hunt = AoE4RPG_EFFECT_LIST_ApplyMeleeAttackMoveHunt
+
+-- Keep the runtime/UI registry compatible with older declarative effect-list copies that predate armor_shred.
+local armor_shred_description_registered = false
+for _, description_row in ipairs(AoE4RPG.EFFECT_DESCRIPTIONS or {}) do
+    if description_row.effect_name == "armor_shred" then
+        armor_shred_description_registered = true
+        break
+    end
+end
+if not armor_shred_description_registered and AoE4RPG.EFFECT_DESCRIPTIONS then
+    table.insert(AoE4RPG.EFFECT_DESCRIPTIONS, {
+        effect_name = "armor_shred",
+        display_name = "Armor Shred",
+        description = "Removes <effect_value> armor from the configured damage-type channel.",
+        value_fields = AoE4RPG_EFFECT_VALUE_FIELDS.armor_shred,
+    })
+end
+
+-- Start monitoring markers.
+function AoE4RPG_EFFECTS_StartMonitor()
+    local effects = AoE4RPG.EFFECTS
+    if effects.monitor_registered or not Rule_AddInterval then
+        return false
+    end
+    Rule_AddInterval(AoE4RPG_EFFECTS_MonitorMarkers, 0.125)
+    effects.monitor_registered = true
+    return true
+end
+-- Stop monitoring markers and clear all runtime registrations.
+-- This is used at match end so callbacks cannot retain stale entities into a later scenario.
+function AoE4RPG_EFFECTS_StopMonitor()
+    local effects = AoE4RPG.EFFECTS
+    if effects.monitor_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_EFFECTS_MonitorMarkers)
+    end
+    effects.monitor_registered = false
+    for marker_id in pairs(effects.markers) do
+        AoE4RPG_EFFECTS_RemoveMarker(marker_id)
+    end
+    effects.markers = {}
+    effects.passives = {}
+    effects.melee_attack_move_hunts = {}
+end

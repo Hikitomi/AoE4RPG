@@ -1,169 +1,489 @@
--- =============================================================================
--- AoE4RPG Bootstrap
--- =============================================================================
--- Import this file in a host SCAR script to initialize the full AoE4RPG module.
--- Example:
---     import("AoE4RPG/AoE4RPG_bootstrap.scar")
--- For UAGS win conditions, the host should import ags_cardinal.scar (and its
--- selected win-condition modules) before this file. This module registers
--- delegates into that lifecycle; it must not import ags_cardinal itself.
--- =============================================================================
+-- ================= AoE4RPG Bootstrap ===============
+-- AoE4RPG Bootstrap - Lifecycle Bootstrap loads the standalone module and initializes its systems.
+-- Author: Hikitomi
+-- Referenced: helpers, leveling, ultility, and ui AoE4RPG modules.
+-- ================= AoE4RPG Bootstrap ===============
 
 import("cardinal.scar")
--- Load the game's native cheat dispatcher. It registers Scar_AddInit(Cheat_Init)
--- and handles
--- broadcast chat commands such as AGEUP, ECONOMY, FOW, and INSTANTBUILD.
--- Native chat cheats require the game's `dev` command-line option.
+-- IMPORTANT: Load the game's native cheat dispatcher.
+-- IMPORTANT: Native chat cheats require the game's `dev` command-line option.
 import("gameplay/cheat.scar")
 
 if not AoE4RPG then
     AoE4RPG = {}
 end
 
--- Runtime integration flags. UAGS owns the actual win-condition modules and
--- match options; this package only records and respects the settings it is
--- given through Cardinal's delegate chain.
-AoE4RPG.UAGS_ACTIVE = false
+-- Runtime state.
+-- The standalone settings module owns the match-option bridge.
 AoE4RPG.WINCONDITION_OPTIONS = nil
 AoE4RPG.enabled = true
 AoE4RPG.ui_initialized = false
+AoE4RPG.ui_retry_registered = false
+AoE4RPG.ui_retry_attempts = 0
+AoE4RPG.play_started = false
+-- IMPORTANT: Enable only while diagnosing neutral-resource MapGen behavior.
+AoE4RPG.debug_resource_census_enabled = false
 
--- Cardinal delegate: receives the same win-condition option table used by
--- UAGS_GlobalSettings. Keep the table intact so other modules can continue to
--- modify it; importing ags_cardinal.scar remains the host script's job.
--- @param options Mutable win-condition options table supplied by Cardinal.
--- Adjust: add more saved UAGS options here only when another module needs them later.
+-- Temporary runtime checkpoints used to isolate HUD startup in warnings.log.
+-- IMPORTANT: These messages are deliberately one-shot and never run from the interval rule.
+function AoE4RPG_DebugLog(message)
+    if print then
+        print("[AoE4RPG] " .. tostring(message))
+    end
+end
+
+-- Standalone settings entry point.
+-- ADJUST: add new AoE4RPG.rdo option keys in AoE4RPG_settings.scar.
 function AoE4RPG_SetupSettings(options)
-    AoE4RPG.WINCONDITION_OPTIONS = options
-    AoE4RPG.UAGS_ACTIVE = (AGS_GLOBAL_SETTINGS ~= nil)
+    if AoE4RPG_SETTINGS_Setup then
+        AoE4RPG_SETTINGS_Setup(options)
+    end
 end
 
--- Cardinal delegate: enables the RPG level system when UAGS global settings
--- are present, without overriding the selected annihilation/conquest/etc.
--- win condition. This prevents the RPG module from fighting the game mode.
--- Adjust: add optional AoE4RPG settings here without replacing the selected win condition.
+-- Applies standalone AoE4RPG settings without replacing the selected win condition.
 function AoE4RPG_AdjustSettings()
-    if AGS_GLOBAL_SETTINGS then
-        AoE4RPG.UAGS_ACTIVE = true
-        if AGS_GLOBAL_SETTINGS.LevelUp == nil then
-            AGS_GLOBAL_SETTINGS.LevelUp = true
-        end
+    if AoE4RPG_SETTINGS_Initialize then
+        AoE4RPG_SETTINGS_Initialize()
+    end
+    if AoE4RPG_SETTINGS_Apply then
+        AoE4RPG_SETTINGS_Apply()
     end
 end
 
--- Cardinal delegate: respect a host setting that explicitly disables leveling.
--- Adjust: add more enable/disable checks here when new UAGS options are introduced.
+-- IMPORTANT: Standalone module settings are authoritative; leveling remains enabled unless the AoE4RPG module itself is disabled by its own initialization guard.
 function AoE4RPG_UpdateModuleSettings()
-    if AGS_GLOBAL_SETTINGS and AGS_GLOBAL_SETTINGS.LevelUp == false then
-        AoE4RPG.enabled = false
+    AoE4RPG.enabled = true
+end
+
+-- IMPORTANT: Cardinal delegate for the registered "AoE4RPG" module.
+-- IMPORTANT: Use the registered module prefix for same-phase UAGS dispatch.
+function AoE4RPG_PresetExecute()
+    if AoE4RPG_SETTINGS_PresetExecute then
+        AoE4RPG_SETTINGS_PresetExecute()
     end
 end
 
--- Initializes the full AoE4RPG package and registers the module with the host
--- SCAR environment. This keeps the system modular, since each sub-file is
--- imported only after the base table exists.
--- Initializes the AoE4RPG package once, in the same style as crafted-map scenario
--- scripts: it attaches to the general Scar init lifecycle rather than assuming it
--- owns the host mode's Mod_OnInit / Mod_Start sequence.
--- @return Nothing. Initialization is idempotent and exits after the first call.
--- @side_effect Creates UI panels and registers the damage event with UAGS.
--- Adjust: register new simulation events here, but keep the initialized guard.
+-- Initializes the full AoE4RPG package and registers the module with the host SCAR environment.
+-- Keeps the system modular, since each sub-file is imported only after the base table exists.
+-- ADJUST: register new simulation events here, but keep the initialized guard.
 function AoE4RPG_Initialize()
+    if AoE4RPG_SETTINGS_Initialize then
+        AoE4RPG_SETTINGS_Initialize()
+    end
+    if AoE4RPG_SETTINGS_Apply then
+        AoE4RPG_SETTINGS_Apply()
+    end
     if AoE4RPG.initialized or not AoE4RPG.enabled then
         return
     end
 
     AoE4RPG.initialized = true
 
+    if AoE4RPG_BONUS_Initialize then
+        AoE4RPG_BONUS_Initialize()
+    end
+    if AoE4RPG_CLASS_InitializeValueRegistry then
+        AoE4RPG_CLASS_InitializeValueRegistry()
+    end
+    if AoE4RPG_InitializeBurstFireProjectileCountCache then
+        AoE4RPG_InitializeBurstFireProjectileCountCache()
+    end
+    if AoE4RPG_ENTITY_TRACKER_Initialize then
+        AoE4RPG_ENTITY_TRACKER_Initialize()
+    end
+    if AoE4RPG_AI_Initialize then
+        AoE4RPG_AI_Initialize()
+    end
+    if AoE4RPG_CLASS_StartRuntimeMonitors then
+        AoE4RPG_CLASS_StartRuntimeMonitors()
+    end
+    if AoE4RPG_CLASS_HideNativeDamageUpgrades then
+        AoE4RPG_CLASS_HideNativeDamageUpgrades()
+    end
+    if AoE4RPG_CONVERSION_Initialize then
+        AoE4RPG_CONVERSION_Initialize()
+    end
+    if AoE4RPG_ABILITY_COST_Initialize then
+        AoE4RPG_ABILITY_COST_Initialize()
+    end
+    if AoE4RPG_ABILITY_COST_StartHealthResourceMonitor then
+        AoE4RPG_ABILITY_COST_StartHealthResourceMonitor()
+    end
+    if AoE4RPG_EFFECTS_StartMonitor then
+        AoE4RPG_EFFECTS_StartMonitor()
+    end
+    if AoE4RPG_PROJECTILES_Start then
+        AoE4RPG_PROJECTILES_Start()
+    end
+    if AoE4RPG_InitializeNativeExperienceMonitor then
+        AoE4RPG_InitializeNativeExperienceMonitor()
+    end
+    if AoE4RPG_InitializeTechnicianResourceDropOffMonitor then
+        AoE4RPG_InitializeTechnicianResourceDropOffMonitor()
+    end
     if Rule_AddGlobalEvent then
         Rule_AddGlobalEvent(AoE4RPG_LevelUp, GE_DamageReceived)
+        Rule_AddGlobalEvent(
+            AoE4RPG_OnTechnicianConstructionComplete,
+            GE_ConstructionComplete
+        )
+        if GE_ConstructionComplete and AoE4RPG_EFFECT_LIST_OnConstructionComplete then
+            Rule_AddGlobalEvent(
+                AoE4RPG_EFFECT_LIST_OnConstructionComplete,
+                GE_ConstructionComplete
+            )
+            AoE4RPG.spawned_effect_construction_event_registered = true
+        end
     end
 end
 
--- UAGS lifecycle delegates. Registration happens at global scope below, while
--- mutable setup is deferred until the normal initialization phases.
+-- UAGS lifecycle delegates.
 -- UAGS delegate called during EarlyInitializations; safe to call repeatedly.
--- Adjust: put simulation-safe startup calls here; UI creation belongs in LateInitializations.
+-- ADJUST: put simulation-safe startup calls here; UI creation belongs in OnPlay.
 function AoE4RPG_EarlyInitializations()
     AoE4RPG_Initialize()
 end
 
--- UAGS LateInitializations is the safe phase for constructing the hero XAML
--- after the host HUD has been initialized.
--- Adjust: change 2.0 for stat/XP refresh speed and 0.25 for selection show/hide response.
+-- Keep the registered module's late delegate simulation-only.
 function AoE4RPG_LateInitializations()
-    if AoE4RPG.ui_initialized then
-        return
+    return true
+end
+
+-- Creates all local presenters during the playable phase.
+-- This follows the reference boon system's createMenu() lifecycle and is safe to retry.
+-- IMPORTANT: AI players never create the local RPG HUD; their simulation systems remain active.
+function AoE4RPG_ShouldInitializePlayableUI()
+    if not Game_GetLocalPlayer or not AI_IsAIPlayer then
+        -- Compatibility fallback: only suppress UI when the engine confirms an AI player.
+        return true
     end
-    AoE4RPG.ui_initialized = true
+
+    local local_player = Game_GetLocalPlayer()
+    if not local_player then
+        return true
+    end
+
+    local success, is_ai = pcall(AI_IsAIPlayer, local_player)
+    if success and is_ai == true then
+        return false
+    end
+    return true
+end
+
+function AoE4RPG_InitializePlayableUI()
+    AoE4RPG_DebugLog("InitializePlayableUI entered")
+    if AoE4RPG.ui_initialized then
+        AoE4RPG_DebugLog("InitializePlayableUI already complete")
+        return true
+    end
+    if not AoE4RPG_ShouldInitializePlayableUI() then
+        -- IMPORTANT: Mark the AI-side UI path complete so no retry rule or presenter is created.
+        AoE4RPG.ui_initialized = true
+        AoE4RPG_DebugLog("Playable UI disabled for local AI player")
+        return true
+    end
     if AoE4RPG_UI_Initialize then
         AoE4RPG_UI_Initialize()
     end
+    local hero_presenter_ready = true
     if AoE4RPG_UI_InitializeHeroBar then
-        AoE4RPG_UI_InitializeHeroBar()
+        if not AoE4RPG_UI_InitializeHeroBar() then
+            AoE4RPG_DebugLog("hero presenter initialization returned false")
+            hero_presenter_ready = false
+        else
+            AoE4RPG_DebugLog("hero presenter initialization returned true")
+        end
     end
-    if Rule_AddInterval then
-        Rule_AddInterval(AoE4RPG_UI_RefreshSelection, 2.0)
-        Rule_AddInterval(AoE4RPG_UI_RefreshHeroProgress, 2.0)
-        Rule_AddInterval(AoE4RPG_UI_CheckSelectionChange, 0.25)
+    -- Ability and random-bonus presenters are optional companions.
+    -- IMPORTANT: A failure in either must not prevent hero selection tracking and attribute updates.
+    if AoE4RPG_ABILITY_UI_Initialize then
+        if not AoE4RPG_ABILITY_UI_Initialize() then
+            AoE4RPG_DebugLog("ability presenter initialization returned false")
+        else
+            AoE4RPG_DebugLog("ability presenter initialization returned true")
+        end
+    end
+    -- IMPORTANT: The random-bonus presenter is independent: attempt to create it before the first selection refresh, but never let an unavailable command/UI API prevent the hero presenter and its monitor from starting.
+    if AoE4RPG_BONUS_UI_Initialize then
+        AoE4RPG_BONUS_UI_Initialize()
+    end
+    if AoE4RPG_UI_CreateClassSlotMenu then
+        AoE4RPG_UI_CreateClassSlotMenu()
+    end
+    if AoE4RPG_UI_StartClassSlotMenuMonitor then
+        AoE4RPG_UI_StartClassSlotMenuMonitor()
+    end
+    local selection_monitor_ready = true
+    if AoE4RPG_UI_StartSelectionMonitor then
+        if not AoE4RPG_UI_StartSelectionMonitor() then
+            AoE4RPG_DebugLog("selection monitor initialization returned false")
+            selection_monitor_ready = false
+        else
+            AoE4RPG_DebugLog("selection monitor initialization returned true")
+        end
+    end
+    if not hero_presenter_ready or not selection_monitor_ready then
+        return false
+    end
+    -- Commit once the hero presenter and its selection monitor succeeded.
+    -- Optional presenters can retry through their own initialization paths.
+    AoE4RPG.ui_initialized = true
+    if AoE4RPG_UI_UpdateSelectionState then
+        AoE4RPG_UI_UpdateSelectionState(true)
+    end
+    AoE4RPG_DebugLog("InitializePlayableUI complete")
+    return true
+end
+
+-- Stops the temporary HUD-startup retry without touching the selection monitor.
+function AoE4RPG_StopPlayableUIRetry()
+    if AoE4RPG.ui_retry_registered and Rule_Remove then
+        Rule_Remove(AoE4RPG_RetryPlayableUI)
+    end
+    AoE4RPG.ui_retry_registered = false
+end
+
+-- IMPORTANT: Retries presenter creation after the native Cardinal HUD exposes ScarNotReplay.
+function AoE4RPG_RetryPlayableUI()
+    if AoE4RPG.ui_initialized then
+        AoE4RPG_StopPlayableUIRetry()
+        return
+    end
+
+    AoE4RPG.ui_retry_attempts = (AoE4RPG.ui_retry_attempts or 0) + 1
+    if AoE4RPG_InitializePlayableUI() then
+        AoE4RPG_DebugLog(
+            "playable UI retry succeeded on attempt="
+                .. tostring(AoE4RPG.ui_retry_attempts)
+        )
+        AoE4RPG_StopPlayableUIRetry()
+        return
+    end
+
+    if AoE4RPG.ui_retry_attempts >= 40 then
+        AoE4RPG_DebugLog("playable UI retry limit reached")
+        AoE4RPG_StopPlayableUIRetry()
+    end
+end
+
+-- Starts one bounded retry rule when the first playable-phase attempt was early.
+function AoE4RPG_StartPlayableUIRetry()
+    if AoE4RPG.ui_initialized or AoE4RPG.ui_retry_registered
+        or not Rule_AddInterval then
+        return
+    end
+    AoE4RPG.ui_retry_attempts = 0
+    Rule_AddInterval(AoE4RPG_RetryPlayableUI, 0.5)
+    AoE4RPG.ui_retry_registered = true
+    AoE4RPG_DebugLog("playable UI retry rule registered")
+end
+
+-- Records neutral resources before any AoE4RPG initialization work.
+function AoE4RPG_PreInit()
+    if AoE4RPG_SETTINGS_LogNeutralResourceCensus then
+        AoE4RPG_SETTINGS_LogNeutralResourceCensus("PreInit")
+    end
+end
+
+-- IMPORTANT: Native cardinal invokes <registered module>_OnInit.
+-- IMPORTANT: Keep the UAGS early/late delegates above, but expose the native callback so this standalone win condition initializes its HUD in the same phase as Diplomacy and other game UI.
+function AoE4RPG_OnInit()
+    AoE4RPG_DebugLog("OnInit entered")
+    AoE4RPG_EarlyInitializations()
+    if AoE4RPG_SETTINGS_LogNeutralResourceCensus then
+        AoE4RPG_SETTINGS_LogNeutralResourceCensus("OnInit")
+    end
+
+    -- IMPORTANT: Native standard_mode does not consistently dispatch Start for extra modules registered by a custom win-condition entry point.
+    -- Scar_AddInit is reliable, so schedule the same idempotent playable-start path for the first simulation tick.
+    if not AoE4RPG.play_started then
+        if Rule_AddOneShot then
+            Rule_AddOneShot(AoE4RPG_StartFallback, 0.125)
+            AoE4RPG_DebugLog("OnPlay fallback scheduled")
+        else
+            AoE4RPG_StartFallback()
+        end
+    end
+end
+
+-- IMPORTANT: Compatibility bridge used only when the native host omits this module's Start delegate.
+-- Extra callback arguments supplied by Rule_AddOneShot are intentionally ignored.
+function AoE4RPG_StartFallback()
+    if not AoE4RPG.play_started then
+        AoE4RPG_DebugLog("OnPlay fallback entered")
+        AoE4RPG_OnPlay()
     end
 end
 
 -- UAGS delegate called after entities are spawned; registers kill handling.
--- Adjust: register other match-start events here if a new RPG system needs one.
+-- ADJUST: register other match-start events here if a new RPG system needs one.
 function AoE4RPG_OnPlay()
+    AoE4RPG_DebugLog("OnPlay entered")
+    if AoE4RPG.play_started then
+        -- IMPORTANT: A UAGS host can dispatch OnPlay after native Cardinal already invoked AoE4RPG_Start.
+        -- UI initialization is retry-safe; gameplay events are not registered a second time.
+        if not AoE4RPG_InitializePlayableUI() then
+            AoE4RPG_StartPlayableUIRetry()
+        end
+        return
+    end
+    AoE4RPG.play_started = true
+
+    if AoE4RPG_SETTINGS_LogNeutralResourceCensus then
+        AoE4RPG_SETTINGS_LogNeutralResourceCensus("OnPlay before modifiers")
+    end
+
+    -- Map resources are now owned by the neutral mapgen tracker.
+    -- IMPORTANT: Defer their writes until the native deposits are visible and have real amounts.
+    if AoE4RPG_SETTINGS_ScheduleMapResourceMultipliers then
+        AoE4RPG_SETTINGS_ScheduleMapResourceMultipliers()
+    end
+    if AoE4RPG_SETTINGS_ApplyEconomyModifiers then
+        AoE4RPG_SETTINGS_ApplyEconomyModifiers()
+    end
+    if AoE4RPG_KING_GROWTH_Start then
+        AoE4RPG_KING_GROWTH_Start()
+    end
+
+    -- IMPORTANT: Run one deferred census after civilization start squads have materialized.
+    -- Production and spawn events handle all later ordinary hero and elite discovery.
+    if AoE4RPG_ENTITY_TRACKER_ScheduleStartupScan then
+        AoE4RPG_ENTITY_TRACKER_ScheduleStartupScan()
+    end
     if AoE4RPG_EnableCriticalHitsForRegisteredUnits then
         AoE4RPG_EnableCriticalHitsForRegisteredUnits()
     end
-    if AoE4RPG_UI_RefreshHeroProgress then
-        AoE4RPG_UI_RefreshHeroProgress()
+    local playable_ui_result = AoE4RPG_InitializePlayableUI()
+    AoE4RPG_DebugLog("playable UI result=" .. tostring(playable_ui_result))
+    if not playable_ui_result then
+        AoE4RPG_StartPlayableUIRetry()
     end
     if Rule_AddGlobalEvent then
         Rule_AddGlobalEvent(AoE4RPG_OnEntityKilled, GE_EntityKilled)
     end
 end
 
+-- IMPORTANT: Native Cardinal invokes <module>_Start, while ags_cardinal.scar separately dispatches the custom OnPlay delegate.
+-- IMPORTANT: Bridge the native phase to the same idempotent startup path, matching the working reference's Mod_Start function.
+function AoE4RPG_Start()
+    AoE4RPG_OnPlay()
+end
+
 -- UAGS delegate called at match end; removes module-owned global event handlers.
--- Adjust: remove every event added by this module here to avoid callbacks after game over.
+-- ADJUST: remove every event added by this module here to avoid callbacks after game over.
 function AoE4RPG_OnGameOver()
+    AoE4RPG_StopPlayableUIRetry()
+    if AoE4RPG_UI_StopSelectionMonitor then
+        AoE4RPG_UI_StopSelectionMonitor()
+    end
+    if AoE4RPG_UI_StopClassSlotMenuMonitor then
+        AoE4RPG_UI_StopClassSlotMenuMonitor()
+    end
+    if AoE4RPG_BONUS_UI_Hide then
+        AoE4RPG_BONUS_UI_Hide()
+    end
+    if AoE4RPG_CLASS_StopRuntimeMonitors then
+        AoE4RPG_CLASS_StopRuntimeMonitors()
+    end
+    if AoE4RPG_ENTITY_TRACKER_Shutdown then
+        AoE4RPG_ENTITY_TRACKER_Shutdown()
+    end
+    if AoE4RPG_AI_Shutdown then
+        AoE4RPG_AI_Shutdown()
+    end
+    if AoE4RPG_SETTINGS_Shutdown then
+        AoE4RPG_SETTINGS_Shutdown()
+    end
+    if AoE4RPG_KING_GROWTH_Shutdown then
+        AoE4RPG_KING_GROWTH_Shutdown()
+    end
+    if AoE4RPG_CLASS_ShutdownValueRegistry then
+        AoE4RPG_CLASS_ShutdownValueRegistry()
+    end
+    if AoE4RPG_ShutdownNativeExperienceMonitor then
+        AoE4RPG_ShutdownNativeExperienceMonitor()
+    end
+    if AoE4RPG_ShutdownTechnicianResourceDropOffMonitor then
+        AoE4RPG_ShutdownTechnicianResourceDropOffMonitor()
+    end
+    if AoE4RPG_CONVERSION_StopMonitor then
+        AoE4RPG_CONVERSION_StopMonitor()
+    end
+    AoE4RPG.TECHNICIAN_CONSTRUCTION_CONTRIBUTORS = {}
+    AoE4RPG.TECHNICIAN_INHERITED_ENTITY_MODIFIERS = {}
+    AoE4RPG.TECHNICIAN_INHERITED_SQUADS = {}
+    AoE4RPG.TECHNICIAN_CARRIED_RESOURCES = {}
+    if AoE4RPG.EFFECTS then
+        AoE4RPG.EFFECTS.spawned_unit_effects = {}
+    end
     if Rule_RemoveGlobalEvent then
-        Rule_RemoveGlobalEvent(AoE4RPG_LevelUp, GE_DamageReceived)
-        Rule_RemoveGlobalEvent(AoE4RPG_OnEntityKilled, GE_EntityKilled)
+        Rule_RemoveGlobalEvent(AoE4RPG_LevelUp)
+        Rule_RemoveGlobalEvent(AoE4RPG_OnTechnicianConstructionComplete)
+        if AoE4RPG.spawned_effect_construction_event_registered then
+            Rule_RemoveGlobalEvent(AoE4RPG_EFFECT_LIST_OnConstructionComplete)
+            AoE4RPG.spawned_effect_construction_event_registered = false
+        end
+        Rule_RemoveGlobalEvent(AoE4RPG_OnEntityKilled)
+    end
+    if AoE4RPG_ABILITY_COST_StopHealthResourceMonitor then
+        AoE4RPG_ABILITY_COST_StopHealthResourceMonitor()
+    end
+    if AoE4RPG_EFFECTS_StopMonitor then
+        AoE4RPG_EFFECTS_StopMonitor()
+    end
+    if AoE4RPG_PROJECTILES_Stop then
+        AoE4RPG_PROJECTILES_Stop()
+    end
+    if AoE4RPG_UI_PanelRemoveAll then
+        -- IMPORTANT: PanelRemoveAll only clears our registry; the engine owns UI teardown order.
+        AoE4RPG_UI_PanelRemoveAll()
     end
 end
 
--- Explicit registration helper that keeps the module safe if another script also
--- owns the main lifecycle. This is optional and only calls the init if not already
--- started.
--- Optional manual entry point for hosts that do not run the normal UAGS delegates.
--- @side_effect Initializes the package and its damage-event hook once.
--- Adjust: keep this manual fallback in sync with any new required startup function.
+-- Explicit registration helper that keeps the module safe if another script also owns the main lifecycle.
+-- This is optional and only calls the init if not already started.
+-- IMPORTANT: Optional manual entry point for hosts that do not run the normal UAGS delegates.
+-- IMPORTANT: ADJUST: keep this manual fallback in sync with any new required startup function.
 function AoE4RPG_RegisterHooks()
-    if AoE4RPG and AoE4RPG.initialized then
-        return
+    if not (AoE4RPG and AoE4RPG.initialized) then
+        AoE4RPG_Initialize()
     end
-
-    AoE4RPG_Initialize()
-    AoE4RPG_LateInitializations()
+    AoE4RPG_InitializePlayableUI()
 end
 
--- Match the proven UAGS module structure: register delegates globally, then let
--- cardinal invoke the lifecycle functions above.
 if Core_RegisterModule then
     Core_RegisterModule("AoE4RPG")
 end
 
-import("AoE4RPG/AoE4RPG_blueprints.scar")
-import("AoE4RPG/AoE4RPG_core.scar")
-import("AoE4RPG/AoE4RPG_classes.scar")
-import("AoE4RPG/AoE4RPG_ui.scar")
-import("AoE4RPG/AoE4RPG_hero_ui.scar")
-import("AoE4RPG/AoE4RPG_debug_cheat.scar")
+-- Helpers are loaded first because the leveling and UI modules consume their registries during initialization.
+-- The ability/effect manifest owns the dependency order for all ability-side helper modules.
+import("helpers/AoE4RPG_runtime_helpers.scar")
+import("helpers/AoE4RPG_economic_blueprints.scar")
+import("helpers/AoE4RPG_settings.scar")
+import("helpers/AoE4RPG_blueprints.scar")
+import("helpers/AoE4RPG_ability_effects_core.scar")
 
--- Native game modules use Scar_AddInit as the guaranteed entry point. Keep a
--- fallback registration so the RPG HUD still appears when a host imports this
--- package without running the full UAGS Cardinal lifecycle.
+-- Leveling and synchronized gameplay logic are loaded after the registries.
+import("leveling/AoE4RPG_core.scar")
+import("leveling/AoE4RPG_classes.scar")
+import("leveling/AoE4RPG_conversion.scar")
+import("leveling/AoE4RPG_random_bonus.scar")
+import("leveling/AoE4RPG_king_growth.scar")
+
+-- Entity tracking owns the live hero/elite state used by the UI modules.
+-- Also enable many entity tracking function used in effects.
+import("ultility/AoE4RPG_class_slots.scar")
+import("ultility/AoE4RPG_mapgen_tracker.scar")
+import("ultility/AoE4RPG_entity_tracker.scar")
+import("ultility/AoE4RPG_ai.scar")
+
+-- UI modules are loaded after their simulation data providers.
+import("ui/AoE4RPG_ui_main.scar")
+
+-- Utility/debug hooks are safe to load after the complete module surface exists.
+import("ultility/AoE4RPG_debug_cheat.scar")
+
+-- Win-condition loading does not consistently dispatch registered-module OnInit callbacks.
 if Scar_AddInit then
-    Scar_AddInit(AoE4RPG_EarlyInitializations)
-    Scar_AddInit(AoE4RPG_LateInitializations)
+    Scar_AddInit(AoE4RPG_OnInit)
 end

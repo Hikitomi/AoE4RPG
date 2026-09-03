@@ -1,0 +1,830 @@
+-- ================= AoE4RPG Economic Blueprints ===============
+-- AoE4RPG Economic Blueprints - Resource Registry tracks resource blueprints and applies economy modifiers.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_settings.scar, AoE4RPG_mapgen_tracker.scar, and native UAGS APIs.
+-- ================= AoE4RPG Economic Blueprints ===============
+
+AoE4RPG = AoE4RPG or {}
+
+AoE4RPG.ECONOMIC_BLUEPRINTS = AoE4RPG.ECONOMIC_BLUEPRINTS or {
+    animals = {
+        -- Exact entity blueprint names are checked before the broader SCAR type.
+        -- Additional visual/civilization variants can share the same scar_type.
+        { blueprint_name = "gaia_herdable_sheep", scar_type = "scar_sheep", base_food = 200, carcass_blueprint_name = "gaia_food_sheep_corpse", deposit_type = "animal_corpse" },
+        { blueprint_name = "gaia_herdable_sheep_black", scar_type = "scar_sheep", base_food = 200, carcass_blueprint_name = "gaia_food_sheep_corpse", deposit_type = "animal_corpse" },
+        { blueprint_name = "gaia_herdable_sheep_pink", scar_type = "scar_sheep", base_food = 200, carcass_blueprint_name = "gaia_food_sheep_corpse", deposit_type = "animal_corpse" },
+        { blueprint_name = "gaia_herdable_sheep_brown", scar_type = "scar_sheep", base_food = 200, carcass_blueprint_name = "gaia_food_sheep_corpse", deposit_type = "animal_corpse" },
+        { blueprint_name = "gaia_huntable_deer", scar_type = "scar_deer", base_food = 350, carcass_blueprint_name = "gaia_food_deer_corpse", deposit_type = "animal_corpse" },
+        -- IMPORTANT: Jin Dynasty's starting reindeer and special-map enchanted stags use the native deer food profile and carcass handling.
+        { blueprint_name = "gaia_huntable_reindeer", scar_type = "scar_deer", base_food = 350, carcass_blueprint_name = "gaia_food_reindeer_corpse", deposit_type = "animal_corpse" },
+        { blueprint_name = "gaia_huntable_enchanted_stag", scar_type = "scar_deer", base_food = 350, carcass_blueprint_name = "gaia_food_enchanted_stag_corpse", deposit_type = "animal_corpse" },
+        { blueprint_name = "gaia_huntable_boar", scar_type = "scar_boar", base_food = 2200, carcass_blueprint_name = "gaia_food_boar_corpse", deposit_type = "animal_corpse" },
+        { blueprint_name = "gaia_herdable_cattle_mal", scar_type = "animal_cattle_mal", base_food = 500, carcass_blueprint_name = "gaia_food_cattle_corpse", deposit_blueprint_name = "food_cattle_corpse_mal", deposit_type = "animal_corpse" },
+    },
+    ovoos = {
+        { blueprint_name = "building_stone_deposit_ovoo_mon" },
+        { blueprint_name = "building_stone_deposit_ovoo_small_mon" },
+        { blueprint_name = "building_stone_deposit_ovoo_large_mon" },
+    },
+    map_deposits = {
+        food = { "shore_fish", "deep_water_fish", "forage_bush" },
+        wood = { "tree" },
+        gold = { "gold" },
+        -- IMPORTANT: Meteorites are treated as stone deposits unless their blueprint also carries a more specific native resource type handled earlier.
+        stone = { "stone", "meteorite" },
+    },
+    -- Gather modifiers target the gatherer entity blueprints, matching the UAGS resource-rate implementation.
+    gatherer_blueprints = nil,
+    applied_animal_entities = {},
+    animal_squad_modifiers = {},
+    pending_animal_squads = {},
+    applied_ovoo_players = {},
+    applied_ovoo_entities = {},
+    pending_ovoo_entities = {},
+    ovoo_stone_multiplier = 1.0,
+    ovoo_construction_event_registered = false,
+    ovoo_lifecycle_monitor_registered = false,
+}
+
+-- IMPORTANT: Returns every worker or fishing-boat EBP that can receive the native resource_entity_harvest_rate_* and resource_carry_capacity_* modifiers.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_GetGathererBlueprints()
+    local economic_blueprints = AoE4RPG.ECONOMIC_BLUEPRINTS
+    if economic_blueprints.gatherer_blueprints ~= nil then
+        return economic_blueprints.gatherer_blueprints
+    end
+
+    local gatherer_blueprints = {}
+    if BP_GetEntityBlueprintsWithType and BP_GetName then
+        local unit_class_blueprints = BP_GetEntityBlueprintsWithType(
+            AGS_BP_UNIT_CLASS or "unit_class"
+        ) or {}
+        for _, entity_blueprint in pairs(unit_class_blueprints) do
+            local blueprint_name = BP_GetName(entity_blueprint)
+            if type(blueprint_name) == "string"
+                and (string.find(blueprint_name, "villager", 1, true)
+                    or string.find(blueprint_name, "village", 1, true)
+                    or string.find(blueprint_name, "fishing", 1, true)) then
+                table.insert(gatherer_blueprints, entity_blueprint)
+            end
+        end
+    end
+
+    economic_blueprints.gatherer_blueprints = gatherer_blueprints
+    return gatherer_blueprints
+end
+AoE4RPG.ECONOMIC_BLUEPRINTS.applied_ovoo_entities =
+    AoE4RPG.ECONOMIC_BLUEPRINTS.applied_ovoo_entities or {}
+AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities =
+    AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities or {}
+AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier =
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier or 1.0
+AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_construction_event_registered =
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_construction_event_registered or false
+AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_lifecycle_monitor_registered =
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_lifecycle_monitor_registered or false
+
+-- IMPORTANT: Converts an Entity handle or delayed-rule EntityID into a validated live handle.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(entity_or_identifier)
+    local entity_identifier = entity_or_identifier
+    if type(entity_or_identifier) ~= "number" then
+        if entity_or_identifier == nil then
+            return nil, nil
+        end
+        entity_identifier = entity_or_identifier.EntityID
+        if not entity_identifier and Entity_GetID
+            and (not scartype or not ST_ENTITY or scartype(entity_or_identifier) == ST_ENTITY) then
+            entity_identifier = Entity_GetID(entity_or_identifier)
+        end
+    end
+    if type(entity_identifier) ~= "number" then
+        return nil, nil
+    end
+    if Entity_IsValid and not Entity_IsValid(entity_identifier) then
+        return nil, entity_identifier
+    end
+    local entity = Entity_FromID and Entity_FromID(entity_identifier) or entity_or_identifier
+    return entity, entity_identifier
+end
+
+-- Returns the registered animal row for an exact blueprint or compatible SCAR type.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalData(entity)
+    if entity == nil then
+        return nil
+    end
+    -- IMPORTANT: SGroup callbacks can expose the first squad entity as an EntityID.
+    -- IMPORTANT: Resolve it before calling blueprint/type APIs, which require an Entity handle and otherwise silently fail to identify a native carcass.
+    if type(entity) == "number" and Entity_IsValid and Entity_FromID then
+        if not Entity_IsValid(entity) then
+            return nil
+        end
+        entity = Entity_FromID(entity)
+    end
+    local entity_blueprint_name = nil
+    if Entity_GetBlueprint and BP_GetName then
+        local entity_blueprint = Entity_GetBlueprint(entity)
+        if entity_blueprint ~= nil then
+            entity_blueprint_name = BP_GetName(entity_blueprint)
+        end
+    end
+
+    for _, animal_data in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.animals or {}) do
+        if entity_blueprint_name == animal_data.blueprint_name
+            or entity_blueprint_name == animal_data.carcass_blueprint_name
+            or entity_blueprint_name == animal_data.deposit_blueprint_name then
+            return animal_data
+        end
+    end
+    -- IMPORTANT: Native corpse blueprints are not always exposed by the local blueprint dump.
+    -- IMPORTANT: Treat the engine's definitive gaia_food_<animal>_corpse naming convention as a fallback so neutral carcasses are still recognized.
+    if type(entity_blueprint_name) == "string" then
+        local corpse_animal_name = string.match(
+            entity_blueprint_name,
+            "^gaia_food_(.+)_corpse$"
+        )
+        if corpse_animal_name ~= nil then
+            for _, animal_data in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.animals or {}) do
+                local scar_animal_name = string.gsub(
+                    animal_data.scar_type or "",
+                    "^scar_",
+                    ""
+                )
+                if corpse_animal_name == scar_animal_name
+                    or string.match(
+                        animal_data.blueprint_name or "",
+                        "_" .. corpse_animal_name .. "$"
+                    ) then
+                    return animal_data
+                end
+            end
+        end
+    end
+    if Entity_IsOfType then
+        for _, animal_data in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.animals or {}) do
+            if Entity_IsOfType(entity, animal_data.scar_type) then
+                return animal_data
+            end
+        end
+    end
+    return nil
+end
+
+-- IMPORTANT: Identifies a native animal deposit without relying on a custom carcass blueprint.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_IsAnimalDeposit(entity, animal_data)
+    if entity == nil then
+        return false
+    end
+    if type(entity) == "number" and Entity_IsValid and Entity_FromID then
+        if not Entity_IsValid(entity) then
+            return false
+        end
+        entity = Entity_FromID(entity)
+    end
+    animal_data = animal_data or AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalData(entity)
+    if animal_data == nil then
+        return false
+    end
+    if Entity_GetBlueprint and BP_GetName then
+        local entity_blueprint = Entity_GetBlueprint(entity)
+        local blueprint_name = entity_blueprint and BP_GetName(entity_blueprint) or nil
+        if blueprint_name == animal_data.carcass_blueprint_name
+            or blueprint_name == animal_data.deposit_blueprint_name then
+            return true
+        end
+    end
+    return Entity_IsOfType and Entity_IsOfType(entity, animal_data.deposit_type or "animal_corpse")
+end
+
+-- Returns animal data retained by a delayed carcass rule after its entity blueprint changes.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalDataByScarType(animal_type)
+    for _, animal_data in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.animals or {}) do
+        if animal_data.scar_type == animal_type then
+            return animal_data
+        end
+    end
+    return nil
+end
+
+-- Returns unique animal squad types for neutral and damage-event filtering.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalSquadTypes(include_wild_animals)
+    local animal_types = {}
+    local registered_types = {}
+    for _, animal_data in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.animals or {}) do
+        local include_type = include_wild_animals
+            or animal_data.scar_type == "scar_sheep"
+            or animal_data.scar_type == "animal_cattle_mal"
+        if include_type and not registered_types[animal_data.scar_type] then
+            table.insert(animal_types, animal_data.scar_type)
+            registered_types[animal_data.scar_type] = true
+        end
+    end
+    return animal_types
+end
+
+-- IMPORTANT: Returns the configured native type list used to filter one map resource.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_GetMapDepositTypes(resource_name)
+    return AoE4RPG.ECONOMIC_BLUEPRINTS.map_deposits[resource_name] or {}
+end
+
+-- Reserves one delayed carcass check per squad to avoid duplicate one-shot rules.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_BeginAnimalSquadCheck(squad_identifier)
+    if type(squad_identifier) ~= "number"
+        or AoE4RPG.ECONOMIC_BLUEPRINTS.pending_animal_squads[squad_identifier] then
+        return false
+    end
+    AoE4RPG.ECONOMIC_BLUEPRINTS.pending_animal_squads[squad_identifier] = true
+    return true
+end
+
+-- Releases a completed delayed carcass check so a later nonlethal hit can retry.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_EndAnimalSquadCheck(squad_identifier)
+    if type(squad_identifier) == "number" then
+        AoE4RPG.ECONOMIC_BLUEPRINTS.pending_animal_squads[squad_identifier] = nil
+    end
+end
+
+-- IMPORTANT: Scales one animal's current food deposit and raises its effective food cap exactly once per EntityID.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyAnimalFoodModifier(
+    entity_or_identifier,
+    multiplier,
+    animal_data,
+    squad_identifier,
+    remaining_food_override,
+    total_food_override,
+    is_carcass
+)
+    if type(multiplier) ~= "number" or multiplier <= 0
+        or (multiplier == 1.0 and total_food_override == nil) then
+        return false
+    end
+    local entity, entity_identifier =
+        AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(entity_or_identifier)
+    if entity == nil or entity_identifier == nil then
+        return false
+    end
+    local applied_state =
+        AoE4RPG.ECONOMIC_BLUEPRINTS.applied_animal_entities[entity_identifier]
+    -- IMPORTANT: Some native conversions retain the living animal's EntityID.
+    -- IMPORTANT: Permit one later carcass pass for that ID, but never repeat a carcass pass.
+    if applied_state == "carcass"
+        or (applied_state == true and is_carcass ~= true) then
+        return false
+    end
+
+    animal_data = animal_data or AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalData(entity)
+    if animal_data == nil then
+        return false
+    end
+    local target_food = total_food_override or animal_data.base_food * multiplier
+    local current_food = Entity_GetRemainingResourceDepositAmount(entity)
+    if type(current_food) ~= "number" then
+        return false
+    end
+    local food_lost = math.max(0, animal_data.base_food - current_food)
+    local target_remaining_food = remaining_food_override
+    if target_remaining_food == nil then
+        -- IMPORTANT: UAGS scales a native carcass from its current deposit.
+        -- IMPORTANT: This also works when the carcass has a new EntityID and no live record.
+        target_remaining_food = is_carcass
+            and current_food * multiplier
+            or math.max(0, target_food - food_lost)
+    end
+    target_remaining_food = math.max(0, math.min(target_food, target_remaining_food))
+
+    -- IMPORTANT: Register before applying the indefinite modifier so the monitor cannot apply the same live animal or native carcass twice.
+    AoE4RPG.ECONOMIC_BLUEPRINTS.applied_animal_entities[entity_identifier] =
+        is_carcass == true and "carcass" or true
+    Entity_SetRemainingResourceDepositAmount(entity, target_remaining_food)
+    local modifier = Modifier_Create(
+        MAT_Entity,
+        "resource_contained_amount_food",
+        MUT_Multiplication,
+        false,
+        multiplier,
+        nil
+    )
+    local modifier_identifier = Modifier_ApplyToEntity(
+        modifier,
+        entity,
+        0.0
+    )
+    if type(squad_identifier) == "number" then
+        AoE4RPG.ECONOMIC_BLUEPRINTS.animal_squad_modifiers[squad_identifier] = {
+            entity_id = entity_identifier,
+            modifier_id = modifier_identifier or modifier,
+            remaining_food = target_remaining_food,
+            total_food = target_food,
+        }
+    end
+    return true
+end
+
+-- IMPORTANT: Finds native carcasses after conversion and applies their food multiplier once.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_ScanAnimalDeposits()
+    if not World_GetAllNeutralSquads or not SGroup_CreateUnique or not SGroup_Filter
+        or not SGroup_ForEach then
+        return
+    end
+    local all_neutral_squads = SGroup_CreateUnique()
+    local animal_squads = SGroup_CreateUnique()
+    World_GetAllNeutralSquads(all_neutral_squads)
+    local animal_filter_types =
+        AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalSquadTypes(true)
+    table.insert(animal_filter_types, "gaia")
+    SGroup_Filter(
+        all_neutral_squads,
+        animal_filter_types,
+        FILTER_REMOVE,
+        animal_squads
+    )
+    local function inspect_animal_squad(group_id, index, squad)
+        local entity = Squad_GetFirstEntity(squad)
+        local squad_identifier = Squad_GetID and Squad_GetID(squad) or nil
+        local animal_data = nil
+        for _, candidate in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.animals or {}) do
+            if Squad_IsOfType and Squad_IsOfType(squad, candidate.scar_type) then
+                animal_data = candidate
+                break
+            end
+        end
+        animal_data = animal_data
+            or AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalData(entity)
+        local is_native_deposit =
+            AoE4RPG_ECONOMIC_BLUEPRINTS_IsAnimalDeposit(entity, animal_data)
+        if Entity_GetHealth and Entity_GetHealth(entity) <= 0 then
+            is_native_deposit = true
+        end
+        if animal_data == nil or not is_native_deposit then
+            return
+        end
+        local retained_food, total_food, modifier_persists =
+            AoE4RPG_ECONOMIC_BLUEPRINTS_PrepareAnimalCarcass(squad_identifier, entity)
+        if retained_food ~= nil and total_food ~= nil then
+            if modifier_persists then
+                -- IMPORTANT: UAGS relies on the unchanged EntityID/SquadID: the living animal modifier remains attached after corpse conversion.
+                local carcass, carcass_identifier =
+                    AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(entity)
+                if carcass ~= nil and carcass_identifier ~= nil then
+                    Entity_SetRemainingResourceDepositAmount(carcass, retained_food)
+                    AoE4RPG.ECONOMIC_BLUEPRINTS.applied_animal_entities[carcass_identifier] =
+                        "carcass"
+                end
+            else
+                local carcass_multiplier = total_food / animal_data.base_food
+                AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyAnimalFoodModifier(
+                    entity,
+                    carcass_multiplier,
+                    animal_data,
+                    squad_identifier,
+                    retained_food,
+                    total_food,
+                    true
+                )
+            end
+        elseif animal_data ~= nil then
+            -- IMPORTANT: A native carcass has a new squad and EntityID, so there may be no live-animal record to carry forward.
+            -- IMPORTANT: Its native deposit is already the synchronized base amount; apply the food multiplier directly once, matching UAGS rpg_common.scar.
+            AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyAnimalFoodModifier(
+                entity,
+                AoE4RPG.SETTINGS.resource_multipliers.food or 1.0,
+                animal_data,
+                squad_identifier,
+                nil,
+                nil,
+                true
+            )
+        end
+    end
+    SGroup_ForEach(animal_squads, inspect_animal_squad)
+
+    -- IMPORTANT: Native carcasses are replacement entities and are not reliably present in World_GetAllNeutralEntities or exposed under their blueprint names.
+    -- Query the engine's definitive corpse type directly.
+    if World_GetAllEntitiesOfType and EGroup_CreateUnique and EGroup_ForEach then
+        local carcass_entities = EGroup_CreateUnique()
+        World_GetAllEntitiesOfType(carcass_entities, "animal_corpse")
+        local function inspect_native_carcass(group_id, index, entity)
+            local current_food = Entity_GetRemainingResourceDepositAmount(entity)
+            if type(current_food) ~= "number" or current_food <= 0 then
+                return
+            end
+            local animal_data = AoE4RPG_ECONOMIC_BLUEPRINTS_GetAnimalData(entity)
+            if animal_data == nil then
+                -- IMPORTANT: Some native corpse blueprints expose only animal_corpse.
+                -- IMPORTANT: At the first 0.25-second scan their deposit still matches the source animal's base food, so use the nearest profile.
+                local nearest_difference = nil
+                for _, candidate in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.animals or {}) do
+                    local difference = math.abs(candidate.base_food - current_food)
+                    if nearest_difference == nil or difference < nearest_difference then
+                        animal_data = candidate
+                        nearest_difference = difference
+                    end
+                end
+            end
+            if animal_data == nil then
+                return
+            end
+            local multiplier = AoE4RPG.SETTINGS.resource_multipliers.food or 1.0
+            local total_food = animal_data.base_food * multiplier
+            AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyAnimalFoodModifier(
+                entity,
+                multiplier,
+                animal_data,
+                nil,
+                math.min(total_food, current_food * multiplier),
+                total_food,
+                true
+            )
+        end
+        EGroup_ForEach(carcass_entities, inspect_native_carcass)
+    end
+end
+
+-- Records the living animal's current displayed food before carcass conversion.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_RecordAnimalSquadFood(
+    squad_identifier,
+    entity
+)
+    if type(squad_identifier) ~= "number" then
+        return
+    end
+    local record = AoE4RPG.ECONOMIC_BLUEPRINTS.animal_squad_modifiers[squad_identifier]
+    if record == nil then
+        return
+    end
+    local live_entity = AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(entity)
+    if live_entity ~= nil then
+        local current_food = Entity_GetRemainingResourceDepositAmount(live_entity)
+        if type(current_food) == "number" then
+            record.remaining_food = current_food
+        end
+    end
+end
+
+-- IMPORTANT: Preserves the living modifier when native conversion keeps the EntityID.
+-- IMPORTANT: Only a genuinely new corpse entity requires removing the old modifier and applying a fresh one to the replacement entity.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_PrepareAnimalCarcass(
+    squad_identifier,
+    carcass_entity
+)
+    if type(squad_identifier) ~= "number" then
+        return nil
+    end
+    local record = AoE4RPG.ECONOMIC_BLUEPRINTS.animal_squad_modifiers[squad_identifier]
+    if record == nil then
+        return nil
+    end
+
+    local carcass, carcass_identifier =
+        AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(carcass_entity)
+    local retained_food = record.remaining_food
+    local total_food = record.total_food
+    local modifier_persists =
+        carcass ~= nil and carcass_identifier == record.entity_id
+    if modifier_persists then
+        -- IMPORTANT: Do not read the newly converted native amount here; it may already have reset to 350.
+        -- Keep the multiplied living-animal amount recorded by UAGS-style initialization.
+        AoE4RPG.ECONOMIC_BLUEPRINTS.animal_squad_modifiers[squad_identifier] = nil
+        return retained_food, total_food, true
+    end
+    if record.modifier_id ~= nil and Modifier_Remove then
+        Modifier_Remove(record.modifier_id)
+    end
+    AoE4RPG.ECONOMIC_BLUEPRINTS.applied_animal_entities[record.entity_id] = nil
+    AoE4RPG.ECONOMIC_BLUEPRINTS.animal_squad_modifiers[squad_identifier] = nil
+    return retained_food, total_food, false
+end
+
+-- Returns true for either a construction blueprint or its converted live Ovoo.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_IsRegisteredOvoo(entity)
+    if entity == nil then
+        return false
+    end
+    -- AGS uses this engine type to find Ovoos after construction.
+    -- The final entity may no longer expose the stone-deposit construction blueprint.
+    if Entity_IsOfType and Entity_IsOfType(entity, "ovoo") then
+        return true
+    end
+    if not Entity_GetBlueprint or not BP_GetName then
+        return false
+    end
+    local entity_blueprint = Entity_GetBlueprint(entity)
+    local blueprint_name = entity_blueprint and BP_GetName(entity_blueprint) or nil
+    for _, ovoo_data in ipairs(AoE4RPG.ECONOMIC_BLUEPRINTS.ovoos or {}) do
+        if blueprint_name == ovoo_data.blueprint_name then
+            return true
+        end
+    end
+    return false
+end
+
+-- IMPORTANT: Applies the Ovoo stone-cap modifier to the current lifecycle instance.
+-- IMPORTANT: Ovoo destruction returns the same deposit to world ownership and removes native entity modifiers, so that ownership transition requires a fresh modifier.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyOvooCapacityModifier(entity, multiplier)
+    if entity == nil or type(multiplier) ~= "number"
+        or not Modifier_ApplyToEntity or not Modifier_Create then
+        return nil
+    end
+    return Modifier_ApplyToEntity(
+        Modifier_Create(
+            MAT_Entity,
+            "resource_contained_amount_stone",
+            MUT_Multiplication,
+            false,
+            multiplier,
+            nil
+        ),
+        entity,
+        0.0
+    )
+end
+
+-- IMPORTANT: Restores an Ovoo's multiplied live stone after deferred native build setup.
+-- Mongol buildings may emit construction-complete twice.
+-- IMPORTANT: The EntityID record prevents double multiplication, while the second pass only repairs a value that was reset to the captured native amount.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_AdjustOvooAfterConstruction(rule_id, context)
+    if type(rule_id) == "table" and context == nil then
+        context = rule_id
+    end
+    if type(context) ~= "table" then
+        return
+    end
+
+    local entity, entity_identifier =
+        AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(context.entity_id)
+    if entity == nil or not AoE4RPG_ECONOMIC_BLUEPRINTS_IsRegisteredOvoo(entity) then
+        AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities[context.entity_id] = nil
+        return
+    end
+
+    local multiplier = tonumber(context.multiplier)
+        or AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier
+    if type(multiplier) ~= "number" or multiplier <= 0 or multiplier == 1.0
+        or not Entity_GetRemainingResourceDepositAmount
+        or not Entity_SetRemainingResourceDepositAmount then
+        AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities[entity_identifier] = nil
+        return
+    end
+
+    local current_amount = Entity_GetRemainingResourceDepositAmount(entity)
+    if type(current_amount) ~= "number" or current_amount <= 0 then
+        AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities[entity_identifier] = nil
+        return
+    end
+
+    local record = AoE4RPG.ECONOMIC_BLUEPRINTS.applied_ovoo_entities[entity_identifier]
+    if record == nil then
+        record = {
+            native_amount = current_amount,
+            target_amount = current_amount * multiplier,
+            multiplier = multiplier,
+            world_owned = World_OwnsEntity and World_OwnsEntity(entity) or false,
+            last_remaining_amount = current_amount * multiplier,
+        }
+        -- IMPORTANT: Do not apply the cap during the first post-construction callback.
+        -- IMPORTANT: Native Ovoo conversion can still remove entity modifiers at this point, which leaves the later stone write constrained to its native amount.
+        -- The next callback applies the cap only after that reset is observable.
+        AoE4RPG.ECONOMIC_BLUEPRINTS.applied_ovoo_entities[entity_identifier] = record
+        Entity_SetRemainingResourceDepositAmount(entity, record.target_amount)
+    else
+        local world_owned = World_OwnsEntity and World_OwnsEntity(entity) or false
+        local ownership_changed = record.world_owned ~= world_owned
+        local reset_tolerance = math.max(0.5, math.abs(record.native_amount) * 0.001)
+        if ownership_changed then
+            -- IMPORTANT: Building destruction removes the player-owned Ovoo modifier while preserving its EntityID.
+            -- Reapply both cap and current stone to the returned neutral deposit exactly once for this ownership change.
+            record.modifier_id =
+                AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyOvooCapacityModifier(
+                    entity,
+                    multiplier
+                )
+            local preserved_remaining_amount = tonumber(record.last_remaining_amount)
+                or record.target_amount
+            Entity_SetRemainingResourceDepositAmount(
+                entity,
+                preserved_remaining_amount
+            )
+            record.last_remaining_amount = preserved_remaining_amount
+        elseif math.abs(current_amount - record.native_amount) <= reset_tolerance then
+            -- IMPORTANT: The native conversion reset the resource to its original cap.
+            -- IMPORTANT: Apply the modifier now, after conversion, then restore the same multiplied amount.
+            -- IMPORTANT: This is the only normal construction path that creates a second modifier, so it cannot compound caps.
+            record.modifier_id =
+                AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyOvooCapacityModifier(
+                    entity,
+                    multiplier
+                )
+            Entity_SetRemainingResourceDepositAmount(entity, record.target_amount)
+            record.last_remaining_amount = record.target_amount
+        else
+            record.last_remaining_amount = current_amount
+        end
+        record.world_owned = world_owned
+    end
+
+    local pass = tonumber(context.pass) or 1
+    -- IMPORTANT: Native Ovoo conversion may complete after the first 0.5-second repair.
+    -- A final pass sees any late reset and reapplies the cap only when needed.
+    if pass < 3 and Rule_AddOneShot then
+        Rule_AddOneShot(
+            AoE4RPG_ECONOMIC_BLUEPRINTS_AdjustOvooAfterConstruction,
+            0.5,
+            {
+                entity_id = entity_identifier,
+                multiplier = multiplier,
+                pass = pass + 1,
+            }
+        )
+    else
+        AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities[entity_identifier] = nil
+    end
+end
+
+-- Tracks the exact remaining stone while an Ovoo is active.
+-- IMPORTANT: Native destruction can reset the converted entity before its delayed callback runs; retaining the last observed amount prevents the returned neutral deposit from being refilled.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_MonitorOvooLifecycles()
+    if not Entity_GetRemainingResourceDepositAmount then
+        return
+    end
+    -- IMPORTANT: Construction events and the Mongol-only startup query discover Ovoos.
+    -- This interval touches only already registered Ovoo EntityIDs.
+    local applied_ovoo_entities =
+        AoE4RPG.ECONOMIC_BLUEPRINTS.applied_ovoo_entities or {}
+    local entity_identifiers = {}
+    for entity_identifier in pairs(applied_ovoo_entities) do
+        table.insert(entity_identifiers, entity_identifier)
+    end
+    table.sort(entity_identifiers)
+    for _, entity_identifier in ipairs(entity_identifiers) do
+        local record = applied_ovoo_entities[entity_identifier]
+        local entity = AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(entity_identifier)
+        if entity ~= nil and AoE4RPG_ECONOMIC_BLUEPRINTS_IsRegisteredOvoo(entity) then
+            local world_owned = World_OwnsEntity and World_OwnsEntity(entity) or false
+            local current_amount = Entity_GetRemainingResourceDepositAmount(entity)
+            if record.world_owned ~= world_owned then
+                record.modifier_id =
+                    AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyOvooCapacityModifier(
+                        entity,
+                        record.multiplier or AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier
+                    )
+                local preserved_remaining_amount = tonumber(record.last_remaining_amount)
+                    or tonumber(current_amount)
+                if preserved_remaining_amount and preserved_remaining_amount > 0
+                    and Entity_SetRemainingResourceDepositAmount then
+                    Entity_SetRemainingResourceDepositAmount(
+                        entity,
+                        preserved_remaining_amount
+                    )
+                    current_amount = preserved_remaining_amount
+                end
+                record.world_owned = world_owned
+            end
+            if type(current_amount) == "number" and current_amount > 0 then
+                record.last_remaining_amount = current_amount
+            end
+        end
+    end
+end
+
+-- Queues an exact Ovoo for adjustment after two engine frames.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_QueueOvooAdjustment(entity, multiplier)
+    local live_entity, entity_identifier =
+        AoE4RPG_ECONOMIC_BLUEPRINTS_GetEntity(entity)
+    if live_entity == nil or entity_identifier == nil
+        or not AoE4RPG_ECONOMIC_BLUEPRINTS_IsRegisteredOvoo(live_entity)
+        or AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities[entity_identifier] then
+        return
+    end
+
+    AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities[entity_identifier] = true
+    local context = {
+        entity_id = entity_identifier,
+        multiplier = multiplier,
+        pass = 1,
+    }
+    if Rule_AddOneShot then
+        Rule_AddOneShot(
+            AoE4RPG_ECONOMIC_BLUEPRINTS_AdjustOvooAfterConstruction,
+            0.125,
+            context
+        )
+    else
+        AoE4RPG_ECONOMIC_BLUEPRINTS_AdjustOvooAfterConstruction(context)
+    end
+end
+
+-- Captures newly built or unpacked Ovoos for Mongols and Golden Horde.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_OnOvooConstructionComplete(context)
+    if type(context) ~= "table" or context.entity == nil or context.player == nil then
+        return
+    end
+    local player = AoE4RPG_RUNTIME_GetPlayerHandle
+        and AoE4RPG_RUNTIME_GetPlayerHandle(context.player)
+        or context.player
+    local race_name = AoE4RPG_RUNTIME_GetPlayerRaceName
+        and AoE4RPG_RUNTIME_GetPlayerRaceName(player, "")
+        or ""
+    if race_name ~= "mongol" and race_name ~= "mongol_ha_gol" then
+        return
+    end
+    AoE4RPG_ECONOMIC_BLUEPRINTS_QueueOvooAdjustment(
+        context.entity,
+        AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier
+    )
+end
+
+-- Applies stone-cap modifiers to exact Mongol/Golden Horde Ovoo blueprints.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_ApplyOvooStoneModifiers(multiplier)
+    if type(multiplier) ~= "number" or multiplier == 1.0 then
+        return
+    end
+
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier = multiplier
+    if not AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_construction_event_registered
+        and Rule_AddGlobalEvent and GE_ConstructionComplete then
+        Rule_AddGlobalEvent(
+            AoE4RPG_ECONOMIC_BLUEPRINTS_OnOvooConstructionComplete,
+            GE_ConstructionComplete
+        )
+        AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_construction_event_registered = true
+    end
+    if not AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_lifecycle_monitor_registered
+        and Rule_AddInterval then
+        Rule_AddInterval(
+            AoE4RPG_ECONOMIC_BLUEPRINTS_MonitorOvooLifecycles,
+            0.125
+        )
+        AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_lifecycle_monitor_registered = true
+    end
+
+    -- Cover Ovoos supplied by a starting condition before this module starts.
+    -- IMPORTANT: Query only Mongol players; Ovoos are non-squad buildings, so Player_GetEntitiesFromType is the narrow engine path.
+    if Player_GetEntitiesFromType and EGroup_ForEach then
+        local players = AoE4RPG_ENTITY_TRACKER_GetWorldPlayers
+            and AoE4RPG_ENTITY_TRACKER_GetWorldPlayers()
+            or {}
+        if #players == 0 and type(PLAYERS) == "table" then
+            for _, player in pairs(PLAYERS) do
+                table.insert(players, player)
+            end
+            table.sort(players, function(left, right)
+                local left_id = AoE4RPG_RUNTIME_GetPlayerIdentifier
+                    and AoE4RPG_RUNTIME_GetPlayerIdentifier(left)
+                    or AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+                        and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(left)
+                    or tonumber(left) or 0
+                local right_id = AoE4RPG_RUNTIME_GetPlayerIdentifier
+                    and AoE4RPG_RUNTIME_GetPlayerIdentifier(right)
+                    or AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier
+                        and AoE4RPG_ENTITY_TRACKER_GetPlayerIdentifier(right)
+                    or tonumber(right) or 0
+                return left_id < right_id
+            end)
+        end
+        for _, player in ipairs(players) do
+            local player_handle = AoE4RPG_RUNTIME_GetPlayerHandle
+                and AoE4RPG_RUNTIME_GetPlayerHandle(player)
+                or player
+            local race_name = AoE4RPG_RUNTIME_GetPlayerRaceName
+                and AoE4RPG_RUNTIME_GetPlayerRaceName(player_handle, "")
+                or ""
+            if player_handle
+                and (race_name == "mongol" or race_name == "mongol_ha_gol") then
+                local existing_ovoos = Player_GetEntitiesFromType(player_handle, "ovoo")
+                if existing_ovoos then
+                    local function queue_existing_ovoo(group_id, index, entity)
+                        AoE4RPG_ECONOMIC_BLUEPRINTS_QueueOvooAdjustment(
+                            entity,
+                            multiplier
+                        )
+                    end
+                    EGroup_ForEach(existing_ovoos, queue_existing_ovoo)
+                end
+            end
+        end
+    end
+end
+
+-- Removes the construction listener owned by the economic blueprint helper.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_StopOvooMonitor()
+    if AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_construction_event_registered
+        and Rule_RemoveGlobalEvent then
+        Rule_RemoveGlobalEvent(AoE4RPG_ECONOMIC_BLUEPRINTS_OnOvooConstructionComplete)
+    end
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_construction_event_registered = false
+    if AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_lifecycle_monitor_registered
+        and Rule_Remove then
+        Rule_Remove(AoE4RPG_ECONOMIC_BLUEPRINTS_MonitorOvooLifecycles)
+    end
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_lifecycle_monitor_registered = false
+end
+
+-- Clears match-runtime guards while preserving the editable blueprint registry.
+function AoE4RPG_ECONOMIC_BLUEPRINTS_ResetRuntimeState()
+    AoE4RPG.ECONOMIC_BLUEPRINTS.applied_animal_entities = {}
+    AoE4RPG.ECONOMIC_BLUEPRINTS.animal_squad_modifiers = {}
+    AoE4RPG.ECONOMIC_BLUEPRINTS.pending_animal_squads = {}
+    AoE4RPG.ECONOMIC_BLUEPRINTS.applied_ovoo_players = {}
+    AoE4RPG.ECONOMIC_BLUEPRINTS.applied_ovoo_entities = {}
+    AoE4RPG.ECONOMIC_BLUEPRINTS.pending_ovoo_entities = {}
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_stone_multiplier = 1.0
+    AoE4RPG.ECONOMIC_BLUEPRINTS.ovoo_lifecycle_monitor_registered = false
+end

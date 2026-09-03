@@ -1,0 +1,116 @@
+-- ================= AoE4RPG Effects List ===============
+-- AoE4RPG Effects List - Registry defines effect names, descriptions, and value schemas.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_effects.scar and AoE4RPG_ability_list_compact.scar.
+-- ================= AoE4RPG Effects List ===============
+
+if not AoE4RPG then AoE4RPG = {} end
+AoE4RPG.EFFECT_LIST = AoE4RPG.EFFECT_LIST or {}
+
+-- ==================== Effect Value Reference ==============
+-- The position of each value is defined by the matching schema below.
+-- Named fields remain valid for nested effects and settings that are not part of the compact positional list.
+--
+--
+-- Nested effect fields: apply_effect, apply_effect_data, delayed_effects, and additional_effects.
+--
+-- Fade fields: fade.enabled, fade.start_multiplier, fade.start_time, and fade.full_time.
+-- These may be placed on an effect row or configured in this list's damage row.
+-- A fade profile changes the value as the marker advances in time.
+-- ==================== Effect Value Reference ==============
+
+-- ==================== Compact Effect Value Schemas ==============
+-- Values are ordered from the most commonly adjusted value to less common effect-specific settings.
+-- Empty trailing positions may be omitted. [1] amount/damage means the primary numeric value.
+-- Nested tables stay in one value position so the ability row remains compact.
+-- ==================== Compact Effect Value Schemas ==============
+AoE4RPG.EFFECT_VALUE_FIELDS = {
+    -- [1] amount, [2] radius, [3] duration, [4] effect growth, [5] target group: "allies", "enemies", or "both".
+    damage = { "amount", "radius", "duration", "effect_growth", "affects" },
+    heal = { "amount", "radius", "duration", "effect_growth", "affects" },
+
+    damage_on_attacked = {
+        "amount", "radius", "duration", "effect_growth", "affects",
+        "activation_cooldown", "apply_effect", "animation_action",
+        "apply_effect_data",
+    },
+
+    -- [1] amount, [2] duration, [3] effect growth.
+    -- IMPORTANT: For attack_ignore_armor, amount is the weapon-damage modifier used by the current implementation; it is not an additional damage instance.
+    attack_ignore_armor = { "amount", "duration", "effect_growth" },
+    projectile_attack_ignore_armor = { "amount", "duration", "effect_growth" },
+    damage_buff = { "amount", "duration", "effect_growth" },
+    attack_speed_buff = { "amount", "duration", "effect_growth" },
+
+    attribute_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+    agility_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+    endurance_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+    vitality_multiplier = { "amount", "effect_growth", "attribute", "effect_id" },
+
+    -- [1] amount, [2] effect growth, [3] ability-value source.
+    -- Supported sources are normally "damage" and "health".
+    ability_damage_multiplier = { "amount", "effect_growth", "source" },
+    ability_health_multiplier = { "amount", "effect_growth", "source" },
+    ability_value_multiplier = { "amount", "effect_growth", "source" },
+
+    missing_health_trigger = {
+        "threshold", "minimum_threshold", "threshold_reduction_per_level",
+        "threshold_refresh_interval", "health_ratio_mode", "apply_effect",
+        "apply_effect_data",
+    },
+
+    track_attack_counts = {
+        "required_attacks", "effect_level", "apply_effect", "effect_id",
+        "apply_effect_data",
+    },
+
+    same_target_damage_stack = {
+        "amount", "effect_growth", "required_attacks", "max_stacks",
+        "reset_on_target_change", "hardpoint", "effect_id",
+    },
+
+    melee_attack_move_hunt = {
+        "duration", "hunt_search_radius", "hunt_retarget_interval",
+        "allow_buildings", "attack_move_queued", "attack_move_cover_radius",
+        "melee_only",
+    },
+
+    timed_effect = {
+        "effect_delay", "effect_level", "effect_growth", "apply_effect",
+        "apply_effect_data",
+    },
+
+    spawned_unit_effects = { "target_scope", "effect_level", "apply_effects" },
+    trained_unit_effects = { "target_scope", "effect_level", "apply_effects" },
+
+    -- [1] weapon slot number, [2] hardpoint name.
+    weapon_slot = { "weapon_slot", "hardpoint" },
+}
+
+-- ==================== Effect Names and Descriptions ==============
+-- ==================== Effect Names and Descriptions ==============
+AoE4RPG.EFFECT_DESCRIPTIONS = {
+    { effect_name = "damage", display_name = "Damage", description = "Deals +<effect_value> direct damage to the target.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.damage,
+      fade = { enabled = false, start_multiplier = 0.20, start_time = 0, full_time = 3 } },
+    { effect_name = "heal", display_name = "Healing", description = "Restores <effect_value> health to the target.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.heal },
+    { effect_name = "weapon_slot", display_name = "Weapon Slot", description = "Selects a configured weapon slot or hardpoint.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.weapon_slot },
+    { effect_name = "attack_ignore_armor", display_name = "Attack Ignore Armor", description = "Applies a weapon damage modifier for armor-ignoring attacks.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.attack_ignore_armor },
+    { effect_name = "projectile_attack_ignore_armor", display_name = "Projectile Ignore Armor", description = "Projectile-hit alias for the armor-ignoring damage effect.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.projectile_attack_ignore_armor },
+    { effect_name = "damage_buff", display_name = "Damage Buff", description = "Adds +<effect_value> damage to the owner's weapons.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.damage_buff },
+    { effect_name = "attack_speed_buff", display_name = "Attack Speed Buff", description = "Changes weapon reload, cooldown, wind-up, and wind-down timing.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.attack_speed_buff },
+    { effect_name = "damage_on_attacked", display_name = "Retaliation Damage", description = "When the owner is attacked, applies the configured effect to eligible nearby targets.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.damage_on_attacked },
+    { effect_name = "attribute_multiplier", display_name = "Attribute Multiplier", description = "Adds <effect_value> to the selected attribute multiplier.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.attribute_multiplier },
+    { effect_name = "agility_multiplier", display_name = "Agility Multiplier", description = "Adds <effect_value> to Agility.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.agility_multiplier },
+    { effect_name = "endurance_multiplier", display_name = "Endurance Multiplier", description = "Adds <effect_value> to Endurance.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.endurance_multiplier },
+    { effect_name = "vitality_multiplier", display_name = "Vitality Multiplier", description = "Adds <effect_value> to Vitality.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.vitality_multiplier },
+    { effect_name = "ability_damage_multiplier", display_name = "Ability Damage Multiplier", description = "Stores an ability-value multiplier based on damage.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.ability_damage_multiplier },
+    { effect_name = "ability_health_multiplier", display_name = "Ability Health Multiplier", description = "Stores an ability-value multiplier based on maximum health.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.ability_health_multiplier },
+    { effect_name = "ability_value_multiplier", display_name = "Ability Value Multiplier", description = "Stores a multiplier for a configured ability-value source.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.ability_value_multiplier },
+    { effect_name = "missing_health_trigger", display_name = "Missing Health Trigger", description = "Triggers another effect after the configured missing-health threshold.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.missing_health_trigger },
+    { effect_name = "track_attack_counts", display_name = "Attack Count Trigger", description = "Triggers another effect after the required number of attacks.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.track_attack_counts },
+    { effect_name = "same_target_damage_stack", display_name = "Same Target Damage Stack", description = "Adds <effect_value> weapon damage per consecutive attack against the same target, up to the configured maximum stack.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.same_target_damage_stack },
+    { effect_name = "melee_attack_move_hunt", display_name = "Melee Hunt", description = "Issues an attack-move order, teleports the owner to the nearest enemy, and repeats on a new target when the current target dies until the duration ends.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.melee_attack_move_hunt },
+    { effect_name = "timed_effect", display_name = "Timed Effect", description = "Invokes another configured effect through a timed marker.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.timed_effect },
+    { effect_name = "spawned_unit_effects", display_name = "Spawned Unit Effects", description = "Registers effects for future units produced by the owner.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.spawned_unit_effects },
+    { effect_name = "trained_unit_effects", display_name = "Trained Unit Effects", description = "Compatibility alias for effects applied to trained units.", value_fields = AoE4RPG.EFFECT_VALUE_FIELDS.trained_unit_effects },
+}

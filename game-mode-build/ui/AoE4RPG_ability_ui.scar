@@ -1,0 +1,174 @@
+-- ================= AoE4RPG Ability UI ===============
+-- AoE4RPG Ability UI - Ability Presenter shows current ability names, costs, cooldowns, and effects.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_ui_panel.scar and AoE4RPG_random_bonus.scar.
+-- ================= AoE4RPG Ability UI ===============
+
+if not AoE4RPG then AoE4RPG = {} end
+
+AoE4RPG.ABILITY_UI = {
+    initialized = false,
+    context = {
+        visible = false,
+        skill1 = { visible = false, name = "", type = "", level = "", cost = "", cooldown = "", effect = "", effect_type = "", description = "" },
+        skill2 = { visible = false, name = "", type = "", level = "", cost = "", cooldown = "", effect = "", effect_type = "", description = "" },
+        skill3 = { visible = false, name = "", type = "", level = "", cost = "", cooldown = "", effect = "", effect_type = "", description = "" },
+        skill4 = { visible = false, name = "", type = "", level = "", cost = "", cooldown = "", effect = "", effect_type = "", description = "" },
+        skill5 = { visible = false, name = "", type = "", level = "", cost = "", cooldown = "", effect = "", effect_type = "", description = "" },
+    },
+}
+
+local function AoE4RPG_ABILITY_UI_SetData()
+    if AoE4RPG_UI_PanelSetData then
+        AoE4RPG_UI_PanelSetData("AoE4RPG_SelectedAbilities", AoE4RPG.ABILITY_UI.context)
+    elseif UI_SetDataContext then
+        UI_SetDataContext("AoE4RPG_SelectedAbilities", AoE4RPG.ABILITY_UI.context)
+    end
+end
+
+-- Clears every slot so a previously selected hero's skills cannot remain visible.
+function AoE4RPG_ABILITY_UI_Hide()
+    local context = AoE4RPG.ABILITY_UI.context
+    context.visible = false
+    for slot = 1, 5 do
+        context["skill" .. tostring(slot)] = {
+            visible = false, name = "", type = "", level = "", cost = "",
+            cooldown = "", effect = "", effect_type = "", description = "",
+        }
+    end
+    AoE4RPG_ABILITY_UI_SetData()
+end
+
+local function AoE4RPG_ABILITY_UI_FindEntry(key)
+    for _, entry in ipairs(AoE4RPG.ABILITY_LIST or {}) do
+        if entry.ability_name == key or entry.ability == key
+            or tostring(entry.ability_pbgid or "") == tostring(key or "") then
+            return entry
+        end
+    end
+    return nil
+end
+
+local function AoE4RPG_ABILITY_UI_FormatSkill(key, unit_data, entity)
+    local entry = AoE4RPG_ABILITY_UI_FindEntry(key)
+    if not entry then return nil end
+    local ability = AoE4RPG_BONUS_GetSkillAbilityBlueprint
+        and AoE4RPG_BONUS_GetSkillAbilityBlueprint(entry, entity)
+        or nil
+    if not ability then
+        return nil
+    end
+    -- The presenter is informational and non-interactive.
+    if Entity_HasAbility then
+        local has_ability_success, has_ability = pcall(Entity_HasAbility, entity, ability)
+        if has_ability_success and not has_ability then
+            return nil
+        end
+    end
+    local level = unit_data.skill_levels and unit_data.skill_levels[key] or 1
+    local effect_level = unit_data.skill_effect_levels and unit_data.skill_effect_levels[key] or level
+    local skill_type = entry.skill_type or "passive"
+    local effect_name = entry.effect_name or "No registered effect"
+    local amount = entry.amount or entry.damage or 0
+    local effect_data = {}
+    for field, value in pairs(entry) do effect_data[field] = value end
+    effect_data.effect_level = effect_level
+    if AoE4RPG_ABILITY_LIST_GetEffectData then
+        effect_data = AoE4RPG_ABILITY_LIST_GetEffectData(key, entity) or effect_data
+    end
+    local display_name = effect_name
+    local description = entry.description
+    if AoE4RPG_EFFECT_GetDisplayName then
+        display_name = AoE4RPG_EFFECT_GetDisplayName(effect_name) or display_name
+    end
+    if AoE4RPG_EFFECT_FormatDescription then
+        description = AoE4RPG_EFFECT_FormatDescription(effect_name, effect_data)
+    end
+    if AoE4RPG_EFFECT_FormatAbilityDescription and entry.ability_description then
+        description = AoE4RPG_EFFECT_FormatAbilityDescription(entry, effect_data)
+    end
+    description = description
+        or ("Applies " .. tostring(effect_name) .. " (value " .. tostring(amount) .. ").")
+    return {
+        visible = true,
+        name = tostring(entry.display_name or entry.ability_name or key),
+        type = string.upper(tostring(skill_type)),
+        level = "Level " .. tostring(level) .. " / Effect " .. tostring(effect_level),
+        cost = "HP Cost: " .. tostring(entry.hp_cost or 0),
+        cooldown = "Cooldown: " .. tostring(entry.cooldown or entry.cooldown_time or "Native"),
+        effect = "Effect: " .. tostring(display_name),
+        effect_type = "Effect Type: " .. tostring(entry.effect_type or skill_type),
+        description = description,
+    }
+end
+
+-- Copies the persistent random-bonus skill slots into the selected-unit UI.
+function AoE4RPG_ABILITY_UI_UpdateForEntity(entity)
+    if not entity or not AoE4RPG_UI_NormalizeEntity then
+        AoE4RPG_ABILITY_UI_Hide()
+        return
+    end
+    local normalized, entity_id = AoE4RPG_UI_NormalizeEntity(entity)
+    local unit_data = entity_id and AoE4RPG_GetExistingUnitData
+        and AoE4RPG_GetExistingUnitData(entity_id)
+        or nil
+    if not normalized or not unit_data or type(unit_data.skill_slots) ~= "table" then
+        AoE4RPG_ABILITY_UI_Hide()
+        return
+    end
+    local context = AoE4RPG.ABILITY_UI.context
+    context.visible = false
+    for slot = 1, 5 do
+        local key = unit_data.skill_slots[slot]
+        local skill_data = key
+            and AoE4RPG_ABILITY_UI_FormatSkill(key, unit_data, normalized)
+            or { visible = false, name = "", type = "", level = "", cost = "", cooldown = "", effect = "", effect_type = "", description = "" }
+        context["skill" .. tostring(slot)] = skill_data
+        if skill_data.visible then context.visible = true end
+    end
+    AoE4RPG_ABILITY_UI_SetData()
+end
+
+-- Creates the fixed five-slot horizontal presenter above the single-selection overlay.
+-- Margin is intentionally adjustable for the target HUD resolution.
+function AoE4RPG_ABILITY_UI_Initialize()
+    if AoE4RPG.ABILITY_UI.initialized then return true end
+    if not AoE4RPG_UI_PanelCreate and (not UI_AddChild or not UI_CreateDataContext) then return false end
+    local xaml = [[<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="418,0,0,194"
+        Visibility="{Binding [visible], Converter={StaticResource BoolToVis}}">
+  <Border.Resources><ResourceDictionary><ResourceDictionary.MergedDictionaries>
+    <ResourceDictionary Source="pack://application:,,,ui/Resources/HUDResources.xaml" />
+  </ResourceDictionary.MergedDictionaries></ResourceDictionary></Border.Resources>
+  <StackPanel Orientation="Horizontal">
+    <Border Width="36" Height="36" Margin="0,0,4,0" Background="#80050B13" BorderBrush="#FF9A8352" BorderThickness="1" Visibility="{Binding [skill1][visible], Converter={StaticResource BoolToVis}}"><Border.ToolTip><ContentControl Style="{StaticResource HUDTooltipBorderStyle}"><StackPanel><TextBlock Text="{Binding [skill1][name]}" Style="{StaticResource nHUDSubheaderSmallTextBlockStyle}"/><TextBlock Text="{Binding [skill1][type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill1][level]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill1][cost]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill1][cooldown]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill1][effect]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill1][effect_type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill1][description]}" TextWrapping="Wrap" Style="{StaticResource nHUDBaseTextBlockStyle}"/></StackPanel></ContentControl></Border.ToolTip><TextBlock Text="1" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+    <Border Width="36" Height="36" Margin="0,0,4,0" Background="#80050B13" BorderBrush="#FF9A8352" BorderThickness="1" Visibility="{Binding [skill2][visible], Converter={StaticResource BoolToVis}}"><Border.ToolTip><ContentControl Style="{StaticResource HUDTooltipBorderStyle}"><StackPanel><TextBlock Text="{Binding [skill2][name]}" Style="{StaticResource nHUDSubheaderSmallTextBlockStyle}"/><TextBlock Text="{Binding [skill2][type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill2][level]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill2][cost]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill2][cooldown]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill2][effect]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill2][effect_type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill2][description]}" TextWrapping="Wrap" Style="{StaticResource nHUDBaseTextBlockStyle}"/></StackPanel></ContentControl></Border.ToolTip><TextBlock Text="2" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+    <Border Width="36" Height="36" Margin="0,0,4,0" Background="#80050B13" BorderBrush="#FF9A8352" BorderThickness="1" Visibility="{Binding [skill3][visible], Converter={StaticResource BoolToVis}}"><Border.ToolTip><ContentControl Style="{StaticResource HUDTooltipBorderStyle}"><StackPanel><TextBlock Text="{Binding [skill3][name]}" Style="{StaticResource nHUDSubheaderSmallTextBlockStyle}"/><TextBlock Text="{Binding [skill3][type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill3][level]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill3][cost]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill3][cooldown]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill3][effect]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill3][effect_type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill3][description]}" TextWrapping="Wrap" Style="{StaticResource nHUDBaseTextBlockStyle}"/></StackPanel></ContentControl></Border.ToolTip><TextBlock Text="3" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+    <Border Width="36" Height="36" Margin="0,0,4,0" Background="#80050B13" BorderBrush="#FF9A8352" BorderThickness="1" Visibility="{Binding [skill4][visible], Converter={StaticResource BoolToVis}}"><Border.ToolTip><ContentControl Style="{StaticResource HUDTooltipBorderStyle}"><StackPanel><TextBlock Text="{Binding [skill4][name]}" Style="{StaticResource nHUDSubheaderSmallTextBlockStyle}"/><TextBlock Text="{Binding [skill4][type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill4][level]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill4][cost]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill4][cooldown]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill4][effect]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill4][effect_type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill4][description]}" TextWrapping="Wrap" Style="{StaticResource nHUDBaseTextBlockStyle}"/></StackPanel></ContentControl></Border.ToolTip><TextBlock Text="4" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+    <Border Width="36" Height="36" Background="#80050B13" BorderBrush="#FF9A8352" BorderThickness="1" Visibility="{Binding [skill5][visible], Converter={StaticResource BoolToVis}}"><Border.ToolTip><ContentControl Style="{StaticResource HUDTooltipBorderStyle}"><StackPanel><TextBlock Text="{Binding [skill5][name]}" Style="{StaticResource nHUDSubheaderSmallTextBlockStyle}"/><TextBlock Text="{Binding [skill5][type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill5][level]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill5][cost]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill5][cooldown]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill5][effect]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill5][effect_type]}" Style="{StaticResource nHUDBaseTextBlockStyle}"/><TextBlock Text="{Binding [skill5][description]}" TextWrapping="Wrap" Style="{StaticResource nHUDBaseTextBlockStyle}"/></StackPanel></ContentControl></Border.ToolTip><TextBlock Text="5" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+  </StackPanel>
+</Border>]]
+    local created
+    if AoE4RPG_UI_PanelCreate then
+        -- IMPORTANT: Do not fall through to direct UI_AddChild when guarded creation is not ready.
+        -- The retry path must never create an unregistered duplicate presenter.
+        created = AoE4RPG_UI_PanelCreate(
+            "AoE4RPG_SelectedAbilities",
+            xaml,
+            AoE4RPG.ABILITY_UI.context,
+            false,
+            "ScarNotReplay"
+        )
+    else
+        created = pcall(function()
+            UI_AddChild("ScarNotReplay", "XamlPresenter", "AoE4RPG_SelectedAbilities", {
+                IsHitTestVisible = true,
+                Xaml = xaml,
+                DataContext = UI_CreateDataContext(AoE4RPG.ABILITY_UI.context),
+            })
+        end)
+    end
+    AoE4RPG.ABILITY_UI.initialized = created and true or false
+    return AoE4RPG.ABILITY_UI.initialized
+end

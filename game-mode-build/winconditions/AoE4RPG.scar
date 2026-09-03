@@ -1,0 +1,147 @@
+-- ================= AoE4RPG Win Condition ===============
+-- AoE4RPG Win Condition - Game Mode Entry registers the selectable win condition and loads the bootstrap.
+-- Author: Hikitomi
+-- Referenced: AoE4RPG_bootstrap.scar and native win-condition modules.
+-- ================= AoE4RPG Win Condition ===============
+
+import("cardinal.scar")
+import("ScarUtil.scar")
+import("gameplay/score.scar")
+import("gameplay/diplomacy.scar")
+
+-- IMPORTANT: Generated random-map resources are finalized by the native Classic Start module.
+_match = _match or {
+    is_nomad_start = false,
+}
+
+import("startconditions/classic_start.scar")
+
+import("winconditions/annihilation.scar")
+import("winconditions/conquest.scar")
+import("winconditions/regicide.scar")
+import("winconditions/elimination.scar")
+import("winconditions/surrender.scar")
+
+import("gameplay/chi/current_dynasty_ui.scar")
+import("gameplay/event_cues.scar")
+import("gameplay/currentageui.scar")
+
+import("AoE4RPG_bootstrap.scar")
+
+-- ==================== Selectable Victory Condition ==============
+-- Each outcome has an AGS-style Boolean option.
+-- IMPORTANT: Multiple native conditions may remain active together; native Regicide creates monarchs only when selected.
+-- ==================== Selectable Victory Condition ==============
+
+AoE4RPG.VICTORY_MODULES = AoE4RPG.VICTORY_MODULES or {
+    conquest = "Conquest",
+    annihilation = "Annihilation",
+    regicide = "Regicide",
+}
+
+-- The result is retained for warnings and future compatibility checks.
+function AoE4RPG_ValidateVictoryConditions()
+    AoE4RPG.victory_condition_validation = {}
+    local all_conditions_available = true
+
+    for mode_name, module_name in pairs(AoE4RPG.VICTORY_MODULES) do
+        local is_registered = Core_IsModuleRegistered
+            and Core_IsModuleRegistered(module_name)
+            or false
+        AoE4RPG.victory_condition_validation[mode_name] = is_registered
+        if not is_registered then
+            all_conditions_available = false
+        end
+        if print then
+            print(
+                "[AoE4RPG] Victory condition validation: "
+                    .. mode_name .. "=" .. tostring(is_registered)
+            )
+        end
+    end
+
+    return all_conditions_available
+end
+
+-- IMPORTANT: Enables or disables one already imported native Cardinal module safely.
+local function AoE4RPG_SetVictoryModuleEnabled(module_name, enabled)
+    if not module_name or not Core_IsModuleRegistered then
+        return false
+    end
+    local is_registered = Core_IsModuleRegistered(module_name)
+    if enabled then
+        if not is_registered and Core_RegisterModule then
+            Core_RegisterModule(module_name)
+        end
+        return true
+    end
+    if is_registered and Core_UnregisterModule then
+        Core_UnregisterModule(module_name)
+    end
+    return true
+end
+
+-- IMPORTANT: Applies all checked AoE4RPG victory conditions before OnInit creates native objectives, event rules, and Regicide monarchs.
+function AoE4RPG_ApplyVictorySelection()
+    AoE4RPG_ValidateVictoryConditions()
+    AoE4RPG.SETTINGS = AoE4RPG.SETTINGS or {}
+
+    local selected_conditions = AoE4RPG.SETTINGS
+        and AoE4RPG.SETTINGS.victory_conditions
+        or {
+            annihilation = true,
+            conquest = true,
+            regicide = false,
+        }
+    local selected_count = 0
+    for mode_name, module_name in pairs(AoE4RPG.VICTORY_MODULES) do
+        local enabled = selected_conditions[mode_name] == true
+            and AoE4RPG.victory_condition_validation[mode_name] == true
+        AoE4RPG_SetVictoryModuleEnabled(module_name, enabled)
+        selected_conditions[mode_name] = enabled
+        if enabled then
+            selected_count = selected_count + 1
+        end
+    end
+
+    -- IMPORTANT: Never allow an unwinnable configuration.
+    -- AGS exposes independent ticks, but this narrower mode restores Conquest when every outcome is unchecked.
+    if selected_count == 0 and AoE4RPG.victory_condition_validation.conquest then
+        selected_conditions.conquest = true
+        AoE4RPG_SetVictoryModuleEnabled(AoE4RPG.VICTORY_MODULES.conquest, true)
+        selected_count = 1
+    end
+
+    AoE4RPG.SETTINGS.victory_conditions = selected_conditions
+    AoE4RPG.active_victory_conditions = selected_conditions
+    AoE4RPG.active_victory_mode = selected_conditions.regicide and "regicide"
+        or (selected_conditions.annihilation and "annihilation")
+        or "conquest"
+    if print then
+        print(
+            "[AoE4RPG] Active victory conditions: annihilation="
+                .. tostring(selected_conditions.annihilation)
+                .. ", conquest=" .. tostring(selected_conditions.conquest)
+                .. ", regicide=" .. tostring(selected_conditions.regicide)
+        )
+    end
+    return selected_conditions
+end
+
+-- The registered AoE4RPG module owns OnInit, Start, and OnGameOver through AoE4RPG_bootstrap.scar.
+function AoE4RPG_OnGameSetup()
+    local options = {}
+    if Setup_GetWinConditionOptions then
+        Setup_GetWinConditionOptions(options)
+    end
+
+    if AoE4RPG_SETTINGS_Setup then
+        AoE4RPG_SETTINGS_Setup(options)
+    elseif AoE4RPG_SETTINGS_Initialize then
+        -- IMPORTANT: Compatibility fallback if an older settings helper has no setup bridge.
+        AoE4RPG.WINCONDITION_OPTIONS = options
+        AoE4RPG_SETTINGS_Initialize()
+    end
+
+    AoE4RPG_ApplyVictorySelection()
+end
