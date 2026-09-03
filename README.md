@@ -47,6 +47,14 @@ blueprint-to-tracking and blueprint-to-civilization maps. Melee hunt effects use
 the bounded per-player nearby-entity query when available and preserve the
 all-world query only as a compatibility fallback.
 
+The human and AI fallback monitors share the same count-gated player entity
+scan. AI fallback work is staggered to one player every five seconds, while
+production events remain the immediate discovery path. XML retains the baseline
+production setup, while the shared class-slot module removes classes that cannot
+enter the leveling system. The redundant AI-only production restriction path is
+not used. Low-health preservation issues one native retreat order instead of
+replacing the squad's move order every monitor interval.
+
 Function counts include global functions, nested local functions, and anonymous callbacks. The active import tree currently contains **248 function declarations**: **235 named/local functions** and **13 anonymous callbacks** across 19 project modules. This reference covers the active root import tree; generated copies under `AoE4RPG_Scar/` are not loaded by the IDE bootstrap.
 
 | Root module | Functions | Main responsibility |
@@ -158,7 +166,9 @@ Function counts include global functions, nested local functions, and anonymous 
 | `AoE4RPG_GetPrimaryStatBonus(class_name)` | Returns the class definition's primary-stat coefficient. |
 | `AoE4RPG_TranslateAttributesToStats(unit_data)` | Converts accumulated attributes and bonuses into the record's derived statistics. |
 | `AoE4RPG_AssignEntityRole(entity, unit_data)` | Resolves and stores mutually exclusive hero/elite role flags. |
-| `AoE4RPG_ApplyDeathPenalty(entity, unit_data)` | Applies hero XP loss, elite level loss, or the applicable role-specific death rule. |
+| `AoE4RPG_RemoveHumanExperienceOnDeath(unit_data)` | Clears RPG XP through the human-only death path. |
+| `AoE4RPG_RemoveAIExperienceOnDeath(unit_data)` | Clears RPG XP through the AI-only death path when AI preservation is disabled. |
+| `AoE4RPG_ApplyDeathPenalty(entity, unit_data)` | Applies the role-specific death rule and bypasses AI XP removal when AI preservation is enabled. |
 | `AoE4RPG_GetSpecialLevelingRule(entity, unit_data)` | Returns the civilization/class rule for Jeanne or four-tier Khan progression. |
 | `AoE4RPG_GetLevelBracketsForUnit(entity, unit_data)` | Selects ordinary five-bracket or special four-bracket progression. |
 | `AoE4RPG_GetLevelBracketStep(level, entity, unit_data)` | Converts an internal level into its current bonus/upgrade bracket number. |

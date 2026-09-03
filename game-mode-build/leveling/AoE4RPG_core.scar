@@ -411,6 +411,23 @@ end
 -- IMPORTANT: Applies the appropriate death penalty based on the unit's role.
 -- ======================== Death penalties ==================================
 
+-- Removes RPG experience through the human death path.
+function AoE4RPG_RemoveHumanExperienceOnDeath(unit_data)
+    if not unit_data then return false end
+    unit_data.damage_dealt = 0
+    return true
+end
+
+-- Removes RPG experience through the AI death path unless AI preservation is enabled.
+function AoE4RPG_RemoveAIExperienceOnDeath(unit_data)
+    if not unit_data then return false end
+    if AoE4RPG.SETTINGS and AoE4RPG.SETTINGS.ai_keep_experience_on_death then
+        return false
+    end
+    unit_data.damage_dealt = 0
+    return true
+end
+
 function AoE4RPG_ApplyDeathPenalty(entity, unit_data)
     if not entity or not unit_data then
         return
@@ -427,30 +444,31 @@ function AoE4RPG_ApplyDeathPenalty(entity, unit_data)
         return
     end
 
-    local keep_experience = false
-    if AoE4RPG.SETTINGS and AoE4RPG.SETTINGS.ai_keep_experience_on_death
-        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
-        and AoE4RPG_ENTITY_TRACKER_IsComputerPlayer then
-        local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
-        keep_experience = owner ~= nil
-            and AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(owner)
+    local owner = AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
+        and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity)
+        or unit_data.owner
+    local is_computer_player = owner ~= nil
+        and AoE4RPG_ENTITY_TRACKER_IsComputerPlayer
+        and AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(owner)
+        or false
+    local experience_removed = false
+    if is_computer_player then
+        experience_removed = AoE4RPG_RemoveAIExperienceOnDeath(unit_data)
+    else
+        experience_removed = AoE4RPG_RemoveHumanExperienceOnDeath(unit_data)
     end
 
     -- IMPORTANT: Heroes lose all XP on death unless the AI-only preservation option applies.
     if is_hero then
-        if not keep_experience then
-            unit_data.damage_dealt = 0
+        if experience_removed then
             AoE4RPG_MarkUnitDataChanged(unit_data)
         end
         return
     end
 
-    -- IMPORTANT: Elites lose one level and all XP unless the AI-only preservation option applies.
+    -- IMPORTANT: Elites always lose one level; the AI-only preservation option skips only XP removal.
     if is_elite then
         unit_data.level = math.max(0, unit_data.level - 1)
-        if not keep_experience then
-            unit_data.damage_dealt = 0
-        end
         AoE4RPG_MarkUnitDataChanged(unit_data)
         return
     end

@@ -377,6 +377,28 @@ local function AoE4RPG_CLASS_SLOTS_RestoreRemovedProduction(state)
     tracker.removed_entity_blueprints = {}
 end
 
+-- Caches the expensive military-SBP fallback after the first resolution attempt.
+local function AoE4RPG_ClassSlots_GetCachedSquadBlueprint(row)
+    if row.squad_resolution_complete then
+        return row.resolved_squad_blueprint, row.resolved_squad_name
+    end
+    row.squad_resolution_complete = true
+    row.resolved_squad_blueprint, row.resolved_squad_name =
+        AoE4RPG_ClassSlots_FindSquadBlueprint(row)
+    return row.resolved_squad_blueprint, row.resolved_squad_name
+end
+
+local function AoE4RPG_ClassSlots_GetCachedEntityBlueprint(row)
+    if row.entity_resolution_complete then
+        return row.resolved_entity_blueprint
+    end
+    row.entity_resolution_complete = true
+    row.resolved_entity_blueprint = row.entity_name
+        and AoE4RPG_ClassSlots_TryGetEntityBlueprint(row.entity_name)
+        or nil
+    return row.resolved_entity_blueprint
+end
+
 -- Removes unoccupied class production entries only when every configured class slot is occupied.
 -- The documented SBP availability call is primary because hero production buttons train squads.
 -- IMPORTANT: Entity availability remains a fallback for custom production rows that expose an EBP directly.
@@ -386,59 +408,123 @@ function AoE4RPG_CLASS_SLOTS_RefreshProductionAvailability(state)
         return false
     end
 
-    tracker.production_limit_reached = false
-    AoE4RPG_CLASS_SLOTS_RestoreRemovedProduction(tracker)
-    if tracker.maximum <= 0 then
-        return true
-    end
     local occupied_count = 0
-    for slot_key in pairs(tracker.occupied) do
+    for _ in pairs(tracker.occupied) do
         occupied_count = occupied_count + 1
     end
-    if occupied_count < tracker.maximum then
-        return true
-    end
-    tracker.production_limit_reached = true
-    local player_handle = AoE4RPG_ClassSlots_GetPlayerHandle(tracker)
+    tracker.production_limit_reached = tracker.maximum > 0
+        and occupied_count >= tracker.maximum
 
-    local slot_keys = {}
-    for slot_key in pairs(tracker.production_by_slot) do
-        table.insert(slot_keys, slot_key)
-    end
-    table.sort(slot_keys)
-    for _, slot_key in ipairs(slot_keys) do
-        local production_rows = tracker.production_by_slot[slot_key]
-        if not tracker.occupied[slot_key] then
-            table.sort(production_rows, function(left, right)
-                return tostring(left.entity_name or left.squad_name or "")
-                    < tostring(right.entity_name or right.squad_name or "")
-            end)
-            for _, row in ipairs(production_rows) do
-                if Player_SetSquadProductionAvailability then
-                    local squad_blueprint, resolved_squad_name =
-                        AoE4RPG_ClassSlots_FindSquadBlueprint(row)
-                    if squad_blueprint then
-                        Player_SetSquadProductionAvailability(
-                            player_handle,
-                            squad_blueprint,
-                            ITEM_REMOVED
-                        )
-                        tracker.removed_squad_blueprints[resolved_squad_name] = true
+    local desired_squad_blueprints = {}
+    local desired_entity_blueprints = {}
+    if tracker.production_limit_reached then
+        local slot_keys = {}
+        for slot_key in pairs(tracker.production_by_slot) do
+            table.insert(slot_keys, slot_key)
+        end
+        table.sort(slot_keys)
+        for _, slot_key in ipairs(slot_keys) do
+            if not tracker.occupied[slot_key] then
+                local production_rows = tracker.production_by_slot[slot_key]
+                table.sort(production_rows, function(left, right)
+                    return tostring(left.entity_name or left.squad_name or "")
+                        < tostring(right.entity_name or right.squad_name or "")
+                end)
+                for _, row in ipairs(production_rows) do
+                    local squad_blueprint, squad_name =
+                        AoE4RPG_ClassSlots_GetCachedSquadBlueprint(row)
+                    if squad_blueprint and squad_name then
+                        desired_squad_blueprints[squad_name] = squad_blueprint
                     end
-                end
-                if Player_SetEntityProductionAvailability and row.entity_name then
-                    local entity_blueprint = AoE4RPG_ClassSlots_TryGetEntityBlueprint(row.entity_name)
-                    if entity_blueprint then
-                        Player_SetEntityProductionAvailability(
-                            player_handle,
-                            entity_blueprint,
-                            ITEM_REMOVED
-                        )
-                        tracker.removed_entity_blueprints[row.entity_name] = true
+                    local entity_blueprint =
+                        AoE4RPG_ClassSlots_GetCachedEntityBlueprint(row)
+                    if entity_blueprint and row.entity_name then
+                        desired_entity_blueprints[row.entity_name] = entity_blueprint
                     end
                 end
             end
         end
+    end
+
+    local player_handle = AoE4RPG_ClassSlots_GetPlayerHandle(tracker)
+    local removed_squads = tracker.removed_squad_blueprints or {}
+    local removed_entities = tracker.removed_entity_blueprints or {}
+    if Player_SetSquadProductionAvailability then
+        local removed_squad_names = {}
+        for squad_name in pairs(removed_squads) do
+            table.insert(removed_squad_names, squad_name)
+        end
+        table.sort(removed_squad_names)
+        for _, squad_name in ipairs(removed_squad_names) do
+            if not desired_squad_blueprints[squad_name] then
+                local squad_blueprint =
+                    AoE4RPG_ClassSlots_TryGetSquadBlueprint(squad_name)
+                if squad_blueprint then
+                    Player_SetSquadProductionAvailability(
+                        player_handle,
+                        squad_blueprint,
+                        ITEM_DEFAULT
+                    )
+                end
+            end
+        end
+        local desired_squad_names = {}
+        for squad_name in pairs(desired_squad_blueprints) do
+            table.insert(desired_squad_names, squad_name)
+        end
+        table.sort(desired_squad_names)
+        for _, squad_name in ipairs(desired_squad_names) do
+            if not removed_squads[squad_name] then
+                Player_SetSquadProductionAvailability(
+                    player_handle,
+                    desired_squad_blueprints[squad_name],
+                    ITEM_REMOVED
+                )
+            end
+        end
+    end
+    if Player_SetEntityProductionAvailability then
+        local removed_entity_names = {}
+        for entity_name in pairs(removed_entities) do
+            table.insert(removed_entity_names, entity_name)
+        end
+        table.sort(removed_entity_names)
+        for _, entity_name in ipairs(removed_entity_names) do
+            if not desired_entity_blueprints[entity_name] then
+                local entity_blueprint =
+                    AoE4RPG_ClassSlots_TryGetEntityBlueprint(entity_name)
+                if entity_blueprint then
+                    Player_SetEntityProductionAvailability(
+                        player_handle,
+                        entity_blueprint,
+                        ITEM_DEFAULT
+                    )
+                end
+            end
+        end
+        local desired_entity_names = {}
+        for entity_name in pairs(desired_entity_blueprints) do
+            table.insert(desired_entity_names, entity_name)
+        end
+        table.sort(desired_entity_names)
+        for _, entity_name in ipairs(desired_entity_names) do
+            if not removed_entities[entity_name] then
+                Player_SetEntityProductionAvailability(
+                    player_handle,
+                    desired_entity_blueprints[entity_name],
+                    ITEM_REMOVED
+                )
+            end
+        end
+    end
+
+    tracker.removed_squad_blueprints = {}
+    for squad_name in pairs(desired_squad_blueprints) do
+        tracker.removed_squad_blueprints[squad_name] = true
+    end
+    tracker.removed_entity_blueprints = {}
+    for entity_name in pairs(desired_entity_blueprints) do
+        tracker.removed_entity_blueprints[entity_name] = true
     end
     return true
 end

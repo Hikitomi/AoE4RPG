@@ -914,7 +914,7 @@ function AoE4RPG_ENTITY_TRACKER_MonitorClassRebind()
 end
 
 -- Scans one synchronized player entity group.
-function AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player)
+function AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player, existing_entities)
     if AoE4RPG_RUNTIME_GetPlayerHandle then
         player = AoE4RPG_RUNTIME_GetPlayerHandle(player)
     end
@@ -922,7 +922,7 @@ function AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player)
         return false
     end
     -- World_GetPlayerAt returns the engine Player* handle.
-    local entities = Player_GetEntities(player)
+    local entities = existing_entities or Player_GetEntities(player)
     if not entities then
         return false
     end
@@ -957,16 +957,26 @@ function AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player)
     end
     table.sort(entity_ids)
     local previous_entity_id = nil
+    local tracked_new_entity = false
+    local is_computer_player = AoE4RPG_ENTITY_TRACKER_IsComputerPlayer(player)
     for _, entity_id in ipairs(entity_ids) do
         if entity_id ~= previous_entity_id then
             local entity = Entity_FromID and Entity_FromID(entity_id) or nil
             if entity then
-                AoE4RPG_ENTITY_TRACKER_TrackEntity(entity, player)
+                if is_computer_player and AoE4RPG_AI_TrackEntity then
+                    tracked_new_entity = AoE4RPG_AI_TrackEntity(entity, player)
+                        or tracked_new_entity
+                else
+                    tracked_new_entity = AoE4RPG_ENTITY_TRACKER_TrackEntity(
+                        entity,
+                        player
+                    ) or tracked_new_entity
+                end
             end
             previous_entity_id = entity_id
         end
     end
-    return true
+    return true, tracked_new_entity
 end
 
 function AoE4RPG_ENTITY_TRACKER_ScanExistingLocalPlayerEntities()
@@ -1388,7 +1398,10 @@ function AoE4RPG_ENTITY_TRACKER_MonitorProducibleLocalEntities()
             -- IMPORTANT: Only roster growth can introduce an undiscovered hero or elite.
             -- Construction cancellation and ordinary deaths only lower the count, so update the cache without enumerating and sorting the full player roster.
             if player_id and (previous_count == nil or current_count > previous_count) then
-                scanned = AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(player) or scanned
+                scanned = AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(
+                    player,
+                    entities
+                ) or scanned
             elseif player_id and current_count < previous_count then
                 tracker.last_owned_entity_count_by_player[player_id] = current_count
             end

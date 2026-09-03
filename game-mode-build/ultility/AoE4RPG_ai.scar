@@ -1,5 +1,5 @@
 -- ================= AoE4RPG AI ===============
--- AoE4RPG AI - AI Integration tracks AI heroes and applies AI progression and production rules.
+-- AoE4RPG AI - AI Integration tracks AI heroes and applies progression and survival rules.
 -- Author: Hikitomi
 -- Referenced: AoE4RPG_core.scar, AoE4RPG_classes.scar, AoE4RPG_random_bonus.scar, and AoE4RPG_entity_tracker.scar.
 -- ================= AoE4RPG AI ===============
@@ -17,18 +17,19 @@ AoE4RPG.AI_TRACKER = AoE4RPG.AI_TRACKER or {
     sorted_tracked_entity_ids = {},
     tracked_entity_ids_dirty = true,
     tracked_entities_by_player = {},
-    production_by_player = {},
-    removed_squad_blueprints_by_player = {},
     retreating_entity_ids = {},
+    retired_unit_data_by_player_class = {},
     fallback_player_ids = {},
     fallback_player_cursor = 1,
-    fallback_scan_interval = 1.0,
+    fallback_scan_interval = 5.0,
     preservation_health_ratio = 0.35,
     preservation_release_ratio = 0.70,
     preservation_interval = 1.0,
 }
 AoE4RPG.AI_TRACKER.retreating_entity_ids =
     AoE4RPG.AI_TRACKER.retreating_entity_ids or {}
+AoE4RPG.AI_TRACKER.retired_unit_data_by_player_class =
+    AoE4RPG.AI_TRACKER.retired_unit_data_by_player_class or {}
 AoE4RPG.AI_TRACKER.preservation_health_ratio =
     AoE4RPG.AI_TRACKER.preservation_health_ratio or 0.35
 AoE4RPG.AI_TRACKER.preservation_release_ratio =
@@ -40,7 +41,7 @@ AoE4RPG.AI_TRACKER.fallback_player_ids =
 AoE4RPG.AI_TRACKER.fallback_player_cursor =
     AoE4RPG.AI_TRACKER.fallback_player_cursor or 1
 AoE4RPG.AI_TRACKER.fallback_scan_interval =
-    AoE4RPG.AI_TRACKER.fallback_scan_interval or 1.0
+    AoE4RPG.AI_TRACKER.fallback_scan_interval or 5.0
 
 local function AoE4RPG_AI_GetPlayerIdentifier(player)
     if AoE4RPG_RUNTIME_GetPlayerIdentifier then
@@ -65,18 +66,6 @@ local function AoE4RPG_AI_ResolvePlayer(player)
     end
     local player_from_id = Player_FromId or Player_FromID
     return player_from_id and player_from_id(player) or nil
-end
-
-local function AoE4RPG_AI_GetSortedKeys(value)
-    if AoE4RPG_RUNTIME_GetSortedKeys then
-        return AoE4RPG_RUNTIME_GetSortedKeys(value)
-    end
-    local keys = {}
-    for key in pairs(value or {}) do
-        table.insert(keys, key)
-    end
-    table.sort(keys)
-    return keys
 end
 
 local function AoE4RPG_AI_IsComputerPlayer(player)
@@ -125,15 +114,38 @@ local function AoE4RPG_AI_GetClassForEntity(entity, entry)
         or (AoE4RPG_CLASS_GetClassForEntity and AoE4RPG_CLASS_GetClassForEntity(entity))
 end
 
+local function AoE4RPG_AI_GetRetiredUnitDataKey(player_id, class_name, role)
+    if player_id == nil or not class_name or not role then return nil end
+    return tostring(player_id) .. ":" .. tostring(class_name) .. ":" .. tostring(role)
+end
+
+-- Restores the oldest matching AI progression record after a replacement EntityID appears.
+local function AoE4RPG_AI_RestoreRetiredUnitData(entity_id, player_id, class_name, role)
+    if not AoE4RPG.UNIT_DATA then return nil end
+    local key = AoE4RPG_AI_GetRetiredUnitDataKey(player_id, class_name, role)
+    local queue = key and AoE4RPG.AI_TRACKER.retired_unit_data_by_player_class[key]
+        or nil
+    local retired = queue and table.remove(queue, 1) or nil
+    if not retired then return nil end
+    if #queue == 0 then
+        AoE4RPG.AI_TRACKER.retired_unit_data_by_player_class[key] = nil
+    end
+    if retired.entity_id and AoE4RPG.UNIT_DATA[retired.entity_id] == retired.unit_data then
+        AoE4RPG.UNIT_DATA[retired.entity_id] = nil
+    end
+    AoE4RPG.UNIT_DATA[entity_id] = retired.unit_data
+    return retired.unit_data
+end
+
 -- Tracks only a computer-owned registered hero or elite.
--- IMPORTANT: AI entities do not consume the human player's class-slot table; they receive an independent record so they still gain XP and bracket rewards.
+-- IMPORTANT: AI entities use the same slot rules through their own per-player state.
 function AoE4RPG_AI_TrackEntity(entity, player)
     local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
         and AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
         or entity and entity.EntityID
     if not entity or not entity_id then return false end
     local tracker = AoE4RPG.AI_TRACKER
-    if tracker.tracked_entity_ids[entity_id] then return true end
+    if tracker.tracked_entity_ids[entity_id] then return false end
 
     local owner = player or (AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner
         and AoE4RPG_ENTITY_TRACKER_GetSafePlayerOwner(entity))
@@ -155,6 +167,29 @@ function AoE4RPG_AI_TrackEntity(entity, player)
         role = "elites"
     end
 
+    local growth_civilization = entry.civilization or civilization
+    local class_slot_key = AoE4RPG_CLASS_SLOTS_GetSlotKey
+        and AoE4RPG_CLASS_SLOTS_GetSlotKey(
+            civilization,
+            entry,
+            growth_civilization
+        )
+        or class_name
+    if not class_slot_key then return false end
+    if AoE4RPG_CLASS_SLOTS_Reserve then
+        local slot_reserved = AoE4RPG_CLASS_SLOTS_Reserve(
+            class_slot_key,
+            {
+                class_name = class_name,
+                civilization = growth_civilization,
+                player_civilization = civilization,
+                role = role,
+            },
+            player_id
+        )
+        if not slot_reserved then return false end
+    end
+
     tracker.tracked_entity_ids[entity_id] = true
     tracker.tracked_entity_ids_dirty = true
     tracker.tracked_entity_records[entity_id] = {
@@ -162,23 +197,32 @@ function AoE4RPG_AI_TrackEntity(entity, player)
         class_name = class_name,
         civilization = civilization,
         player_id = player_id,
+        class_slot_key = class_slot_key,
     }
     tracker.tracked_entities_by_player[player_id] = tracker.tracked_entities_by_player[player_id] or {}
     tracker.tracked_entities_by_player[player_id][entity_id] = true
+    if AoE4RPG_CLASS_SLOTS_AddEntity then
+        AoE4RPG_CLASS_SLOTS_AddEntity(class_slot_key, player_id)
+    end
 
-    local unit_data = AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity_id) or nil
+    local unit_data = AoE4RPG_AI_RestoreRetiredUnitData(
+        entity_id,
+        player_id,
+        class_name,
+        role
+    ) or (AoE4RPG_GetUnitData and AoE4RPG_GetUnitData(entity_id) or nil)
     if unit_data then
         unit_data.entity_id = entity_id
         unit_data.owner = owner
         unit_data.class_name = class_name
         unit_data.civilization = civilization
         unit_data.player_civilization = civilization
-        unit_data.growth_civilization = entry.civilization or civilization
+        unit_data.growth_civilization = growth_civilization
         unit_data.is_hero = role == "heroes"
         unit_data.is_elite = role == "elites"
     end
     if AoE4RPG_CLASS_RegisterEntity then
-        AoE4RPG_CLASS_RegisterEntity(entity, entry.civilization or civilization, class_name)
+        AoE4RPG_CLASS_RegisterEntity(entity, growth_civilization, class_name)
     end
     if AoE4RPG_CLASS_BindUnit then AoE4RPG_CLASS_BindUnit(entity) end
     if AoE4RPG_BONUS_EnsureCurrentBracketOffer then
@@ -231,110 +275,6 @@ function AoE4RPG_AI_AutoSelectOffer(entity, owner, bracket_index)
     return true
 end
 
-local function AoE4RPG_AI_CollectEntityBlueprintNames(value, callback)
-    if AoE4RPG_RUNTIME_ForEachBlueprintName then
-        AoE4RPG_RUNTIME_ForEachBlueprintName(value, callback)
-        return
-    end
-    if type(value) == "string" then callback(value); return end
-    if type(value) ~= "table" then return end
-    for key, child in pairs(value) do
-        if key ~= "parent_unit_type" and key ~= "rider" and key ~= "class_name" then
-            AoE4RPG_AI_CollectEntityBlueprintNames(child, callback)
-        end
-    end
-end
-
-local function AoE4RPG_AI_AddProductionRow(rows, entity_name)
-    local squad_name = AoE4RPG_GetSquadBlueprintNameFromEntityBlueprint
-        and AoE4RPG_GetSquadBlueprintNameFromEntityBlueprint(entity_name)
-        or entity_name
-    if type(squad_name) ~= "string" or squad_name == "" then return end
-    if SBP_Exists then
-        local success, exists = pcall(SBP_Exists, squad_name)
-        if success and not exists then return end
-    end
-    rows[squad_name] = true
-end
-
-local function AoE4RPG_AI_BuildProductionLookup(civilization)
-    local result = {}
-    local civ_table = AoE4RPG_ENTITY_TABLE and AoE4RPG_ENTITY_TABLE[civilization] or nil
-    for unit_type, registry_value in pairs(civ_table or {}) do
-        local class_name = AoE4RPG_CLASS_NAME_BY_UNIT_TYPE
-            and AoE4RPG_CLASS_NAME_BY_UNIT_TYPE[unit_type]
-            or nil
-        if class_name then
-            result[class_name] = result[class_name] or {}
-            AoE4RPG_AI_CollectEntityBlueprintNames(registry_value, function(entity_name)
-                AoE4RPG_AI_AddProductionRow(result[class_name], entity_name)
-            end)
-        end
-    end
-    return result
-end
-
-local function AoE4RPG_AI_ApplyProductionRestrictions(player, occupied)
-    if not Player_SetSquadProductionAvailability then return end
-    local player_handle = AoE4RPG_AI_ResolvePlayer(player)
-    local player_id = AoE4RPG_AI_GetPlayerIdentifier(player_handle or player)
-    if not player_handle or not player_id then return end
-    local civilization = AoE4RPG_RUNTIME_GetPlayerRaceName
-        and AoE4RPG_RUNTIME_GetPlayerRaceName(player, "default")
-        or "default"
-    if type(civilization) ~= "string" then civilization = "default" end
-    local lookup = AoE4RPG.AI_TRACKER.production_by_player[player_id]
-    if not lookup then
-        lookup = AoE4RPG_AI_BuildProductionLookup(civilization)
-        AoE4RPG.AI_TRACKER.production_by_player[player_id] = lookup
-    end
-    local maximum = AoE4RPG.SETTINGS and AoE4RPG.SETTINGS.max_class_slots
-        or AoE4RPG.MaxClassSlots or 5
-    local occupied_count = 0
-    for _ in pairs(occupied) do occupied_count = occupied_count + 1 end
-    local removed = AoE4RPG.AI_TRACKER.removed_squad_blueprints_by_player[player_id] or {}
-    if occupied_count < maximum then
-        local removed_squad_names = AoE4RPG_AI_GetSortedKeys(removed)
-        for _, squad_name in ipairs(removed_squad_names) do
-            local squad = BP_GetSquadBlueprint and BP_GetSquadBlueprint(squad_name) or nil
-            if squad then Player_SetSquadProductionAvailability(player_handle, squad, ITEM_DEFAULT) end
-        end
-        AoE4RPG.AI_TRACKER.removed_squad_blueprints_by_player[player_id] = {}
-        return
-    end
-    local class_names = AoE4RPG_AI_GetSortedKeys(lookup)
-    for _, class_name in ipairs(class_names) do
-        local squad_names = lookup[class_name]
-        if not occupied[class_name] then
-            local sorted_squad_names = AoE4RPG_AI_GetSortedKeys(squad_names)
-            for _, squad_name in ipairs(sorted_squad_names) do
-                local squad = BP_GetSquadBlueprint and BP_GetSquadBlueprint(squad_name) or nil
-                if squad then
-                    Player_SetSquadProductionAvailability(player_handle, squad, ITEM_REMOVED)
-                    removed[squad_name] = true
-                end
-            end
-        end
-    end
-    AoE4RPG.AI_TRACKER.removed_squad_blueprints_by_player[player_id] = removed
-end
-
-local function AoE4RPG_AI_RefreshTrackedProductionRestrictions(player)
-    local player_id = AoE4RPG_AI_GetPlayerIdentifier(player)
-    if not player_id then return false end
-    local occupied = {}
-    for entity_id in pairs(
-        AoE4RPG.AI_TRACKER.tracked_entities_by_player[player_id] or {}
-    ) do
-        local record = AoE4RPG_AI_GetTrackedRecord(entity_id)
-        if record and record.class_name then
-            occupied[record.class_name] = true
-        end
-    end
-    AoE4RPG_AI_ApplyProductionRestrictions(player, occupied)
-    return true
-end
-
 -- Tracks a completed AI unit directly.
 function AoE4RPG_AI_OnBuildItemComplete(context)
     if not context or not context.player
@@ -346,10 +286,6 @@ function AoE4RPG_AI_OnBuildItemComplete(context)
     local entity = spawned_squad and Squad_GetFirstEntity
         and Squad_GetFirstEntity(spawned_squad) or nil
     local tracked = entity and AoE4RPG_AI_TrackEntity(entity, player_handle) or false
-    if tracked then
-        AoE4RPG_AI_RefreshTrackedProductionRestrictions(player_handle)
-    end
-
     return tracked
 end
 
@@ -383,13 +319,13 @@ function AoE4RPG_AI_ScanPlayers()
     end
 
     local player_count = #tracker.fallback_player_ids
-    if player_count == 0 or not Player_GetSquadsFromType
-        or not SGroup_ForEach or not Squad_GetFirstEntity then
+    if player_count == 0 or not Player_GetEntities or not EGroup_CountSpawned
+        or not AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities then
         return false
     end
 
-    -- IMPORTANT: Scan only one AI player per interval so adding players cannot create
-    -- a same-frame burst of hero and elite group queries.
+    -- IMPORTANT: Check only one AI player per interval so adding players cannot create
+    -- a same-frame burst of complete roster scans.
     local player_index = math.max(1, math.min(
         player_count,
         math.floor(tonumber(tracker.fallback_player_cursor) or 1)
@@ -401,54 +337,55 @@ function AoE4RPG_AI_ScanPlayers()
         return false
     end
 
-    -- IMPORTANT: Query squads and resolve only their first/root entity.
-    -- Player_GetAllEntitiesFromType can include attached rider entities and then fatally
-    -- attempts to insert them into its autogenerated EGroup.
-    -- The exact blueprint registry remains authoritative inside TrackEntity.
-    local candidate_entity_ids = {}
-    local seen_entity_ids = {}
-    for _, unit_type in ipairs({ "hero", "elite" }) do
-        local candidate_squads = Player_GetSquadsFromType(player_handle, unit_type)
-        if candidate_squads then
-            SGroup_ForEach(candidate_squads, function(_, _, squad)
-                local entity = Squad_GetFirstEntity(squad)
-                local entity_id = AoE4RPG_RUNTIME_GetEntityIdentifier
-                    and AoE4RPG_RUNTIME_GetEntityIdentifier(entity)
-                    or entity and entity.EntityID
-                if entity_id and not seen_entity_ids[entity_id] then
-                    seen_entity_ids[entity_id] = true
-                    table.insert(candidate_entity_ids, entity_id)
-                end
-            end)
+    -- IMPORTANT: Reuse the human tracker scan only when this AI roster grows.
+    -- Build and spawn events remain the immediate path.
+    local entities = Player_GetEntities(player_handle)
+    if not entities then return false end
+    local current_count = EGroup_CountSpawned(entities)
+    AoE4RPG.ENTITY_TRACKER = AoE4RPG.ENTITY_TRACKER or {}
+    local shared_tracker = AoE4RPG.ENTITY_TRACKER
+    shared_tracker.last_owned_entity_count_by_player =
+        shared_tracker.last_owned_entity_count_by_player or {}
+    local previous_count = shared_tracker.last_owned_entity_count_by_player[player_id]
+    if previous_count ~= nil and current_count <= previous_count then
+        if current_count < previous_count then
+            shared_tracker.last_owned_entity_count_by_player[player_id] = current_count
         end
+        return false
     end
-    table.sort(candidate_entity_ids)
-    local tracked_new_entity = false
-    for _, entity_id in ipairs(candidate_entity_ids) do
-        local entity = Entity_FromID and Entity_FromID(entity_id) or nil
-        if entity then
-            local entry = AoE4RPG_GetBlueprintTrackingEntryForEntity
-                and AoE4RPG_GetBlueprintTrackingEntryForEntity(entity)
-                or nil
-            if entry and (entry.role == "heroes" or entry.role == "elites")
-                and not tracker.tracked_entity_ids[entity_id]
-                and AoE4RPG_AI_TrackEntity(entity, player_handle) then
-                tracked_new_entity = true
-            end
-        end
-    end
-    if tracked_new_entity then
-        AoE4RPG_AI_RefreshTrackedProductionRestrictions(player_handle)
-    end
+    local _, tracked_new_entity = AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(
+        player_handle,
+        entities
+    )
     return tracked_new_entity
+end
+
+-- Issues one synchronized retreat order for a tracked AI squad.
+local function AoE4RPG_AI_IssueRetreatOrder(squad, fallback_position)
+    if not squad or not fallback_position then return false end
+    if Squad_IsRetreating and Squad_IsRetreating(squad) then return true end
+    if Cmd_Retreat and SGroup_CreateUnique and SGroup_Add then
+        local retreat_group = SGroup_CreateUnique("AoE4RPG_AI_Retreat")
+        if retreat_group then
+            SGroup_Add(retreat_group, squad)
+            Cmd_Retreat(retreat_group, fallback_position, false, false, true, false)
+            if SGroup_Destroy then SGroup_Destroy(retreat_group) end
+            return true
+        end
+    end
+    -- Compatibility fallback for hosts without the synchronized retreat command.
+    if AITactic_AICommandSquadMove then
+        AITactic_AICommandSquadMove(squad, fallback_position, 8.0, false)
+        return true
+    end
+    return false
 end
 
 -- Gives tracked AI heroes and elites a simple survival priority.
 -- IMPORTANT: The synchronized rule walks sorted tracked EntityIDs and never uses local selection state.
 function AoE4RPG_AI_MonitorHeroAndElitePreservation()
     if not Entity_GetHealth or not Entity_GetHealthMax
-        or not Entity_GetSquad or not Player_GetStartingPosition
-        or not AITactic_AICommandSquadMove then
+        or not Entity_GetSquad or not Player_GetStartingPosition then
         return
     end
     local tracker = AoE4RPG.AI_TRACKER
@@ -466,11 +403,7 @@ function AoE4RPG_AI_MonitorHeroAndElitePreservation()
             tracker.retreating_entity_ids[entity_id] = nil
             return
         end
-        if not is_retreating and health_ratio <= tracker.preservation_health_ratio then
-            tracker.retreating_entity_ids[entity_id] = true
-            is_retreating = true
-        end
-        if not is_retreating then return end
+        if is_retreating or health_ratio > tracker.preservation_health_ratio then return end
 
         -- Garrisoning already protects the unit and must not be interrupted.
         if Entity_IsInHold and Entity_IsInHold(entity) then return end
@@ -480,7 +413,10 @@ function AoE4RPG_AI_MonitorHeroAndElitePreservation()
         if Squad_IsValid and not Squad_IsValid(squad) then return end
         local fallback_position = Player_GetStartingPosition(player)
         if not fallback_position then return end
-        AITactic_AICommandSquadMove(squad, fallback_position, 8.0, false)
+        -- IMPORTANT: Enter native retreat once instead of replacing the AI order every interval.
+        if AoE4RPG_AI_IssueRetreatOrder(squad, fallback_position) then
+            tracker.retreating_entity_ids[entity_id] = true
+        end
     end)
 end
 
@@ -489,13 +425,36 @@ function AoE4RPG_AI_OnEntityKilled(context)
     local entity_id = victim and (victim.EntityID or victim) or nil
     local record = entity_id and AoE4RPG_AI_GetTrackedRecord(entity_id) or nil
     if not record then return false end
+    if AoE4RPG.SETTINGS and AoE4RPG.SETTINGS.ai_keep_experience_on_death
+        and AoE4RPG.UNIT_DATA and AoE4RPG.UNIT_DATA[entity_id] then
+        local key = AoE4RPG_AI_GetRetiredUnitDataKey(
+            record.player_id,
+            record.class_name,
+            record.role
+        )
+        if key then
+            local queue = AoE4RPG.AI_TRACKER.retired_unit_data_by_player_class[key]
+                or {}
+            table.insert(queue, {
+                entity_id = entity_id,
+                unit_data = AoE4RPG.UNIT_DATA[entity_id],
+            })
+            AoE4RPG.AI_TRACKER.retired_unit_data_by_player_class[key] = queue
+        end
+    end
     AoE4RPG.AI_TRACKER.tracked_entity_ids[entity_id] = nil
     AoE4RPG.AI_TRACKER.tracked_entity_records[entity_id] = nil
     AoE4RPG.AI_TRACKER.retreating_entity_ids[entity_id] = nil
     AoE4RPG.AI_TRACKER.tracked_entity_ids_dirty = true
     local player_entities = AoE4RPG.AI_TRACKER.tracked_entities_by_player[record.player_id]
     if player_entities then player_entities[entity_id] = nil end
-    AoE4RPG_AI_RefreshTrackedProductionRestrictions(record.player_id)
+    if record.class_slot_key and AoE4RPG_CLASS_SLOTS_RemoveEntity then
+        AoE4RPG_CLASS_SLOTS_RemoveEntity(
+            record.class_slot_key,
+            record.role == "heroes",
+            record.player_id
+        )
+    end
     if AoE4RPG_CLASS_UnregisterEntity then AoE4RPG_CLASS_UnregisterEntity(entity_id) end
     return true
 end
@@ -550,8 +509,7 @@ function AoE4RPG_AI_Shutdown()
     tracker.fallback_player_ids = {}
     tracker.fallback_player_cursor = 1
     tracker.tracked_entities_by_player = {}
-    tracker.production_by_player = {}
-    tracker.removed_squad_blueprints_by_player = {}
+    tracker.retired_unit_data_by_player_class = {}
     tracker.retreating_entity_ids = {}
     tracker.build_event_registered = false
     tracker.spawn_event_registered = false
