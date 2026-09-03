@@ -76,6 +76,21 @@ local function AoE4RPG_AI_IsComputerPlayer(player)
     return success and result == true
 end
 
+-- Returns a native numeric SquadID without allowing wrapper tables across engine APIs.
+local function AoE4RPG_AI_GetSquadIdentifier(squad)
+    if type(squad) == "number" then
+        return squad
+    end
+    if not squad or not Squad_GetID then
+        return nil
+    end
+    local success, squad_id = pcall(Squad_GetID, squad)
+    if success and type(squad_id) == "number" then
+        return squad_id
+    end
+    return nil
+end
+
 -- Returns the AI-specific record used by the shared bonus offer code.
 function AoE4RPG_AI_GetTrackedRecord(entity_id)
     return entity_id
@@ -86,6 +101,30 @@ end
 function AoE4RPG_AI_IsTrackedEntityIdentifier(entity_id)
     return entity_id ~= nil
         and AoE4RPG.AI_TRACKER.tracked_entity_ids[entity_id] == true
+end
+
+local function AoE4RPG_AI_RemoveStaleTrackedEntity(entity_id, record)
+    local tracker = AoE4RPG.AI_TRACKER
+    tracker.tracked_entity_ids[entity_id] = nil
+    tracker.tracked_entity_records[entity_id] = nil
+    tracker.retreating_entity_ids[entity_id] = nil
+    tracker.tracked_entity_ids_dirty = true
+    local player_entities = record
+        and tracker.tracked_entities_by_player[record.player_id]
+        or nil
+    if player_entities then
+        player_entities[entity_id] = nil
+    end
+    if record and record.class_slot_key and AoE4RPG_CLASS_SLOTS_RemoveEntity then
+        AoE4RPG_CLASS_SLOTS_RemoveEntity(
+            record.class_slot_key,
+            record.role == "heroes",
+            record.player_id
+        )
+    end
+    if AoE4RPG_CLASS_UnregisterEntity then
+        AoE4RPG_CLASS_UnregisterEntity(entity_id)
+    end
 end
 
 function AoE4RPG_AI_ForEachTrackedEntity(callback)
@@ -103,8 +142,14 @@ function AoE4RPG_AI_ForEachTrackedEntity(callback)
     for _, entity_id in ipairs(tracker.sorted_tracked_entity_ids) do
         local record = tracker.tracked_entity_records[entity_id]
         local entity = Entity_FromID and Entity_FromID(entity_id) or nil
-        if entity and (not Entity_IsValid or Entity_IsValid(entity_id)) then
+        local entity_is_valid = entity ~= nil
+        if entity_is_valid and Entity_IsValid then
+            entity_is_valid = Entity_IsValid(entity_id)
+        end
+        if entity_is_valid then
             callback(entity, entity_id, record)
+        else
+            AoE4RPG_AI_RemoveStaleTrackedEntity(entity_id, record)
         end
     end
 end
@@ -282,7 +327,7 @@ function AoE4RPG_AI_OnBuildItemComplete(context)
         return false
     end
     local player_handle = AoE4RPG_AI_ResolvePlayer(context.player)
-    local spawned_squad = context.spawnedSquad
+    local spawned_squad = AoE4RPG_AI_GetSquadIdentifier(context.spawnedSquad)
     local entity = spawned_squad and Squad_GetFirstEntity
         and Squad_GetFirstEntity(spawned_squad) or nil
     local tracked = entity and AoE4RPG_AI_TrackEntity(entity, player_handle) or false
@@ -408,8 +453,10 @@ function AoE4RPG_AI_MonitorHeroAndElitePreservation()
         -- Garrisoning already protects the unit and must not be interrupted.
         if Entity_IsInHold and Entity_IsInHold(entity) then return end
         local player = record and AoE4RPG_AI_ResolvePlayer(record.player_id) or nil
-        local squad = Entity_GetSquad(entity)
-        if not player or not squad then return end
+        local squad = AoE4RPG_AI_GetSquadIdentifier(Entity_GetSquad(entity))
+        -- IMPORTANT: Entity_GetSquad can return a Lua squad wrapper; squad APIs
+        -- require its native unsigned SquadID.
+        if not player or not squad or type(squad) ~= "number" then return end
         if Squad_IsValid and not Squad_IsValid(squad) then return end
         local fallback_position = Player_GetStartingPosition(player)
         if not fallback_position then return end
