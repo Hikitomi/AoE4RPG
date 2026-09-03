@@ -2,17 +2,6 @@
 
 Author: Hikitomi
 
-## IDE workflow
-
-The repository includes VS Code workspace files under `.vscode/`.
-
-- Open the repository folder as the workspace root.
-- Install the recommended Lua extension when prompted; `.scar` files are associated with Lua syntax for navigation and highlighting.
-- Use the Command Palette or **Terminal → Run Task** to run `SCAR: list root modules` and `SCAR: find imports`.
-- Keep `.aoe4-mcp-runtime` excluded from search and editing; it is local tooling rather than game source.
-
-SCAR is loaded by the game/editor runtime, so these tasks provide source navigation and lightweight checks rather than compiling or launching the game.
-
 ## Class value and entity lifecycle
 
 `AoE4RPG_CLASS_InitializeValueRegistry()` builds one profile for every
