@@ -431,8 +431,20 @@ end
 -- Issues one synchronized retreat order for a tracked AI squad.
 local function AoE4RPG_AI_IssueRetreatOrder(squad, fallback_position)
     if not squad or not fallback_position then return false end
-    if Squad_IsRetreating and Squad_IsRetreating(squad) then return true end
-    if Cmd_Retreat and SGroup_CreateUnique and SGroup_Add then
+    -- The live AoE4 host exposes Squad_IsRetreating as Squad*, while the
+    -- command APIs below require the numeric SquadID. Do not pass the ID to
+    -- the wrapper-only query; an already-retreating numeric squad is still
+    -- safely handled by issuing the synchronized retreat command once.
+    if type(squad) ~= "number" and Squad_IsRetreating then
+        local success, is_retreating = pcall(Squad_IsRetreating, squad)
+        if success and is_retreating then return true end
+    end
+    local squad_identifier = AoE4RPG_AI_GetSquadIdentifier(squad)
+    if not squad_identifier then return false end
+    -- The live host also exposes SGroup_Add as Squad*, so only use the
+    -- grouped Cmd_Retreat path when the original value is a Squad wrapper.
+    if type(squad) ~= "number" and Cmd_Retreat
+        and SGroup_CreateUnique and SGroup_Add then
         local retreat_group = SGroup_CreateUnique("AoE4RPG_AI_Retreat")
         if retreat_group then
             SGroup_Add(retreat_group, squad)
@@ -443,7 +455,7 @@ local function AoE4RPG_AI_IssueRetreatOrder(squad, fallback_position)
     end
     -- Compatibility fallback for hosts without the synchronized retreat command.
     if AITactic_AICommandSquadMove then
-        AITactic_AICommandSquadMove(squad, fallback_position, 8.0, false)
+        AITactic_AICommandSquadMove(squad_identifier, fallback_position, 8.0, false)
         return true
     end
     return false

@@ -418,7 +418,7 @@ function AoE4RPG_UI_UpdateHeroAttributes(entity)
     local exp_ratio = required_xp > 0
         and math.max(0, math.min(1, current_xp / required_xp))
         or 1
-    context.exp_progress_width = tostring(math.floor(exp_ratio * 176))                                             -- XP bar width in pixels; adjust if the XAML changes size.
+    context.exp_progress_width = tostring(math.floor(exp_ratio * 164))                                             -- XP fill width inside the reduced content area and 1px border padding.
     local non_bonus = class_values.non_bonus_attributes or data.non_bonus_attributes or data.attributes or {}
     local total = class_values.attributes or data.attributes or {}
     local function format_attribute(value)
@@ -495,8 +495,8 @@ function AoE4RPG_UI_CreateHeroAttributesUI()
         HorizontalAlignment="Left"
         VerticalAlignment="Bottom"
         RenderTransformOrigin="0.5,1"
-        Margin="418,0,0,4"
-        Width="104"
+        Margin="428,0,0,4"
+        Width="178"
         Height="176"
         Visibility="{Binding [visible], Converter={StaticResource BoolToVis}}"
         Padding="4">
@@ -507,12 +507,10 @@ function AoE4RPG_UI_CreateHeroAttributesUI()
     </Border.Resources>
     <Grid>
       <Grid.RowDefinitions><RowDefinition Height="28" /><RowDefinition Height="148" /></Grid.RowDefinitions>
-      <!-- The XP bar needs the full panel width; the previous nested placement
-           clipped its 116px container inside the 104px attribute column. -->
+      <!-- Keep the XP box and its bound fill inside the 176px content area. -->
       <Border Grid.Row="0" Padding="1">
         <Grid Height="24" VerticalAlignment="Center">
-          <Grid.ColumnDefinitions><ColumnDefinition Width="34" /><ColumnDefinition Width="70" /></Grid.ColumnDefinitions>
-          <Grid Grid.Column="1" Width="66" Height="12" Margin="0,0,0,0" HorizontalAlignment="Center" VerticalAlignment="Center" Background="#80050B13">
+          <Grid Width="164" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" Background="#80050B13">
             <Border BorderBrush="#FF9A8352" BorderThickness="1" CornerRadius="1"><Grid><Rectangle Fill="#FFFFD45C" Width="{Binding [exp_progress_width]}" HorizontalAlignment="Left" /><Border HorizontalAlignment="Center" VerticalAlignment="Center" Height="22" MinWidth="18" Padding="2,0" Background="#CC0B1320" BorderBrush="#FFE0B65A" BorderThickness="1" CornerRadius="1"><TextBlock Text="{Binding [level_number]}" TextAlignment="Center" VerticalAlignment="Center" FontSize="12" FontWeight="Bold" Style="{StaticResource HUDPrimaryColorGradientVerticalSubtitleTextBlock14ptStyle}" /></Border></Grid></Border>
           </Grid>
         </Grid>
