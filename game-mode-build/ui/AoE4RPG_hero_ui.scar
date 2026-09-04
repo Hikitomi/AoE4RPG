@@ -351,8 +351,10 @@ function AoE4RPG_UI_UpdateHeroAttributes(entity)
         context.range_stat = "0%"
         if AoE4RPG_UI_PanelSetData then
             AoE4RPG_UI_PanelSetData("AoE4RPG_HeroAttributes", context)
+            AoE4RPG_UI_PanelSetData("AoE4RPG_HeroDerivedStats", context)
         elseif UI_SetDataContext then
             UI_SetDataContext("AoE4RPG_HeroAttributes", context)
+            UI_SetDataContext("AoE4RPG_HeroDerivedStats", context)
         end
         return
     end
@@ -469,8 +471,10 @@ function AoE4RPG_UI_UpdateHeroAttributes(entity)
         .. format_upgrade_stars(attribute_upgrade_stars.weapon_range)                                             -- Weapon Range bonus and automatic range upgrade stars.
     if AoE4RPG_UI_PanelSetData then
         AoE4RPG_UI_PanelSetData("AoE4RPG_HeroAttributes", context)
+        AoE4RPG_UI_PanelSetData("AoE4RPG_HeroDerivedStats", context)
     elseif UI_SetDataContext then
         UI_SetDataContext("AoE4RPG_HeroAttributes", context)
+        UI_SetDataContext("AoE4RPG_HeroDerivedStats", context)
     end
 end
 
@@ -492,7 +496,7 @@ function AoE4RPG_UI_CreateHeroAttributesUI()
         VerticalAlignment="Bottom"
         RenderTransformOrigin="0.5,1"
         Margin="418,0,0,4"
-        Width="280"
+        Width="104"
         Height="176"
         Visibility="{Binding [visible], Converter={StaticResource BoolToVis}}"
         Padding="4">
@@ -503,20 +507,17 @@ function AoE4RPG_UI_CreateHeroAttributesUI()
     </Border.Resources>
     <Grid>
       <Grid.RowDefinitions><RowDefinition Height="28" /><RowDefinition Height="148" /></Grid.RowDefinitions>
-      <!-- Keep the attribute rows in the left section and reserve the right
-           section for the compact derived-statistics list. -->
-      <Grid.ColumnDefinitions><ColumnDefinition Width="104" /><ColumnDefinition Width="176" /></Grid.ColumnDefinitions>
       <!-- The XP bar needs the full panel width; the previous nested placement
            clipped its 116px container inside the 104px attribute column. -->
-      <Border Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Padding="1">
+      <Border Grid.Row="0" Padding="1">
         <Grid Height="24" VerticalAlignment="Center">
-          <Grid.ColumnDefinitions><ColumnDefinition Width="70" /><ColumnDefinition Width="34" /><ColumnDefinition Width="176" /></Grid.ColumnDefinitions>
-          <Grid Grid.Column="2" Width="166" Height="12" Margin="-156,0,0,0" HorizontalAlignment="Center" VerticalAlignment="Center" Background="#80050B13">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="34" /><ColumnDefinition Width="70" /></Grid.ColumnDefinitions>
+          <Grid Grid.Column="1" Width="66" Height="12" Margin="0,0,0,0" HorizontalAlignment="Center" VerticalAlignment="Center" Background="#80050B13">
             <Border BorderBrush="#FF9A8352" BorderThickness="1" CornerRadius="1"><Grid><Rectangle Fill="#FFFFD45C" Width="{Binding [exp_progress_width]}" HorizontalAlignment="Left" /><Border HorizontalAlignment="Center" VerticalAlignment="Center" Height="22" MinWidth="18" Padding="2,0" Background="#CC0B1320" BorderBrush="#FFE0B65A" BorderThickness="1" CornerRadius="1"><TextBlock Text="{Binding [level_number]}" TextAlignment="Center" VerticalAlignment="Center" FontSize="12" FontWeight="Bold" Style="{StaticResource HUDPrimaryColorGradientVerticalSubtitleTextBlock14ptStyle}" /></Border></Grid></Border>
           </Grid>
         </Grid>
       </Border>
-      <Grid Grid.Row="1" Grid.Column="0">
+      <Grid Grid.Row="1">
       <Grid.RowDefinitions>
         <RowDefinition Height="40" />
         <RowDefinition Height="40" />
@@ -579,21 +580,6 @@ function AoE4RPG_UI_CreateHeroAttributesUI()
       </Border>
       </Grid>
 
-      <!-- Compact derived values stay visible beside the RPG attributes. -->
-      <Border Grid.Row="1" Grid.Column="1" Width="176" Height="148" HorizontalAlignment="Left" Padding="4,2,0,0">
-        <StackPanel>
-          <TextBlock Text="{Binding [improvement_title]}" FontSize="11" FontWeight="Bold" Foreground="#FFFFD45C" />
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [attack_speed_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [agility_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [health_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [endurance_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [armor_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [vitality_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [cooldown_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [ability_cooldown_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [regeneration_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [regeneration_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [production_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [production_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [critical_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [critical_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [range_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [range_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-          <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [speed_setup_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [speed_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
-        </StackPanel>
-      </Border>
     </Grid>
 </Border>]]
 
@@ -610,6 +596,57 @@ function AoE4RPG_UI_CreateHeroAttributesUI()
     local ok = pcall(function()
         UI_AddChild("ScarNotReplay", "XamlPresenter", "AoE4RPG_HeroAttributes", {
             IsHitTestVisible = true,
+            Xaml = xaml,
+            DataContext = UI_CreateDataContext(AoE4RPG.HERO_UI.attribute_context),
+        })
+    end)
+    return ok
+end
+
+-- Creates the standalone derived-statistics presenter beside the hero attributes.
+function AoE4RPG_UI_CreateHeroDerivedStatsUI()
+    local xaml = [[
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        HorizontalAlignment="Left"
+        VerticalAlignment="Bottom"
+        Margin="522,0,0,4"
+        Width="176"
+        Height="176"
+        Visibility="{Binding [visible], Converter={StaticResource BoolToVis}}"
+        Padding="4,32,0,0">
+    <Border.Resources>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="pack://application:,,,ui/Resources/HUDResources.xaml" />
+      </ResourceDictionary.MergedDictionaries>
+    </Border.Resources>
+    <StackPanel>
+      <TextBlock Text="{Binding [improvement_title]}" FontSize="11" FontWeight="Bold" Foreground="#FFFFD45C" />
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [attack_speed_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [agility_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [health_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [endurance_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [armor_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [vitality_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [cooldown_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [ability_cooldown_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [regeneration_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [regeneration_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [production_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [production_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [critical_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [critical_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [range_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [range_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding [speed_setup_label]}" Margin="0,0,2,0" FontSize="9" Foreground="#FFE6EDF5" /><TextBlock Text="{Binding [speed_stat]}" FontSize="9" Foreground="#FFE6EDF5" /></StackPanel>
+    </StackPanel>
+</Border>]]
+
+    if AoE4RPG_UI_PanelCreate then
+        return AoE4RPG_UI_PanelCreate(
+            "AoE4RPG_HeroDerivedStats",
+            xaml,
+            AoE4RPG.HERO_UI.attribute_context,
+            false,
+            "ScarNotReplay"
+        )
+    end
+
+    local ok = pcall(function()
+        UI_AddChild("ScarNotReplay", "XamlPresenter", "AoE4RPG_HeroDerivedStats", {
+            IsHitTestVisible = false,
             Xaml = xaml,
             DataContext = UI_CreateDataContext(AoE4RPG.HERO_UI.attribute_context),
         })
@@ -718,6 +755,9 @@ function AoE4RPG_UI_InitializeHeroesDisplay()
     local panel = AoE4RPG_UI_CreateHeroPanel("heroes_elites")
     panel.visible = true
     if not AoE4RPG_UI_CreateHeroAttributesUI() then
+        return false
+    end
+    if not AoE4RPG_UI_CreateHeroDerivedStatsUI() then
         return false
     end
     return panel
