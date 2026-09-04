@@ -1645,7 +1645,20 @@ function AoE4RPG_CLASS_TrackModifier(entity, modifier_id)
 end
 
 function AoE4RPG_CLASS_ApplyModifierToEntity(entity, modifier)
-    if not entity or not modifier or not Modifier_ApplyToEntity then
+    if not entity or not modifier then
+        return nil
+    end
+    -- IMPORTANT: Several hero/elite blueprints do not expose modifier_ext.
+    -- Apply class progression to the owning squad so those units can level
+    -- without calling Modifier_ApplyToEntity on an unsupported entity.
+    local squad = Entity_GetSquad and Entity_GetSquad(entity) or nil
+    if squad and Modifier_ApplyToSquad then
+        return AoE4RPG_CLASS_TrackModifier(
+            entity,
+            Modifier_ApplyToSquad(modifier, squad, 0)
+        )
+    end
+    if not Modifier_ApplyToEntity then
         return nil
     end
     return AoE4RPG_CLASS_TrackModifier(

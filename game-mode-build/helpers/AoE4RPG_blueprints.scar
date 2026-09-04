@@ -84,7 +84,7 @@ AoE4RPG_KHAN_BLUEPRINTS_BY_CIVILIZATION = {
 }
 
 -- Optional burst-fire profiles for RPG attribute damage normalization.
--- IMPORTANT: The framework calculates: projectiles_per_burst = max(1, rate_of_fire * duration) RPG damage bonus per projectile = normal bonus / projectiles_per_burst Native weapon damage is never changed.
+-- IMPORTANT: The framework calculates: projectiles_per_burst = max(1, rate_of_fire). The configured rate_of_fire is the burst attack count; duration only describes burst timing. RPG damage bonus per projectile = normal bonus / projectiles_per_burst. Native weapon damage is never changed.
 -- An absent or invalid row keeps the ordinary single-shot bonus.
 -- Example only (deliberately disabled): ["unit_shogun_example_1_civ"] = { rate_of_fire = 16, duration = 0.125 },
 AoE4RPG_BURST_FIRE_PROFILES = AoE4RPG_BURST_FIRE_PROFILES or {
@@ -140,7 +140,7 @@ function AoE4RPG_GetBurstFireProjectileCount(entity)
     if not rate_of_fire or not duration or rate_of_fire <= 0 or duration <= 0 then
         return 1
     end
-    local projectile_count = math.max(1, rate_of_fire * duration)
+    local projectile_count = math.max(1, rate_of_fire)
     if blueprint_name then
         AoE4RPG_BURST_FIRE_PROJECTILE_COUNT_CACHE[blueprint_name] = projectile_count
     end
@@ -156,7 +156,7 @@ function AoE4RPG_InitializeBurstFireProjectileCountCache()
         local duration = weapon and tonumber(weapon.duration) or nil
         if rate_of_fire and duration and rate_of_fire > 0 and duration > 0 then
             AoE4RPG_BURST_FIRE_PROJECTILE_COUNT_CACHE[blueprint_name] =
-                math.max(1, rate_of_fire * duration)
+                math.max(1, rate_of_fire)
         end
     end
 end
