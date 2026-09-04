@@ -327,11 +327,34 @@ function AoE4RPG_AI_OnBuildItemComplete(context)
         return false
     end
     local player_handle = AoE4RPG_AI_ResolvePlayer(context.player)
-    local spawned_squad = AoE4RPG_AI_GetSquadIdentifier(context.spawnedSquad)
-    local entity = spawned_squad and Squad_GetFirstEntity
-        and Squad_GetFirstEntity(spawned_squad) or nil
-    local tracked = entity and AoE4RPG_AI_TrackEntity(entity, player_handle) or false
-    return tracked
+
+    -- IMPORTANT: Build events are inconsistent across game versions. Some
+    -- provide a Squad wrapper, while others provide only a numeric SquadID.
+    -- Squad_GetFirstEntity accepts the wrapper, not the numeric identifier.
+    local spawned_squad = context.spawnedSquad
+    local entity = nil
+    if spawned_squad and type(spawned_squad) ~= "number"
+        and Squad_GetFirstEntity then
+        local success, first_entity = pcall(Squad_GetFirstEntity, spawned_squad)
+        if success then entity = first_entity end
+    end
+    if entity then
+        return AoE4RPG_AI_TrackEntity(entity, player_handle)
+    end
+
+    -- Numeric-only events have no safe Squad* conversion. Use the shared
+    -- player scan once for this event so the unit is still tracked promptly.
+    if Player_GetEntities and AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities then
+        local entities = Player_GetEntities(player_handle)
+        if entities then
+            local _, tracked_new_entity = AoE4RPG_ENTITY_TRACKER_ScanPlayerEntities(
+                player_handle,
+                entities
+            )
+            return tracked_new_entity
+        end
+    end
+    return false
 end
 
 function AoE4RPG_AI_OnSpawnActionComplete(context)
