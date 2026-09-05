@@ -95,9 +95,9 @@ AoE4RPG.commander_regeneration_aura_dirty = true
 AoE4RPG.commander_regeneration_aura_elapsed = 1.0
 AoE4RPG.commander_regeneration_aura_refresh_interval = 1.0
 AoE4RPG.commander_regeneration_aura_signature = nil
-AoE4RPG.COMMANDER_SELF_REGENERATION_BASE_RATE = 0.02 -- 2% of maximum health before bracket growth.
-AoE4RPG.COMMANDER_SELF_REGENERATION_RATE_PER_BRACKET = 0.01 -- +1% of maximum health per bracket.
-AoE4RPG.COMMANDER_SELF_REGENERATION_REFRESH_INTERVAL = 0.25 -- Refresh after bracket or max-health changes.
+AoE4RPG.COMMANDER_SELF_REGENERATION_BASE_RATE = 0.01 -- 1% of maximum health before bracket growth.
+AoE4RPG.COMMANDER_SELF_REGENERATION_RATE_PER_BRACKET = 0.005 -- +0.5% of maximum health per bracket.
+AoE4RPG.COMMANDER_SELF_REGENERATION_REFRESH_INTERVAL = 0.5 -- Refresh after bracket or max-health changes.
 AoE4RPG.commander_self_regeneration_monitor_registered = false
 AoE4RPG.CLASS_RUNTIME_REFRESH_INTERVAL = 0.25
 AoE4RPG.class_runtime_monitor_registered = false
@@ -260,8 +260,8 @@ AoE4RPG_CLASS_DAMAGE_PROFILES = {
 -- Roamers gain armor from their maximum health.
 -- The pool grows when the Roamer reaches a new level bracket and is refreshed during combat.
 -- ==================== Roamer Health Armor ==============
-AoE4RPG.ROAMER_HEALTH_ARMOR_BASE_RATE = 0.01 -- 1% of maximum health before bracket growth.
-AoE4RPG.ROAMER_HEALTH_ARMOR_RATE_PER_BRACKET = 0.005 -- +0.5% of maximum health per bracket.
+AoE4RPG.ROAMER_HEALTH_ARMOR_BASE_RATE = 0.02 -- 2% of maximum health before bracket growth.
+AoE4RPG.ROAMER_HEALTH_ARMOR_RATE_PER_BRACKET = 0.01 -- +1% of maximum health per bracket.
 AoE4RPG.ROAMER_HEALTH_ARMOR_HEALTH_STEP = 0.20 -- 20% current-health bands.
 AoE4RPG.ROAMER_HEALTH_ARMOR_EFFECTIVENESS_STEP = 0.20 -- Reduce effectiveness by 20% per band.
 AoE4RPG.ROAMER_HEALTH_ARMOR_MIN_EFFECTIVENESS = 0.20 -- Full health retains 20% of the pool.
@@ -380,12 +380,12 @@ end
 -- IMPORTANT: A successful attack or recent attack state resets the timer and removes the temporary modifier.
 -- ==================== Initiator Idle Damage ==============
 
-AoE4RPG.INITIATOR_IDLE_DAMAGE_BASE_RATE_PER_INTERVAL = 0.05 -- Bracket 1: +5% damage per complete two-second interval.
-AoE4RPG.INITIATOR_IDLE_DAMAGE_RATE_PER_BRACKET_PER_INTERVAL = 0.025 -- Each later bracket adds +2.5% damage per two-second interval.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_BASE_RATE_PER_INTERVAL = 0.1 -- Bracket 1: +10% damage per complete two-second interval.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_RATE_PER_BRACKET_PER_INTERVAL = 0.05 -- Each later bracket adds +5% damage per two-second interval.
 AoE4RPG.INITIATOR_IDLE_DAMAGE_INTERVAL_SECONDS = 2.0 -- One idle-damage stack is gained every 2 seconds.
 AoE4RPG.INITIATOR_IDLE_DAMAGE_BASE_MAX_SECONDS = 6.0 -- Bracket 1: maximum idle duration is 6 seconds.
-AoE4RPG.INITIATOR_IDLE_DAMAGE_MAX_SECONDS_PER_BRACKET = 1.0 -- Each additional bracket adds 1 second to the maximum duration.
-AoE4RPG.INITIATOR_IDLE_DAMAGE_REFRESH_INTERVAL = 0.25 -- Monitor interval and elapsed-time increment in seconds.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_MAX_SECONDS_PER_BRACKET = 2.0 -- Each additional bracket adds 2 seconds to the maximum duration.
+AoE4RPG.INITIATOR_IDLE_DAMAGE_REFRESH_INTERVAL = 2 -- Monitor interval and elapsed-time increment in seconds.
 AoE4RPG.initiator_idle_damage_monitor_registered = false
 
 -- IMPORTANT: Returns the Initiator's current idle damage percentage in modifier units.
